@@ -2,6 +2,15 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.2.1] - 2026-11-08
+
+### Fixed
+- **Deck Tree Hierarchy & Protobuf Compatibility (`SearchDialog`):**
+  - Fixed `RecursionError` during initial bottom-up tri-state checkbox computation (`_sync_subtree_check_state_bottom_up` vs `_update_ancestors_check_state`).
+  - Fixed `AttributeError` when filtering dynamic decks on Anki 24+/26+ `DeckNameId` protobuf objects.
+
+---
+
 ## [0.2.0] - 2026-11-08
 
 ### Added
