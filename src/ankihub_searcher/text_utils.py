@@ -1,4 +1,4 @@
-"""Text processing and Markdown parsing utilities for AnkiHubSearcher.
+"""Text processing and Markdown parsing utilities for Smart Search.
 
 Provides:
 1. clean_html_and_cloze: HTML, Cloze, and media cleaner for Anki note fields.

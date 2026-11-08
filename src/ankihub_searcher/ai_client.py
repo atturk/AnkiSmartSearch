@@ -50,7 +50,7 @@ class OpenAICompatibleClient:
         """Makes an HTTP request and parses JSON response."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "AnkiHubSearcher/1.0",
+            "User-Agent": "SmartSearch/1.0",
         }
         if api_key and api_key.strip():
             headers["Authorization"] = f"Bearer {api_key.strip()}"

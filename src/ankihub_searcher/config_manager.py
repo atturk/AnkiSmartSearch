@@ -1,4 +1,4 @@
-"""Configuration manager for AnkiHubSearcher.
+"""Configuration manager for Smart Search.
 
 Works seamlessly inside Anki (via mw.addonManager) and in standalone test environments.
 """
@@ -202,4 +202,4 @@ class ConfigManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             # Silently fail if read-only, but log if needed
-            print(f"[AnkiHubSearcher] Warning: failed to save config file {target_path}: {e}")
+            print(f"[SmartSearch] Warning: failed to save config file {target_path}: {e}")

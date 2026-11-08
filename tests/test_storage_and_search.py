@@ -155,6 +155,25 @@ class TestStorageAndSearch(unittest.TestCase):
         self.assertEqual(len(sims_large), 3)
         self.assertEqual(sims_large[0][0], 1)
 
+    def test_database_legacy_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_file = os.path.join(tmp, "ankihub_searcher.db")
+            new_file = os.path.join(tmp, "smart_search.db")
+            # Create a legacy db and insert data
+            legacy_db = SearchDatabase(legacy_file)
+            legacy_db.upsert_notes_content_batch([(999, 1, 100, "h999", "Migrated note", "Tag")])
+
+            # Execute migration
+            SearchDatabase._migrate_legacy_db(legacy_file, new_file)
+            self.assertFalse(os.path.exists(legacy_file))
+            self.assertTrue(os.path.exists(new_file))
+
+            # Load migrated database
+            migrated_db = SearchDatabase(new_file)
+            content = migrated_db.get_notes_content([999])
+            self.assertIn(999, content)
+            self.assertEqual(content[999]["clean_text"], "Migrated note")
+
     # 2. Model Scoped Embedding Isolation
     def test_model_isolation_and_stats(self):
         model_1 = "provider::model_1"

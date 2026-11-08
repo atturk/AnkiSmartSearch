@@ -1,1 +1,1 @@
-"""UI package for AnkiHubSearcher."""
+"""UI package for Smart Search."""

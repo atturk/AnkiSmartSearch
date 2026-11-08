@@ -1,10 +1,12 @@
-"""Main PyQt6 Dialog for AnkiHubSearcher.
+"""PyQt6 dialogs for Smart Search.
 
-Organized into 4 tabs:
-1. 🔍 Smart Search (Main Workflow)
-2. 🕒 Cronologia & Rollback (Safe Undo)
-3. 🗂️ Gestione Indice & Embedding Cache
-4. ⚙️ Impostazioni (AI Providers, Campi & Avanzate)
+Provides 4 minimal, native-styled standalone dialogs:
+1. SearchDialog (compact main search window with hierarchical deck tree and Browser integration)
+2. HistoryDialog (run history, safe undo, and delete-deck-only shortcut)
+3. IndexDialog (model vector status, incremental indexer, and DB export/import)
+4. SettingsDialog (search parameters, LLM/embedding providers, and field indexing)
+
+Alias AnkiHubSearcherDialog = SearchDialog is preserved for backwards compatibility.
 """
 
 from __future__ import annotations
@@ -33,10 +35,10 @@ try:
         QProgressBar,
         QPushButton,
         QSlider,
-        QSplitter,
         QTableWidget,
         QTableWidgetItem,
-        QTabWidget,
+        QTreeWidget,
+        QTreeWidgetItem,
         Qt,
         QVBoxLayout,
         QWidget,
@@ -61,10 +63,10 @@ except ImportError:
             QProgressBar,
             QPushButton,
             QSlider,
-            QSplitter,
             QTableWidget,
             QTableWidgetItem,
-            QTabWidget,
+            QTreeWidget,
+            QTreeWidgetItem,
             QVBoxLayout,
             QWidget,
         )
@@ -73,10 +75,10 @@ except ImportError:
     except ImportError:
         # Running headless
         QDialog = object  # type: ignore
+        QTreeWidgetItem = object  # type: ignore
         mw = None
 
 
-from .. import __version__
 from ..ai_client import OpenAICompatibleClient
 from ..config_manager import ConfigManager
 from ..deck_ops import delete_filtered_deck_only
@@ -85,9 +87,15 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
+CURRENT_VERSION = "0.2.0"
 
-class AnkiHubSearcherDialog(QDialog):
-    """Main dialog window for AnkiHubSearcher."""
+
+# =====================================================================
+# 1. SEARCH DIALOG (Compact Main Window)
+# =====================================================================
+
+class SearchDialog(QDialog):
+    """Compact, minimal main search dialog with hierarchical deck tree."""
 
     def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -96,289 +104,226 @@ class AnkiHubSearcherDialog(QDialog):
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
 
-        self.setWindowTitle(f"AnkiHub Smart Searcher v{__version__} — Med School AI Bridge")
-        self.resize(920, 680)
+        self.setWindowTitle("Smart Search")
+        self.resize(520, 460)
 
         self.search_worker: Optional[SearchBatchWorker] = None
-        self.index_worker: Optional[IndexWorker] = None
-        self.rollback_worker: Optional[RollbackWorker] = None
-
         self._init_ui()
-        self._load_config_to_ui()
-        self._refresh_history_tab()
-        self._refresh_index_tab()
 
     def _init_ui(self) -> None:
-        main_layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
 
-        self.tab_widget = QTabWidget(self)
-        main_layout.addWidget(self.tab_widget)
+        # 1. Hierarchical Deck Selection Tree
+        lbl_decks = QLabel("Mazzi in cui cercare:")
+        layout.addWidget(lbl_decks)
 
-        # Tab 1: Smart Search
-        self.tab_search = QWidget()
-        self._build_search_tab(self.tab_search)
-        self.tab_widget.addTab(self.tab_search, "🔍 Smart Search")
+        self.deck_tree = QTreeWidget()
+        self.deck_tree.setHeaderHidden(True)
+        self.deck_tree.setMaximumHeight(130)
+        self.deck_tree.itemChanged.connect(self._on_tree_item_changed)
+        layout.addWidget(self.deck_tree)
+        self._populate_deck_tree()
 
-        # Tab 2: Cronologia & Rollback
-        self.tab_history = QWidget()
-        self._build_history_tab(self.tab_history)
-        self.tab_widget.addTab(self.tab_history, "🕒 Cronologia & Rollback")
+        # 2. Filtered Deck Name (Optional)
+        lbl_deck_name = QLabel("Nome mazzo filtrato (opzionale):")
+        layout.addWidget(lbl_deck_name)
 
-        # Tab 3: Gestione Indice
-        self.tab_index = QWidget()
-        self._build_index_tab(self.tab_index)
-        self.tab_widget.addTab(self.tab_index, "🗂️ Gestione Indice")
+        self.txt_base_deck = QLineEdit()
+        self.txt_base_deck.setPlaceholderText("Es. Patologia Generale")
+        layout.addWidget(self.txt_base_deck)
 
-        # Tab 4: Impostazioni
-        self.tab_settings = QWidget()
-        self._build_settings_tab(self.tab_settings)
-        self.tab_widget.addTab(self.tab_settings, "⚙️ Impostazioni")
+        # 3. Lecture Text Input
+        lbl_text = QLabel("Testo della lezione:")
+        layout.addWidget(lbl_text)
 
-        self.tab_widget.currentChanged.connect(self._on_tab_changed)
-
-    def _on_tab_changed(self, idx: int) -> None:
-        if idx == 1:
-            self._refresh_history_tab()
-        elif idx == 2:
-            self._refresh_index_tab()
-
-    # ---------------- TAB 1: SMART SEARCH ----------------
-
-    def _build_search_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
-
-        # Top section: Source decks selection + Base deck name
-        top_group = QGroupBox("1. Selezione Mazzi di Origine e Mazzo Filtrato")
-        top_layout = QVBoxLayout(top_group)
-
-        # Decks selection
-        deck_filter_layout = QHBoxLayout()
-        self.deck_filter_input = QLineEdit()
-        self.deck_filter_input.setPlaceholderText("Filtra mazzi...")
-        self.deck_filter_input.textChanged.connect(self._filter_deck_list)
-        deck_filter_layout.addWidget(self.deck_filter_input)
-
-        btn_sel_all = QPushButton("Tutti")
-        btn_sel_all.clicked.connect(self._select_all_decks)
-        deck_filter_layout.addWidget(btn_sel_all)
-
-        btn_desel_all = QPushButton("Nessuno")
-        btn_desel_all.clicked.connect(self._deselect_all_decks)
-        deck_filter_layout.addWidget(btn_desel_all)
-        top_layout.addLayout(deck_filter_layout)
-
-        self.deck_list_widget = QListWidget()
-        self.deck_list_widget.setMaximumHeight(100)
-        self.deck_list_widget.itemChanged.connect(self._on_deck_selection_changed)
-        top_layout.addWidget(self.deck_list_widget)
-        self._populate_deck_list()
-
-        # Base Deck Name
-        base_deck_layout = QHBoxLayout()
-        base_deck_layout.addWidget(QLabel("Nome Mazzo Base:"))
-        self.base_deck_input = QLineEdit()
-        self.base_deck_input.setPlaceholderText(
-            "Es. Patologia Generale (opzionale se usi header Markdown # Capitolo 2 ...)"
+        self.txt_lecture = QPlainTextEdit()
+        self.txt_lecture.setPlaceholderText(
+            "Incolla qui il testo della lezione o appunti in Markdown..."
         )
-        base_deck_layout.addWidget(self.base_deck_input)
-        top_layout.addLayout(base_deck_layout)
-        layout.addWidget(top_group)
+        layout.addWidget(self.txt_lecture)
 
-        # Middle section: Text Input
-        mid_group = QGroupBox("2. Appunti o Trascrizione della Lezione (Italiano / Markdown)")
-        mid_layout = QVBoxLayout(mid_group)
+        # 4. Minimal Progress Bar & Status (Hidden unless running)
+        self.lbl_status = QLabel("")
+        self.lbl_status.setVisible(False)
+        layout.addWidget(self.lbl_status)
 
-        self.lecture_text_input = QPlainTextEdit()
-        self.lecture_text_input.setPlaceholderText(
-            "Incolla qui gli appunti della lezione in italiano...\n"
-            "Supporta sia testo semplice che dispense Markdown con capitoli e sottocapitoli (#, ##, ###)."
-        )
-        self.lecture_text_input.textChanged.connect(self._on_lecture_text_changed)
-        mid_layout.addWidget(self.lecture_text_input)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
 
-        self.lbl_units_status = QLabel("Nessun testo inserito.")
-        self.lbl_units_status.setStyleSheet("color: #7f8c8d; font-style: italic;")
-        mid_layout.addWidget(self.lbl_units_status)
-        layout.addWidget(mid_group)
+        # 5. Bottom Action Buttons (Aligned Right)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
 
-        # Quick Options Bar
-        opt_group = QGroupBox("3. Opzioni di Ricerca Rapide")
-        opt_layout = QHBoxLayout(opt_group)
+        self.btn_cancel = QPushButton("Annulla")
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+        btn_layout.addWidget(self.btn_cancel)
 
-        # Sensitivity slider
-        sens_layout = QVBoxLayout()
-        self.lbl_sensitivity = QLabel(f"Sensibilità Ricerca: {int(self.config.sensitivity * 100)}%")
-        sens_layout.addWidget(self.lbl_sensitivity)
+        self.btn_search = QPushButton("Cerca")
+        self.btn_search.setDefault(True)
+        self.btn_search.clicked.connect(self._start_search)
+        btn_layout.addWidget(self.btn_search)
 
-        slider_box = QHBoxLayout()
-        slider_box.addWidget(QLabel("Preciso"))
-        self.sensitivity_slider = QSlider(Qt.Orientation.Horizontal)
-        self.sensitivity_slider.setRange(10, 95)
-        self.sensitivity_slider.setValue(int(self.config.sensitivity * 100))
-        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_slider_changed)
-        slider_box.addWidget(self.sensitivity_slider)
-        slider_box.addWidget(QLabel("Ampio"))
-        sens_layout.addLayout(slider_box)
-        opt_layout.addLayout(sens_layout)
+        layout.addLayout(btn_layout)
 
-        # Checkboxes
-        chk_layout = QVBoxLayout()
-        self.chk_llm_verify = QCheckBox("Verifica finale con LLM (più lento)")
-        self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
-        chk_layout.addWidget(self.chk_llm_verify)
-
-        self.chk_include_active = QCheckBox("Inserisci nel mazzo filtrato anche le carte già attive")
-        self.chk_include_active.setToolTip(
-            "Se disattivato (default), nel mazzo filtrato finiscono solo le carte nuove appena unsospese, "
-            "mentre il contatore ti mostra comunque quante carte correlate erano già attive nella tua collezione."
-        )
-        self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
-        chk_layout.addWidget(self.chk_include_active)
-        opt_layout.addLayout(chk_layout)
-        layout.addWidget(opt_group)
-
-        # Progress & Actions
-        bottom_layout = QVBoxLayout()
-        self.search_progress_bar = QProgressBar()
-        self.search_progress_bar.setValue(0)
-        self.search_progress_bar.setVisible(False)
-        bottom_layout.addWidget(self.search_progress_bar)
-
-        self.lbl_search_status = QLabel("")
-        self.lbl_search_status.setStyleSheet("font-weight: bold;")
-        bottom_layout.addWidget(self.lbl_search_status)
-
-        action_btn_layout = QHBoxLayout()
-        self.btn_run_search = QPushButton("🚀 Cerca Carte e Crea Mazzo Filtrato")
-        self.btn_run_search.setStyleSheet(
-            "QPushButton { background-color: #2980b9; color: white; font-size: 14px; font-weight: bold; padding: 10px; border-radius: 5px; }"
-            "QPushButton:hover { background-color: #3498db; }"
-        )
-        self.btn_run_search.clicked.connect(self._start_search)
-        action_btn_layout.addWidget(self.btn_run_search)
-
-        self.btn_cancel_search = QPushButton("⏹️ Annulla")
-        self.btn_cancel_search.setEnabled(False)
-        self.btn_cancel_search.clicked.connect(self._cancel_search)
-        action_btn_layout.addWidget(self.btn_cancel_search)
-
-        bottom_layout.addLayout(action_btn_layout)
-        layout.addLayout(bottom_layout)
-
-    def _populate_deck_list(self) -> None:
-        self.deck_list_widget.blockSignals(True)
-        self.deck_list_widget.clear()
+    def _populate_deck_tree(self) -> None:
+        self.deck_tree.clear()
         if not self.col:
-            self.deck_list_widget.blockSignals(False)
             return
 
+        items_by_path: Dict[str, QTreeWidgetItem] = {}
         selected_set = set(self.config.selected_decks)
-        try:
-            all_decks = self.col.decks.all()
-        except Exception:
-            all_decks = []
-        if not all_decks and hasattr(self.col.decks, "all_names_and_ids"):
-            all_decks = self.col.decks.all_names_and_ids()
 
-        deck_names = []
-        for deck in all_decks:
-            dname = deck.get("name", "") if isinstance(deck, dict) else getattr(deck, "name", "")
-            if dname:
-                deck_names.append(dname)
+        # Collect and sort all deck names from collection
+        if hasattr(self.col.decks, "all_names_and_ids"):
+            raw_decks = self.col.decks.all_names_and_ids()
+            deck_names = sorted(
+                d.name if hasattr(d, "name") else d.get("name", "")
+                for d in raw_decks
+                if (d.name if hasattr(d, "name") else d.get("name", ""))
+                and not (d.dyn if hasattr(d, "dyn") else d.get("dyn", 0))
+            )
+        else:
+            deck_names = sorted(
+                (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
+                for d in self.col.decks.all()
+                if (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
+                and not (d.get("dyn", 0) if isinstance(d, dict) else getattr(d, "dyn", 0))
+            )
 
-        for dname in sorted(deck_names):
-            item = QListWidgetItem(dname)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            if dname in selected_set or any(dname.startswith(f"{s}::") for s in selected_set):
-                item.setCheckState(Qt.CheckState.Checked)
-            else:
-                item.setCheckState(Qt.CheckState.Unchecked)
-            self.deck_list_widget.addItem(item)
-        self.deck_list_widget.blockSignals(False)
+        self.deck_tree.blockSignals(True)
+        for dname in deck_names:
+            parts = dname.split("::")
+            parent_item = None
+            curr_path = ""
+            for i, part in enumerate(parts):
+                curr_path = "::".join(parts[: i + 1])
+                if curr_path in items_by_path:
+                    parent_item = items_by_path[curr_path]
+                    continue
 
-    def _on_deck_selection_changed(self, _item: Optional[QListWidgetItem] = None) -> None:
+                item = QTreeWidgetItem()
+                item.setText(0, part)
+                item.setData(0, Qt.ItemDataRole.UserRole, curr_path)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+
+                # Check if this path (or a parent prefix) was configured as selected
+                is_selected = (curr_path in selected_set) or any(
+                    curr_path.startswith(f"{s}::") for s in selected_set
+                )
+                item.setCheckState(0, Qt.CheckState.Checked if is_selected else Qt.CheckState.Unchecked)
+
+                if parent_item is None:
+                    self.deck_tree.addTopLevelItem(item)
+                    item.setExpanded(False)  # Collapsed by default
+                else:
+                    parent_item.addChild(item)
+                    item.setExpanded(False)
+
+                items_by_path[curr_path] = item
+                parent_item = item
+
+        # Update parent states based on initial child states
+        for top_idx in range(self.deck_tree.topLevelItemCount()):
+            self._update_parent_check_state(self.deck_tree.topLevelItem(top_idx))
+
+        self.deck_tree.blockSignals(False)
+
+    def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        self.deck_tree.blockSignals(True)
+        state = item.checkState(column)
+        if state in (Qt.CheckState.Checked, Qt.CheckState.Unchecked):
+            self._set_children_check_state(item, state)
+        self._update_parent_check_state(item)
+        self.deck_tree.blockSignals(False)
         self.config.selected_decks = self._get_selected_deck_names()
         self.config.save()
 
-    def _filter_deck_list(self, filter_text: str) -> None:
-        filter_lower = filter_text.strip().lower()
-        for idx in range(self.deck_list_widget.count()):
-            item = self.deck_list_widget.item(idx)
-            item.setHidden(filter_lower not in item.text().lower())
+    def _set_children_check_state(self, item: QTreeWidgetItem, state: Qt.CheckState) -> None:
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, state)
+            self._set_children_check_state(child, state)
 
-    def _select_all_decks(self) -> None:
-        self.deck_list_widget.blockSignals(True)
-        for idx in range(self.deck_list_widget.count()):
-            item = self.deck_list_widget.item(idx)
-            if not item.isHidden():
-                item.setCheckState(Qt.CheckState.Checked)
-        self.deck_list_widget.blockSignals(False)
-        self._on_deck_selection_changed()
+    def _update_parent_check_state(self, item: QTreeWidgetItem) -> None:
+        # First ensure all children of item are updated if it has children
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.childCount() > 0:
+                self._update_parent_check_state(child)
 
-    def _deselect_all_decks(self) -> None:
-        self.deck_list_widget.blockSignals(True)
-        for idx in range(self.deck_list_widget.count()):
-            item = self.deck_list_widget.item(idx)
-            if not item.isHidden():
-                item.setCheckState(Qt.CheckState.Unchecked)
-        self.deck_list_widget.blockSignals(False)
-        self._on_deck_selection_changed()
-
-    def _get_selected_deck_names(self) -> List[str]:
-        names = []
-        for idx in range(self.deck_list_widget.count()):
-            item = self.deck_list_widget.item(idx)
-            if item.checkState() == Qt.CheckState.Checked:
-                names.append(item.text())
-        return names
-
-    def _on_lecture_text_changed(self) -> None:
-        text = self.lecture_text_input.toPlainText()
-        if not text.strip():
-            self.lbl_units_status.setText("Nessun testo inserito.")
+        parent = item.parent()
+        if not parent:
             return
 
-        units = parse_markdown_units(
-            raw_text=text,
-            base_deck_name=self.base_deck_input.text().strip(),
-            naming_style=self.config.batch_deck_naming_style,
-        )
-        if not units:
-            self.lbl_units_status.setText("⚠️ Nessuna unità con contenuto testuale rilevata.")
-        elif len(units) == 1:
-            self.lbl_units_status.setText("✅ 1 singola unità rilevata (testo unico).")
-        else:
-            self.lbl_units_status.setText(
-                f"✅ Rilevate {len(units)} unità di studio distinte (header vuoti ignorati come mazzo)."
-            )
+        child_count = parent.childCount()
+        checked_count = 0
+        partially_count = 0
+        for i in range(child_count):
+            c_state = parent.child(i).checkState(0)
+            if c_state == Qt.CheckState.Checked:
+                checked_count += 1
+            elif c_state == Qt.CheckState.PartiallyChecked:
+                partially_count += 1
 
-    def _on_sensitivity_slider_changed(self, val: int) -> None:
-        self.config.sensitivity = round(val / 100.0, 2)
-        self.lbl_sensitivity.setText(f"Sensibilità Ricerca: {val}%")
+        if checked_count == child_count:
+            parent.setCheckState(0, Qt.CheckState.Checked)
+        elif checked_count > 0 or partially_count > 0:
+            parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        else:
+            parent.setCheckState(0, Qt.CheckState.Unchecked)
+
+        self._update_parent_check_state(parent)
+
+    def _get_selected_deck_names(self) -> List[str]:
+        selected: List[str] = []
+
+        def _traverse(item: QTreeWidgetItem) -> None:
+            state = item.checkState(0)
+            full_name = item.data(0, Qt.ItemDataRole.UserRole) or item.text(0)
+
+            if state == Qt.CheckState.Checked:
+                # The entire deck (and its subdecks, if any) is selected
+                selected.append(full_name)
+            elif state == Qt.CheckState.PartiallyChecked:
+                # Only some children are selected, recurse
+                for i in range(item.childCount()):
+                    _traverse(item.child(i))
+
+        for idx in range(self.deck_tree.topLevelItemCount()):
+            _traverse(self.deck_tree.topLevelItem(idx))
+
+        return selected
+
+    def _on_cancel_clicked(self) -> None:
+        if self.search_worker and self.search_worker.isRunning():
+            self.lbl_status.setText("Interruzione in corso...")
+            self.search_worker.cancel()
+        else:
+            self.reject()
 
     def _start_search(self) -> None:
-        raw_text = self.lecture_text_input.toPlainText().strip()
+        raw_text = self.txt_lecture.toPlainText().strip()
         if not raw_text:
             QMessageBox.warning(self, "Attenzione", "Inserisci il testo della lezione prima di avviare la ricerca.")
             return
 
         selected_decks = self._get_selected_deck_names()
         if not selected_decks:
-            QMessageBox.warning(self, "Attenzione", "Seleziona almeno un mazzo di origine in cui cercare le carte.")
+            QMessageBox.warning(self, "Attenzione", "Seleziona almeno un mazzo in cui cercare.")
             return
 
-        # Save active options
         self.config.selected_decks = selected_decks
-        self.config.enable_llm_verification = self.chk_llm_verify.isChecked()
-        self.config.include_active_cards_in_filtered_deck = self.chk_include_active.isChecked()
         self.config.save()
 
-        self.btn_run_search.setEnabled(False)
-        self.btn_cancel_search.setEnabled(True)
-        self.search_progress_bar.setVisible(True)
-        self.search_progress_bar.setRange(0, 100)
-        self.search_progress_bar.setValue(0)
-        self.lbl_search_status.setText("Avvio elaborazione in corso...")
+        self.btn_search.setEnabled(False)
+        self.btn_cancel.setText("Interrompi")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.lbl_status.setVisible(True)
+        self.lbl_status.setText("Avvio elaborazione in corso...")
 
         self.search_worker = SearchBatchWorker(
             col=self.col,
@@ -386,98 +331,131 @@ class AnkiHubSearcherDialog(QDialog):
             storage=self.storage,
             ai_client=self.ai_client,
             raw_text=raw_text,
-            base_deck_name=self.base_deck_input.text().strip(),
+            base_deck_name=self.txt_base_deck.text().strip(),
         )
         self.search_worker.progress_sig.connect(self._on_search_progress)
         self.search_worker.finished_sig.connect(self._on_search_finished)
         self.search_worker.error_sig.connect(self._on_search_error)
         self.search_worker.start()
 
-    def _cancel_search(self) -> None:
-        if self.search_worker:
-            self.lbl_search_status.setText("Interruzione in corso...")
-            self.search_worker.cancel()
-
     def _on_search_progress(self, current: int, total: int, msg: str) -> None:
         if total > 0:
-            self.search_progress_bar.setMaximum(total)
-            self.search_progress_bar.setValue(current)
-        self.lbl_search_status.setText(msg)
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
+        self.lbl_status.setText(msg)
 
     def _on_search_finished(self, res: Dict[str, Any]) -> None:
-        self.btn_run_search.setEnabled(True)
-        self.btn_cancel_search.setEnabled(False)
-        self.search_progress_bar.setVisible(False)
+        self.btn_search.setEnabled(True)
+        self.btn_cancel.setText("Annulla")
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setVisible(False)
 
         status = res.get("status", "done")
         results = res.get("results", [])
 
         if status == "cancelled":
-            self.lbl_search_status.setText("Operazione annullata.")
             QMessageBox.information(self, "Annullato", "Ricerca interrotta dall'utente.")
-        else:
+            return
+
+        total_added = sum(r.total_cards_count for r in results)
+        total_unsuspended = sum(r.newly_unsuspended_count for r in results)
+        total_already_active = sum(len(r.already_active_cids) for r in results)
+        decks_created = len([r for r in results if r.total_cards_count > 0])
+
+        # 1. Reset Anki window so created filtered decks are immediately visible
+        try:
+            from aqt import mw
             if mw:
-                try:
-                    mw.reset()
-                except Exception:
-                    pass
-            total_added = sum(r.total_cards_count for r in results)
-            total_unsuspended = sum(r.newly_unsuspended_count for r in results)
-            total_already_active = sum(getattr(r, "already_active_count", 0) for r in results)
-            decks_created = sum(1 for r in results if r.filtered_did)
+                mw.reset()
+        except Exception:
+            pass
 
-            if total_added == 0 and total_already_active > 0:
-                self.lbl_search_status.setText(
-                    f"ℹ️ 0 nuove carte da unsospendere — {total_already_active} carte correlate erano GIÀ attive!"
-                )
-                QMessageBox.information(
-                    self,
-                    "Argomenti Già Attivi in Studio!",
-                    f"ℹ️ Nessuna nuova carta da unsospendere per questa lezione!\n\n"
-                    f"✅ Carte correlate che avevi GIÀ attive (non-sospese): {total_already_active}\n"
-                    f"🆕 Nuove carte unsospese: 0\n\n"
-                    f"Tutte le carte rilevanti trovate per questi argomenti fanno già parte del tuo studio attivo.",
-                )
-            else:
-                self.lbl_search_status.setText(
-                    f"✅ Completato! {decks_created} mazzi filtrati ({total_unsuspended} nuove unsospese, {total_already_active} già attive)."
-                )
-                QMessageBox.information(
-                    self,
-                    "Ricerca Completata!",
-                    f"Creati {decks_created} mazzi filtrati con successo!\n\n"
-                    f"🆕 Nuove carte unsospese: {total_unsuspended}\n"
-                    f"✅ Carte correlate GIÀ attive in studio: {total_already_active}\n"
-                    f"📦 Carte totali inserite nel Mazzo Filtrato: {total_added}\n\n"
-                    f"Puoi iniziare subito il ripasso su Anki!",
-                )
+        # 2. Automatically close the SearchDialog
+        self.accept()
 
-        self._refresh_history_tab()
-        self._refresh_index_tab()
+        # 3. Present clean post-search summary popup with Browser shortcut
+        parent_widget = mw if mw else None
+        msg_box = QMessageBox(parent_widget)
+        msg_box.setWindowTitle("Ricerca completata")
+
+        if total_added == 0 and total_already_active > 0:
+            msg_box.setText(
+                f"Nessuna nuova carta da riattivare.\n\n"
+                f"Carte correlate già attive in studio: {total_already_active}"
+            )
+        else:
+            msg_box.setText(
+                f"Mazzi filtrati creati: {decks_created}\n"
+                f"Nuove carte riattivate: {total_unsuspended}\n"
+                f"Carte correlate già attive: {total_already_active}\n"
+                f"Carte totali nel mazzo filtrato: {total_added}"
+            )
+
+        msg_box.addButton(QMessageBox.StandardButton.Ok)
+        btn_browser = None
+        created_names = [r.deck_name for r in results if r.filtered_did and r.total_cards_count > 0]
+        if created_names:
+            btn_browser = msg_box.addButton("Browser", QMessageBox.ButtonRole.ActionRole)
+
+        msg_box.exec()
+
+        if btn_browser and msg_box.clickedButton() == btn_browser:
+            try:
+                import aqt
+                if aqt.mw:
+                    query = " OR ".join(f'"deck:{name}"' for name in created_names)
+                    browser = aqt.dialogs.open("Browser", aqt.mw)
+                    if browser and hasattr(browser, "search_for"):
+                        browser.search_for(query)
+            except Exception as e:
+                print(f"[SmartSearch] Error opening browser: {e}")
 
     def _on_search_error(self, err_msg: str) -> None:
-        self.btn_run_search.setEnabled(True)
-        self.btn_cancel_search.setEnabled(False)
-        self.search_progress_bar.setVisible(False)
-        self.lbl_search_status.setText(f"❌ Errore: {err_msg}")
+        self.btn_search.setEnabled(True)
+        self.btn_cancel.setText("Annulla")
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setVisible(False)
         QMessageBox.critical(self, "Errore Ricerca", f"Si è verificato un errore:\n\n{err_msg}")
 
-    # ---------------- TAB 2: HISTORY & ROLLBACK ----------------
 
-    def _build_history_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
+# Backwards compatibility alias for imports
+AnkiHubSearcherDialog = SearchDialog
+
+
+# =====================================================================
+# 2. HISTORY DIALOG (Cronologia)
+# =====================================================================
+
+class HistoryDialog(QDialog):
+    """Minimal dialog displaying past search runs and safe rollback controls."""
+
+    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.col = col or (mw.col if mw else None)
+        self.config = ConfigManager.load()
+        self.storage = SearchDatabase()
+
+        self.setWindowTitle("Smart Search — Cronologia")
+        self.resize(720, 420)
+
+        self.rollback_worker: Optional[RollbackWorker] = None
+        self._init_ui()
+        self._refresh_history()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
 
         info_lbl = QLabel(
-            "Cronologia delle ricerche eseguite. Il rollback ri-sospende ESCLUSIVAMENTE le carte che erano "
-            "sospese prima della run, senza toccare MAI le carte già attive nella tua collezione."
+            "Cronologia delle ricerche eseguite. Il rollback ri-sospende esclusivamente le carte che erano "
+            "sospese prima della run, senza modificare le carte già attive."
         )
         info_lbl.setWordWrap(True)
         layout.addWidget(info_lbl)
 
         self.history_table = QTableWidget()
-        self.history_table.setColumnCount(8)
+        self.history_table.setColumnCount(7)
         self.history_table.setHorizontalHeaderLabels(
-            ["Run ID", "Data/Ora", "Mazzo Filtrato", "Unità", "Nel Mazzo", "Nuove Unsospese", "Già Attive", "Stato"]
+            ["Data", "Mazzo Filtrato", "Unità", "Nel Mazzo", "Nuove Riattivate", "Già Attive", "Stato"]
         )
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.history_table.horizontalHeader().setStretchLastSection(True)
@@ -485,47 +463,53 @@ class AnkiHubSearcherDialog(QDialog):
         self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         layout.addWidget(self.history_table)
 
-        # Rollback options and buttons
-        btn_layout = QHBoxLayout()
-        self.chk_keep_reviewed = QCheckBox("Mantieni attive le carte che ho già ripassato (consigliato)")
+        self.chk_keep_reviewed = QCheckBox("Mantieni attive le carte già ripassate")
         self.chk_keep_reviewed.setChecked(self.config.rollback_keep_reviewed_default)
-        btn_layout.addWidget(self.chk_keep_reviewed)
+        layout.addWidget(self.chk_keep_reviewed)
 
-        btn_refresh = QPushButton("🔄 Aggiorna")
-        btn_refresh.clicked.connect(self._refresh_history_tab)
+        btn_layout = QHBoxLayout()
+
+        self.btn_rollback = QPushButton("Annulla run selezionata")
+        self.btn_rollback.clicked.connect(self._on_rollback_clicked)
+        btn_layout.addWidget(self.btn_rollback)
+
+        self.btn_delete_deck_only = QPushButton("Elimina solo mazzo filtrato")
+        self.btn_delete_deck_only.setToolTip(
+            "Svuota ed elimina il mazzo filtrato ma lascia le carte riattivate nei mazzi principali per il ripasso."
+        )
+        self.btn_delete_deck_only.clicked.connect(self._on_delete_deck_only_clicked)
+        btn_layout.addWidget(self.btn_delete_deck_only)
+
+        btn_layout.addStretch()
+
+        btn_refresh = QPushButton("Aggiorna")
+        btn_refresh.clicked.connect(self._refresh_history)
         btn_layout.addWidget(btn_refresh)
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_close)
+
         layout.addLayout(btn_layout)
 
-        actions_layout = QHBoxLayout()
-        self.btn_rollback = QPushButton("⏪ Annulla Run Selezionata (Ri-sospendi carte e rimuovi mazzo)")
-        self.btn_rollback.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 8px;")
-        self.btn_rollback.clicked.connect(self._on_rollback_clicked)
-        actions_layout.addWidget(self.btn_rollback)
-
-        self.btn_delete_deck_only = QPushButton("🗑️ Elimina Solo Mazzo Filtrato (Lascia carte attive)")
-        self.btn_delete_deck_only.setToolTip(
-            "Svuota ed elimina il mazzo filtrato ma lascia le carte unsospese nei mazzi principali per il ripasso futuro."
-        )
-        self.btn_delete_deck_only.clicked.connect(self._on_delete_filtered_deck_only_clicked)
-        actions_layout.addWidget(self.btn_delete_deck_only)
-        layout.addLayout(actions_layout)
-
-    def _refresh_history_tab(self) -> None:
+    def _refresh_history(self) -> None:
         runs = self.storage.get_runs()
         self.history_table.setRowCount(len(runs))
 
         for row_idx, r in enumerate(runs):
             t_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.created_at))
-            status_str = "❌ Annullata" if r.rolled_back else "✅ Attiva"
+            status_str = "Annullata" if r.rolled_back else "Attiva"
 
-            self.history_table.setItem(row_idx, 0, QTableWidgetItem(r.run_id))
-            self.history_table.setItem(row_idx, 1, QTableWidgetItem(t_str))
-            self.history_table.setItem(row_idx, 2, QTableWidgetItem(r.deck_name))
-            self.history_table.setItem(row_idx, 3, QTableWidgetItem(r.unit_title))
-            self.history_table.setItem(row_idx, 4, QTableWidgetItem(str(len(r.total_matched_cids))))
-            self.history_table.setItem(row_idx, 5, QTableWidgetItem(str(len(r.newly_unsuspended_cids))))
-            self.history_table.setItem(row_idx, 6, QTableWidgetItem(str(len(getattr(r, "already_active_cids", [])))))
-            self.history_table.setItem(row_idx, 7, QTableWidgetItem(status_str))
+            item_date = QTableWidgetItem(t_str)
+            item_date.setData(Qt.ItemDataRole.UserRole, r.run_id)
+
+            self.history_table.setItem(row_idx, 0, item_date)
+            self.history_table.setItem(row_idx, 1, QTableWidgetItem(r.deck_name))
+            self.history_table.setItem(row_idx, 2, QTableWidgetItem(r.unit_title))
+            self.history_table.setItem(row_idx, 3, QTableWidgetItem(str(len(r.total_matched_cids))))
+            self.history_table.setItem(row_idx, 4, QTableWidgetItem(str(len(r.newly_unsuspended_cids))))
+            self.history_table.setItem(row_idx, 5, QTableWidgetItem(str(len(r.already_active_cids))))
+            self.history_table.setItem(row_idx, 6, QTableWidgetItem(status_str))
 
     def _get_selected_run_id(self) -> Optional[str]:
         selected_rows = self.history_table.selectedItems()
@@ -533,7 +517,7 @@ class AnkiHubSearcherDialog(QDialog):
             return None
         row = selected_rows[0].row()
         item = self.history_table.item(row, 0)
-        return item.text() if item else None
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
 
     def _on_rollback_clicked(self) -> None:
         run_id = self._get_selected_run_id()
@@ -575,15 +559,12 @@ class AnkiHubSearcherDialog(QDialog):
     def _on_rollback_finished(self, res: Any) -> None:
         self.btn_rollback.setEnabled(True)
         if mw:
-            try:
-                mw.reset()
-            except Exception:
-                pass
-        self._refresh_history_tab()
+            mw.reset()
+        self._refresh_history()
         QMessageBox.information(
             self,
             "Rollback Eseguito",
-            f"Rollback completato con successo!\n\n"
+            f"Rollback completato con successo.\n\n"
             f"Mazzo filtrato rimosso: {'Sì' if res.deck_removed else 'No/Già rimosso'}\n"
             f"Carte ri-sospese: {res.resuspended_count}\n"
             f"Carte mantenute attive perché ripassate: {res.kept_reviewed_count}",
@@ -593,7 +574,7 @@ class AnkiHubSearcherDialog(QDialog):
         self.btn_rollback.setEnabled(True)
         QMessageBox.critical(self, "Errore Rollback", f"Errore durante il rollback:\n{err}")
 
-    def _on_delete_filtered_deck_only_clicked(self) -> None:
+    def _on_delete_deck_only_clicked(self) -> None:
         run_id = self._get_selected_run_id()
         if not run_id:
             QMessageBox.warning(self, "Attenzione", "Seleziona prima una run dalla tabella.")
@@ -606,176 +587,142 @@ class AnkiHubSearcherDialog(QDialog):
         reply = QMessageBox.question(
             self,
             "Elimina Solo Mazzo",
-            f"Vuoi eliminare il mazzo filtrato '{run_rec.deck_name}' mantenendo tutte le carte unsospese nella tua collezione?",
+            f"Vuoi eliminare il mazzo filtrato '{run_rec.deck_name}' mantenendo tutte le carte attive nella tua collezione?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             success = delete_filtered_deck_only(self.col, self.storage, run_id)
             if success:
-                QMessageBox.information(self, "Fatto", "Mazzo filtrato eliminato. Le carte restano attive!")
+                QMessageBox.information(self, "Fatto", "Mazzo filtrato eliminato. Le carte restano attive.")
             else:
                 QMessageBox.warning(self, "Avviso", "Il mazzo filtrato non esiste più.")
 
-    # ---------------- TAB 3: INDEX MANAGEMENT ----------------
 
-    def _build_index_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
+# =====================================================================
+# 3. INDEX DIALOG (Indicizzazione)
+# =====================================================================
 
-        info_lbl = QLabel(
-            "Gestione dell'indice vettoriale e FTS5. Gli embeddings vengono calcolati per il modello attivo "
-            "e salvati localmente in SQLite. Cambiare modello non cancella le cache precedenti a meno che non le elimini esplicitamente."
-        )
-        info_lbl.setWordWrap(True)
-        layout.addWidget(info_lbl)
+class IndexDialog(QDialog):
+    """Minimal dialog managing vector index coverage, updates, and DB import/export."""
+
+    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.col = col or (mw.col if mw else None)
+        self.config = ConfigManager.load()
+        self.storage = SearchDatabase()
+        self.ai_client = OpenAICompatibleClient()
+
+        self.setWindowTitle("Smart Search — Indicizzazione")
+        self.resize(620, 420)
+
+        self.index_worker: Optional[IndexWorker] = None
+        self._init_ui()
+        self._refresh_status()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
 
         # Status Box
         status_group = QGroupBox("Stato Modello Attivo")
         status_layout = QVBoxLayout(status_group)
-        self.lbl_active_model_badge = QLabel("Modello Attivo: -")
-        self.lbl_active_model_badge.setStyleSheet("font-size: 13px; font-weight: bold;")
-        status_layout.addWidget(self.lbl_active_model_badge)
 
-        self.lbl_indexing_coverage = QLabel("Copertura Mazzi Selezionati: -")
-        status_layout.addWidget(self.lbl_indexing_coverage)
+        self.lbl_active_model = QLabel("Modello Attivo: -")
+        status_layout.addWidget(self.lbl_active_model)
 
-        self.index_progress_bar = QProgressBar()
-        self.index_progress_bar.setVisible(False)
-        status_layout.addWidget(self.index_progress_bar)
+        self.lbl_coverage = QLabel("Copertura mazzi selezionati: -")
+        status_layout.addWidget(self.lbl_coverage)
 
-        self.lbl_index_status = QLabel("")
-        status_layout.addWidget(self.lbl_index_status)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        status_layout.addWidget(self.progress_bar)
+
+        self.lbl_progress_msg = QLabel("")
+        self.lbl_progress_msg.setVisible(False)
+        status_layout.addWidget(self.lbl_progress_msg)
 
         btn_box = QHBoxLayout()
-        self.btn_run_indexing = QPushButton("▶️ Indicizza / Aggiorna Ora")
-        self.btn_run_indexing.clicked.connect(self._start_indexing)
-        btn_box.addWidget(self.btn_run_indexing)
+        self.btn_run = QPushButton("Indicizza / Aggiorna")
+        self.btn_run.clicked.connect(self._start_indexing)
+        btn_box.addWidget(self.btn_run)
 
-        self.btn_cancel_indexing = QPushButton("⏸️ Interrompi")
-        self.btn_cancel_indexing.setEnabled(False)
-        self.btn_cancel_indexing.clicked.connect(self._cancel_indexing)
-        btn_box.addWidget(self.btn_cancel_indexing)
+        self.btn_cancel = QPushButton("Interrompi")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_indexing)
+        btn_box.addWidget(self.btn_cancel)
         status_layout.addLayout(btn_box)
+
         layout.addWidget(status_group)
 
         # Cached models table
-        models_group = QGroupBox("Cache Modelli nel Database Locale")
+        models_group = QGroupBox("Cache Modelli nel Database")
         models_layout = QVBoxLayout(models_group)
+
         self.models_table = QTableWidget()
         self.models_table.setColumnCount(3)
-        self.models_table.setHorizontalHeaderLabels(["Modello ID", "Note con Embedding", "Spazio su Disco (MB)"])
+        self.models_table.setHorizontalHeaderLabels(["Modello", "Note indicizzate", "Dimensione (MB)"])
         self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         models_layout.addWidget(self.models_table)
 
-        purge_layout = QHBoxLayout()
-        btn_export_db = QPushButton("📤 Esporta Indice (.db)...")
-        btn_export_db.clicked.connect(self._export_db)
-        purge_layout.addWidget(btn_export_db)
-
-        btn_import_db = QPushButton("📥 Importa / Unisci da altro .db...")
-        btn_import_db.clicked.connect(self._import_external_db)
-        purge_layout.addWidget(btn_import_db)
-
-        btn_purge_inactive = QPushButton("🧹 Elimina Cache Modelli Non Attivi")
-        btn_purge_inactive.clicked.connect(self._purge_inactive_models)
-        purge_layout.addWidget(btn_purge_inactive)
-
-        btn_refresh_idx = QPushButton("🔄 Aggiorna")
-        btn_refresh_idx.clicked.connect(self._refresh_index_tab)
-        purge_layout.addWidget(btn_refresh_idx)
-        models_layout.addLayout(purge_layout)
         layout.addWidget(models_group)
 
-    def _export_db(self) -> None:
-        default_path = os.path.expanduser("~/Desktop/ankihub_searcher_export.db")
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Esporta Indice AnkiHubSearcher (.db)",
-            default_path,
-            "SQLite Database (*.db);;All Files (*)",
-        )
-        if not file_path:
-            return
-        if not file_path.endswith(".db"):
-            file_path += ".db"
-        try:
-            size_mb = self.storage.export_db(file_path)
-            QMessageBox.information(
-                self,
-                "Esportazione Completata",
-                f"Indice esportato con successo!\n\n"
-                f"File: {file_path}\n"
-                f"Dimensione: {size_mb} MB\n\n"
-                f"Ora puoi inviarlo via AirDrop sull'altro Mac e importarlo con '📥 Importa / Unisci da altro .db...'.",
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Errore Esportazione", f"Impossibile esportare il database:\n{e}")
+        # Bottom actions
+        bottom_layout = QHBoxLayout()
 
-    def _import_external_db(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Seleziona il file ankihub_searcher.db da importare/unire",
-            "",
-            "SQLite Database (*.db);;All Files (*)",
-        )
-        if not file_path:
-            return
-        try:
-            res = self.storage.merge_external_db(file_path)
-            self._refresh_index_tab()
-            QMessageBox.information(
-                self,
-                "Unione Indice Completata",
-                f"Indice unito con successo!\n\n"
-                f"Vettori importati/aggiornati: {res['embeddings_merged']}\n"
-                f"Note importate: {res['notes_merged']}",
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Errore Importazione", f"Impossibile unire il database:\n{e}")
+        btn_export = QPushButton("Esporta indice (.db)...")
+        btn_export.clicked.connect(self._export_database)
+        bottom_layout.addWidget(btn_export)
 
-    def _refresh_index_tab(self) -> None:
-        self.config.selected_decks = self._get_selected_deck_names()
+        btn_import = QPushButton("Importa / Unisci (.db)...")
+        btn_import.clicked.connect(self._import_database)
+        bottom_layout.addWidget(btn_import)
+
+        btn_purge = QPushButton("Elimina cache modelli inattivi")
+        btn_purge.clicked.connect(self._purge_inactive_models)
+        bottom_layout.addWidget(btn_purge)
+
+        bottom_layout.addStretch()
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.clicked.connect(self.accept)
+        bottom_layout.addWidget(btn_close)
+
+        layout.addLayout(bottom_layout)
+
+    def _refresh_status(self) -> None:
         active_id = self.config.get_active_model_id()
-        self.lbl_active_model_badge.setText(f"Modello Attivo: {active_id}")
+        self.lbl_active_model.setText(f"Modello Attivo: {active_id}")
 
         stats = self.storage.get_indexed_models_stats()
         self.models_table.setRowCount(len(stats))
+        active_count = 0
         for r_idx, s in enumerate(stats):
             self.models_table.setItem(r_idx, 0, QTableWidgetItem(s["model_id"]))
             self.models_table.setItem(r_idx, 1, QTableWidgetItem(str(s["note_count"])))
             self.models_table.setItem(r_idx, 2, QTableWidgetItem(f"{s['size_mb']} MB"))
+            if s["model_id"] == active_id:
+                active_count = s["note_count"]
 
-        # Calculate coverage of currently checked decks in Tab 1
         if self.col:
             indexer = DeckIndexer(self.config, self.storage, self.ai_client)
             target_dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
             target_nids = indexer.get_notes_in_decks(self.col, target_dids)
             total_notes = len(target_nids)
-            covered_notes = self.storage.count_embeddings_for_notes(target_nids, active_id)
-            pct = int(covered_notes / total_notes * 100) if total_notes > 0 else 0
-            decks_summary = ", ".join(self.config.selected_decks[:3])
-            if len(self.config.selected_decks) > 3:
-                decks_summary += f" (+{len(self.config.selected_decks) - 3})"
-            if not decks_summary:
-                decks_summary = "Nessun mazzo selezionato"
-            self.lbl_indexing_coverage.setText(
-                f"Copertura Mazzi Selezionati [{decks_summary}]: {covered_notes} / {total_notes} note ({pct}%)"
+            deck_active_count = self.storage.count_embeddings_for_notes(target_nids, active_id) if target_nids else 0
+            pct = int(deck_active_count / total_notes * 100) if total_notes > 0 else 0
+            self.lbl_coverage.setText(
+                f"Copertura mazzi selezionati: {deck_active_count} / {total_notes} note ({pct}%)"
             )
 
     def _start_indexing(self) -> None:
         if not self.col:
             return
 
-        self.config.selected_decks = self._get_selected_deck_names()
-        if not self.config.selected_decks:
-            QMessageBox.warning(self, "Attenzione", "Seleziona almeno un mazzo nella tab Smart Search.")
-            return
-        self.config.save()
-
-        self.btn_run_indexing.setEnabled(False)
-        self.btn_cancel_indexing.setEnabled(True)
-        self.index_progress_bar.setVisible(True)
-        self.index_progress_bar.setValue(0)
-        self.lbl_index_status.setText("Avvio indicizzazione...")
+        self.btn_run.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.lbl_progress_msg.setVisible(True)
+        self.lbl_progress_msg.setText("Avvio indicizzazione...")
 
         self.index_worker = IndexWorker(
             col=self.col,
@@ -784,43 +731,81 @@ class AnkiHubSearcherDialog(QDialog):
             ai_client=self.ai_client,
             selected_decks=self.config.selected_decks,
         )
-        self.index_worker.progress_sig.connect(self._on_index_progress)
-        self.index_worker.finished_sig.connect(self._on_index_finished)
-        self.index_worker.error_sig.connect(self._on_index_error)
+        self.index_worker.progress_sig.connect(self._on_progress)
+        self.index_worker.finished_sig.connect(self._on_finished)
+        self.index_worker.error_sig.connect(self._on_error)
         self.index_worker.start()
 
     def _cancel_indexing(self) -> None:
         if self.index_worker:
-            self.lbl_index_status.setText("Interruzione in corso...")
+            self.lbl_progress_msg.setText("Interruzione in corso...")
             self.index_worker.cancel()
 
-    def _on_index_progress(self, cur: int, total: int, msg: str) -> None:
+    def _on_progress(self, cur: int, total: int, msg: str) -> None:
         if total > 0:
-            self.index_progress_bar.setMaximum(total)
-            self.index_progress_bar.setValue(cur)
-        self.lbl_index_status.setText(msg)
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(cur)
+        self.lbl_progress_msg.setText(msg)
 
-    def _on_index_finished(self, res: Dict[str, Any]) -> None:
-        self.btn_run_indexing.setEnabled(True)
-        self.btn_cancel_indexing.setEnabled(False)
-        self.index_progress_bar.setVisible(False)
-        self.lbl_index_status.setText("Indicizzazione completata / in pausa.")
-        self._refresh_index_tab()
+    def _on_finished(self, res: Dict[str, Any]) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.lbl_progress_msg.setVisible(False)
+        self._refresh_status()
+
         QMessageBox.information(
             self,
             "Indicizzazione",
-            f"Operazione completata!\n\n"
+            f"Operazione completata.\n\n"
             f"Note con testo indicizzato: {res.get('text_indexed', 0)}\n"
             f"Nuovi vettori calcolati: {res.get('embeddings_indexed', 0)}\n"
             f"Stato: {'Interrotta' if res.get('cancelled') else 'Completata'}",
         )
 
-    def _on_index_error(self, err: str) -> None:
-        self.btn_run_indexing.setEnabled(True)
-        self.btn_cancel_indexing.setEnabled(False)
-        self.index_progress_bar.setVisible(False)
-        self.lbl_index_status.setText(f"Errore: {err}")
+    def _on_error(self, err: str) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.lbl_progress_msg.setVisible(False)
         QMessageBox.critical(self, "Errore Indicizzazione", f"Errore:\n{err}")
+
+    def _export_database(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Esporta Indice Smart Search (.db)",
+            os.path.expanduser("~/Desktop/smart_search.db"),
+            "Database SQLite (*.db);;Tutti i file (*.*)",
+        )
+        if not path:
+            return
+        try:
+            self.storage.export_database(path)
+            QMessageBox.information(self, "Esportazione Completata", f"Indice esportato con successo in:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Esportazione", f"Impossibile esportare l'indice:\n{e}")
+
+    def _import_database(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importa / Unisci Indice (.db)",
+            os.path.expanduser("~/Desktop"),
+            "Database SQLite (*.db);;Tutti i file (*.*)",
+        )
+        if not path:
+            return
+        try:
+            res = self.storage.import_database(path)
+            self._refresh_status()
+            QMessageBox.information(
+                self,
+                "Importazione Completata",
+                f"Importazione e unione completate con successo!\n\n"
+                f"Note importate/aggiornate: {res.get('notes_imported', 0)}\n"
+                f"Embeddings importati/aggiornati: {res.get('embeddings_imported', 0)}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Importazione", f"Impossibile importare l'indice:\n{e}")
 
     def _purge_inactive_models(self) -> None:
         active_id = self.config.get_active_model_id()
@@ -832,16 +817,69 @@ class AnkiHubSearcherDialog(QDialog):
         )
         if reply == QMessageBox.StandardButton.Yes:
             deleted = self.storage.delete_inactive_models(active_id)
-            self._refresh_index_tab()
+            self._refresh_status()
             QMessageBox.information(self, "Pulizia Completata", f"Eliminati {deleted} vettori inattivi.")
 
-    # ---------------- TAB 4: SETTINGS ----------------
 
-    def _build_settings_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
+# =====================================================================
+# 4. SETTINGS DIALOG (Impostazioni)
+# =====================================================================
 
-        # 1. Chat LLM
-        chat_group = QGroupBox("Chat / Reasoning LLM (Decomposizione Concettuale Stage 1)")
+class SettingsDialog(QDialog):
+    """Minimal dialog for configuring search sensitivity, AI endpoints, and note fields."""
+
+    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.col = col or (mw.col if mw else None)
+        self.config = ConfigManager.load()
+        self.ai_client = OpenAICompatibleClient()
+
+        self.setWindowTitle("Smart Search — Impostazioni")
+        self.resize(580, 560)
+
+        self._init_ui()
+        self._load_config_to_ui()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # 1. Parametri di Ricerca
+        search_group = QGroupBox("Parametri di Ricerca")
+        search_layout = QVBoxLayout(search_group)
+
+        # Sensitivity slider
+        sens_row = QHBoxLayout()
+        sens_row.addWidget(QLabel("Sensibilità ricerca:"))
+        self.slider_sens = QSlider(Qt.Orientation.Horizontal)
+        self.slider_sens.setRange(10, 95)
+        self.slider_sens.setValue(int(self.config.sensitivity * 100))
+        self.slider_sens.valueChanged.connect(self._on_sens_slider_changed)
+        sens_row.addWidget(self.slider_sens)
+
+        self.lbl_sens_val = QLabel(f"{int(self.config.sensitivity * 100)}%")
+        sens_row.addWidget(self.lbl_sens_val)
+        search_layout.addLayout(sens_row)
+
+        self.chk_llm_verify = QCheckBox("Verifica finale dei risultati con LLM (più accurato, più lento)")
+        self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
+        search_layout.addWidget(self.chk_llm_verify)
+
+        self.chk_include_active = QCheckBox("Inserisci nel mazzo filtrato anche le carte già attive in studio")
+        self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
+        search_layout.addWidget(self.chk_include_active)
+
+        naming_row = QHBoxLayout()
+        naming_row.addWidget(QLabel("Stile nomi mazzi multi-unità:"))
+        self.combo_naming = QComboBox()
+        self.combo_naming.addItem("Nome Base - Titolo Sezione", "dash")
+        self.combo_naming.addItem("Nome Base::Titolo Sezione (Sottomazzo)", "subdeck")
+        naming_row.addWidget(self.combo_naming)
+        search_layout.addLayout(naming_row)
+
+        layout.addWidget(search_group)
+
+        # 2. Modello Chat (LLM)
+        chat_group = QGroupBox("Modello Chat (Decomposizione Concettuale)")
         chat_layout = QVBoxLayout(chat_group)
 
         row_chat_preset = QHBoxLayout()
@@ -871,18 +909,19 @@ class AnkiHubSearcherDialog(QDialog):
         self.combo_chat_model.setEditable(True)
         row_chat_model.addWidget(self.combo_chat_model)
 
-        btn_fetch_chat = QPushButton("🔄 Carica Modelli")
+        btn_fetch_chat = QPushButton("Carica modelli")
         btn_fetch_chat.clicked.connect(self._fetch_chat_models)
         row_chat_model.addWidget(btn_fetch_chat)
 
-        btn_test_chat = QPushButton("Test Connessione")
+        btn_test_chat = QPushButton("Test")
         btn_test_chat.clicked.connect(self._test_chat_connection)
         row_chat_model.addWidget(btn_test_chat)
         chat_layout.addLayout(row_chat_model)
+
         layout.addWidget(chat_group)
 
-        # 2. Embedding Model
-        embed_group = QGroupBox("Embedding Model (Indice Vettoriale Stage 2)")
+        # 3. Modello Embedding
+        embed_group = QGroupBox("Modello Embedding (Indice Vettoriale)")
         embed_layout = QVBoxLayout(embed_group)
 
         row_embed_preset = QHBoxLayout()
@@ -912,113 +951,73 @@ class AnkiHubSearcherDialog(QDialog):
         self.combo_embed_model.setEditable(True)
         row_embed_model.addWidget(self.combo_embed_model)
 
-        btn_fetch_embed = QPushButton("🔄 Carica Modelli")
+        btn_fetch_embed = QPushButton("Carica modelli")
         btn_fetch_embed.clicked.connect(self._fetch_embed_models)
         row_embed_model.addWidget(btn_fetch_embed)
 
-        btn_test_embed = QPushButton("Test Connessione")
+        btn_test_embed = QPushButton("Test")
         btn_test_embed.clicked.connect(self._test_embed_connection)
         row_embed_model.addWidget(btn_test_embed)
         embed_layout.addLayout(row_embed_model)
 
         row_strategy = QHBoxLayout()
-        row_strategy.addWidget(QLabel("Strategia Linguistica:"))
+        row_strategy.addWidget(QLabel("Strategia linguistica:"))
         self.combo_strategy = QComboBox()
-        self.combo_strategy.addItem("Traduzione concettuale in Inglese (Consigliato per AnKing)", "translate_to_en")
-        self.combo_strategy.addItem("Multilingua Diretto (Italiano + Inglese)", "multilingual_direct")
+        self.combo_strategy.addItem("Traduzione concettuale in inglese (consigliato)", "translate_to_en")
+        self.combo_strategy.addItem("Multilingua diretto", "multilingual_direct")
         row_strategy.addWidget(self.combo_strategy)
         embed_layout.addLayout(row_strategy)
+
         layout.addWidget(embed_group)
 
-        # 3. Naming & Advanced
-        adv_group = QGroupBox("Stile Mazzi Filtrati Multi-Unità, Campi Indicizzati & Opzioni Avanzate")
-        adv_layout = QVBoxLayout(adv_group)
+        # 4. Campi indicizzati per Tipo di Nota
+        fields_group = QGroupBox("Campi Indicizzati per Tipo di Nota")
+        fields_layout = QVBoxLayout(fields_group)
 
-        row_naming = QHBoxLayout()
-        row_naming.addWidget(QLabel("Stile Nomi Mazzi Batch:"))
-        self.combo_naming = QComboBox()
-        self.combo_naming.addItem("Opzione A: Nome Base - Titolo Header", "dash")
-        self.combo_naming.addItem("Opzione B: Nome Base::Titolo Header (Sottomazzi)", "subdeck")
-        row_naming.addWidget(self.combo_naming)
-        adv_layout.addLayout(row_naming)
+        model_select_row = QHBoxLayout()
+        model_select_row.addWidget(QLabel("Tipo di Nota:"))
+        self.combo_note_models = QComboBox()
+        self.combo_note_models.currentIndexChanged.connect(self._on_note_model_selected)
+        model_select_row.addWidget(self.combo_note_models)
+        fields_layout.addLayout(model_select_row)
 
-        self.chk_index_tags = QCheckBox("Indicizza anche i Tag delle note (filtrando il boilerplate)")
+        self.list_fields = QListWidget()
+        self.list_fields.setMaximumHeight(80)
+        fields_layout.addWidget(self.list_fields)
+
+        self.chk_index_tags = QCheckBox("Indicizza anche i tag delle note")
         self.chk_index_tags.setChecked(self.config.index_tags)
-        adv_layout.addWidget(self.chk_index_tags)
+        fields_layout.addWidget(self.chk_index_tags)
 
-        # Note Type -> Field selector
-        fields_row = QHBoxLayout()
-        fields_row.addWidget(QLabel("Tipo di Nota (Campi da indicizzare):"))
-        self.combo_note_model = QComboBox()
-        self.combo_note_model.currentIndexChanged.connect(self._on_note_model_selected)
-        fields_row.addWidget(self.combo_note_model, stretch=1)
-        adv_layout.addLayout(fields_row)
+        layout.addWidget(fields_group)
 
-        self.fields_list_widget = QListWidget()
-        self.fields_list_widget.setMaximumHeight(95)
-        self.fields_list_widget.itemChanged.connect(self._on_field_check_changed)
-        adv_layout.addWidget(self.fields_list_widget)
-        self._populate_note_models_combo()
+        # Bottom Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
 
-        layout.addWidget(adv_group)
+        btn_cancel = QPushButton("Annulla")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancel)
 
-        # Save Button
-        btn_save = QPushButton("💾 Salva Impostazioni")
-        btn_save.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 10px;")
+        btn_save = QPushButton("Salva")
+        btn_save.setDefault(True)
         btn_save.clicked.connect(self._save_settings)
-        layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_save)
 
-    def _populate_note_models_combo(self) -> None:
-        self._model_fields_map: Dict[str, List[str]] = {}
-        self.combo_note_model.blockSignals(True)
-        self.combo_note_model.clear()
-        if self.col:
-            try:
-                for item in self.col.models.all_names_and_ids():
-                    mid_val = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
-                    if mid_val is not None:
-                        m = self.col.models.get(mid_val)
-                        if m and "name" in m and "flds" in m:
-                            mname = m["name"]
-                            flds = [f["name"] for f in m["flds"]]
-                            self._model_fields_map[mname] = flds
-            except Exception:
-                pass
-        for mname in sorted(self._model_fields_map.keys()):
-            self.combo_note_model.addItem(mname)
-        self.combo_note_model.blockSignals(False)
-        if self.combo_note_model.count() > 0:
-            self._on_note_model_selected(0)
+        layout.addLayout(btn_layout)
 
-    def _on_note_model_selected(self, _idx: int) -> None:
-        mname = self.combo_note_model.currentText()
-        if not mname or mname not in self._model_fields_map:
-            return
-        avail_fields = self._model_fields_map[mname]
-        active_fields = set(self.config.get_indexed_fields_for_model(mname, avail_fields))
-
-        self.fields_list_widget.blockSignals(True)
-        self.fields_list_widget.clear()
-        for fname in avail_fields:
-            item = QListWidgetItem(fname)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if fname in active_fields else Qt.CheckState.Unchecked)
-            self.fields_list_widget.addItem(item)
-        self.fields_list_widget.blockSignals(False)
-
-    def _on_field_check_changed(self, _item: QListWidgetItem) -> None:
-        mname = self.combo_note_model.currentText()
-        if not mname:
-            return
-        checked = []
-        for idx in range(self.fields_list_widget.count()):
-            it = self.fields_list_widget.item(idx)
-            if it.checkState() == Qt.CheckState.Checked:
-                checked.append(it.text())
-        if checked:
-            self.config.indexed_fields_by_model[mname] = checked
+        self._populate_note_models()
 
     def _load_config_to_ui(self) -> None:
+        self.slider_sens.setValue(int(self.config.sensitivity * 100))
+        self.lbl_sens_val.setText(f"{int(self.config.sensitivity * 100)}%")
+        self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
+        self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
+
+        idx_naming = self.combo_naming.findData(self.config.batch_deck_naming_style)
+        if idx_naming != -1:
+            self.combo_naming.setCurrentIndex(idx_naming)
+
         self.txt_chat_url.setText(self.config.chat_base_url)
         self.txt_chat_key.setText(self.config.chat_api_key)
         self.combo_chat_model.setCurrentText(self.config.chat_model)
@@ -1042,15 +1041,12 @@ class AnkiHubSearcherDialog(QDialog):
         else:
             self.combo_embed_preset.setCurrentIndex(2)
 
-        # Strategy
-        idx = self.combo_strategy.findData(self.config.embed_language_strategy)
-        if idx != -1:
-            self.combo_strategy.setCurrentIndex(idx)
+        idx_strat = self.combo_strategy.findData(self.config.embed_language_strategy)
+        if idx_strat != -1:
+            self.combo_strategy.setCurrentIndex(idx_strat)
 
-        # Naming style
-        idx_naming = self.combo_naming.findData(self.config.batch_deck_naming_style)
-        if idx_naming != -1:
-            self.combo_naming.setCurrentIndex(idx_naming)
+    def _on_sens_slider_changed(self, val: int) -> None:
+        self.lbl_sens_val.setText(f"{val}%")
 
     def _on_chat_preset_changed(self, idx: int) -> None:
         if idx == 0:
@@ -1071,7 +1067,7 @@ class AnkiHubSearcherDialog(QDialog):
             models = self.ai_client.list_models(url, key)
             self.combo_chat_model.clear()
             self.combo_chat_model.addItems(models)
-            QMessageBox.information(self, "Modelli Caricati", f"Trovati {len(models)} modelli disponibili!")
+            QMessageBox.information(self, "Modelli Caricati", f"Trovati {len(models)} modelli disponibili.")
         except Exception as e:
             QMessageBox.critical(self, "Errore", f"Impossibile caricare i modelli:\n{e}")
 
@@ -1082,7 +1078,7 @@ class AnkiHubSearcherDialog(QDialog):
             models = self.ai_client.list_models(url, key)
             self.combo_embed_model.clear()
             self.combo_embed_model.addItems(models)
-            QMessageBox.information(self, "Modelli Caricati", f"Trovati {len(models)} modelli disponibili!")
+            QMessageBox.information(self, "Modelli Caricati", f"Trovati {len(models)} modelli disponibili.")
         except Exception as e:
             QMessageBox.critical(self, "Errore", f"Impossibile caricare i modelli:\n{e}")
 
@@ -1091,35 +1087,72 @@ class AnkiHubSearcherDialog(QDialog):
         key = self.txt_chat_key.text().strip()
         ok = self.ai_client.test_connection(url, key)
         if ok:
-            QMessageBox.information(self, "Connessione OK", "Connessione riuscita all'endpoint Chat LLM!")
+            QMessageBox.information(self, "Connessione", "Connessione riuscita all'endpoint Chat LLM.")
         else:
-            QMessageBox.critical(self, "Errore Connessione", "Impossibile connettersi all'endpoint specificato.")
+            QMessageBox.critical(self, "Connessione", "Impossibile connettersi all'endpoint specificato.")
 
     def _test_embed_connection(self) -> None:
         url = self.txt_embed_url.text().strip()
         key = self.txt_embed_key.text().strip()
         ok = self.ai_client.test_connection(url, key)
         if ok:
-            QMessageBox.information(self, "Connessione OK", "Connessione riuscita all'endpoint Embedding Model!")
+            QMessageBox.information(self, "Connessione", "Connessione riuscita all'endpoint Embedding Model.")
         else:
-            QMessageBox.critical(self, "Errore Connessione", "Impossibile connettersi all'endpoint specificato.")
+            QMessageBox.critical(self, "Connessione", "Impossibile connettersi all'endpoint specificato.")
+
+    def _populate_note_models(self) -> None:
+        self.combo_note_models.clear()
+        if not self.col:
+            return
+        for m in sorted(self.col.models.all(), key=lambda x: x.get("name", "")):
+            self.combo_note_models.addItem(m.get("name", ""), m.get("id"))
+        self._on_note_model_selected(0)
+
+    def _on_note_model_selected(self, index: int) -> None:
+        self.list_fields.clear()
+        if not self.col or index < 0:
+            return
+        m_name = self.combo_note_models.currentText()
+        mid = self.combo_note_models.currentData()
+        model = self.col.models.get(mid)
+        if not model:
+            return
+
+        available_fields = [f["name"] for f in model.get("flds", [])]
+        configured_fields = set(self.config.get_indexed_fields_for_model(m_name, available_fields))
+
+        for fld in available_fields:
+            item = QListWidgetItem(fld)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if fld in configured_fields else Qt.CheckState.Unchecked)
+            self.list_fields.addItem(item)
 
     def _save_settings(self) -> None:
-        preset_map = {0: "lm_studio", 1: "openrouter", 2: "custom"}
-        self.config.chat_provider = preset_map.get(self.combo_chat_preset.currentIndex(), "custom")
+        self.config.sensitivity = round(self.slider_sens.value() / 100.0, 2)
+        self.config.enable_llm_verification = self.chk_llm_verify.isChecked()
+        self.config.include_active_cards_in_filtered_deck = self.chk_include_active.isChecked()
+        self.config.batch_deck_naming_style = self.combo_naming.currentData() or "dash"
+
         self.config.chat_base_url = self.txt_chat_url.text().strip()
         self.config.chat_api_key = self.txt_chat_key.text().strip()
         self.config.chat_model = self.combo_chat_model.currentText().strip()
 
-        self.config.embed_provider = preset_map.get(self.combo_embed_preset.currentIndex(), "custom")
         self.config.embed_base_url = self.txt_embed_url.text().strip()
         self.config.embed_api_key = self.txt_embed_key.text().strip()
         self.config.embed_model = self.combo_embed_model.currentText().strip()
-
         self.config.embed_language_strategy = self.combo_strategy.currentData() or "translate_to_en"
-        self.config.batch_deck_naming_style = self.combo_naming.currentData() or "dash"
         self.config.index_tags = self.chk_index_tags.isChecked()
 
+        # Save selected fields for active model
+        m_name = self.combo_note_models.currentText()
+        if m_name:
+            checked_fields = []
+            for i in range(self.list_fields.count()):
+                it = self.list_fields.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    checked_fields.append(it.text())
+            if checked_fields:
+                self.config.indexed_fields_by_model[m_name] = checked_fields
+
         self.config.save()
-        self._refresh_index_tab()
-        QMessageBox.information(self, "Salvataggio", "Impostazioni salvate con successo!")
+        self.accept()

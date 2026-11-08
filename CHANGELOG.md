@@ -1,6 +1,25 @@
 # Changelog
 
-All notable changes to **AnkiSmartSearch (AnkiHubSearcher)** are documented in this file.
+All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
+
+## [0.2.0] - 2026-11-08
+
+### Added
+- **Rebranding to "Smart Search":** Renamed add-on across menus, window titles, and `manifest.json`, removing legacy "AnkiHub" references while automatically migrating existing databases (`ankihub_searcher.db` -> `smart_search.db`) without data loss.
+- **`Tools -> Smart Search` Submenu Architecture:**
+  - `Cerca...` (`Ctrl+Shift+F` / `⇧⌘F`)
+  - `Cronologia`
+  - `Indicizzazione`
+  - `Impostazioni`
+  - `Verifica aggiornamenti`
+- **Minimal, Native-Styled UI Redesign (4 Independent Dialogs):**
+  - **Compact `SearchDialog` (`520x460`):** Features a collapsible hierarchical `QTreeWidget` showing parent decks collapsed by default (`▸`) with tri-state checkbox propagation to subdecks, optional base deck name input, lecture text box, and native `"Annulla"` / `"Cerca"` buttons.
+  - **Auto-Close & Direct `"Browser"` Button:** Automatically closes the search window upon completion and shows a summary dialog with `"OK"` and `"Browser"` buttons (`Browser` opens Anki's Card Browser filtered directly to the newly created deck).
+  - **Dedicated `HistoryDialog`, `IndexDialog`, and `SettingsDialog`:** Clean, emoji-free native Qt layouts.
+- **GitHub Auto-Updater (`Verifica aggiornamenti`):**
+  - Queries `https://api.github.com/repos/atturk/AnkiSmartSearch/releases/latest`, displays release notes, and downloads/installs `.ankiaddon` updates directly inside Anki while strictly preserving `user_files/` (local SQLite embeddings database) and `meta.json` (user settings).
+
+---
 
 ## [0.1.1] - 2026-11-08
 

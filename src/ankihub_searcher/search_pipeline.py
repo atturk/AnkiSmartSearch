@@ -1,4 +1,4 @@
-"""Multi-stage hybrid search pipeline for AnkiHubSearcher.
+"""Multi-stage hybrid search pipeline for Smart Search.
 
 Stage 1: LLM Concept Decomposition & Cross-Lingual Medical Query Expansion
 Stage 2: Hybrid Retrieval (Dense Embeddings + SQLite FTS5 BM25) with RRF/linear fusion
@@ -148,7 +148,7 @@ class SmartSearchPipeline:
 
         except Exception as e:
             # Fallback will activate below
-            print(f"[AnkiHubSearcher] Notice: Stage 1 LLM extraction fallback used ({e})")
+            print(f"[SmartSearch] Notice: Stage 1 LLM extraction fallback used ({e})")
 
         # Fallback concept when LLM extraction fails or is offline
         words = re.findall(r"\b[A-Za-z0-9_-]{3,}\b", unit.body_text)
@@ -365,7 +365,7 @@ class SmartSearchPipeline:
                         verified_nids.add(int(nid))
             except Exception as e:
                 # If verification call fails, retain chunk rather than losing results
-                print(f"[AnkiHubSearcher] Notice: Stage 3 verification call error ({e}), keeping batch.")
+                print(f"[SmartSearch] Notice: Stage 3 verification call error ({e}), keeping batch.")
                 for c in chunk:
                     verified_nids.add(c.nid)
 

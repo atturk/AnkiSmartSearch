@@ -284,7 +284,7 @@ def rollback_run(
                 col.decks.remove([record.filtered_did])
                 deck_removed = True
         except Exception as e:
-            print(f"[AnkiHubSearcher] Notice: could not remove filtered deck {record.filtered_did}: {e}")
+            print(f"[SmartSearch] Notice: could not remove filtered deck {record.filtered_did}: {e}")
 
     # 2. Check which cards to re-suspend
     candidate_cids = list(record.newly_unsuspended_cids)

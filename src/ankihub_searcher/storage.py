@@ -1,4 +1,4 @@
-"""SQLite storage engine and model-scoped vector index for AnkiHubSearcher.
+"""SQLite storage engine and model-scoped vector index for Smart Search.
 
 Manages:
 1. notes_content: extracted text and tags per note.
@@ -65,19 +65,46 @@ def unpack_vector(blob: bytes, dim: int) -> List[float]:
 
 
 class SearchDatabase:
-    """Thread-safe SQLite database manager for AnkiHubSearcher."""
+    """Thread-safe SQLite database manager for Smart Search."""
 
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            # Default to <addon_dir>/user_files/ankihub_searcher.db
+            # Default to <addon_dir>/user_files/smart_search.db
             base_dir = os.path.dirname(os.path.abspath(__file__))
             user_files = os.path.join(base_dir, "user_files")
             os.makedirs(user_files, exist_ok=True)
-            db_path = os.path.join(user_files, "ankihub_searcher.db")
+            db_path = os.path.join(user_files, "smart_search.db")
+
+            # Automatic migration: if smart_search.db does not exist, check legacy ankihub_searcher.db
+            legacy_path = os.path.join(user_files, "ankihub_searcher.db")
+            if not os.path.exists(db_path) and os.path.exists(legacy_path):
+                self._migrate_legacy_db(legacy_path, db_path)
 
         self.db_path = db_path
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self._init_db()
+
+    @staticmethod
+    def _migrate_legacy_db(legacy_path: str, new_path: str) -> None:
+        """Migrates legacy ankihub_searcher.db to smart_search.db preserving WAL state."""
+        try:
+            try:
+                conn = sqlite3.connect(legacy_path)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.close()
+            except Exception:
+                pass
+            os.rename(legacy_path, new_path)
+            for suffix in ("-wal", "-shm"):
+                old_file = legacy_path + suffix
+                new_file = new_path + suffix
+                if os.path.exists(old_file):
+                    try:
+                        os.rename(old_file, new_file)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[SmartSearch] Warning: failed to migrate legacy database: {e}")
 
     @contextmanager
     def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -711,3 +738,61 @@ class SearchDatabase:
         with self._get_connection() as conn:
             conn.execute("DELETE FROM run_history WHERE run_id = ?", (run_id,))
             conn.commit()
+
+    def export_database(self, target_file_path: str) -> None:
+        """Safely exports the entire SQLite database to a target file."""
+        os.makedirs(os.path.dirname(os.path.abspath(target_file_path)), exist_ok=True)
+        if os.path.exists(target_file_path):
+            os.remove(target_file_path)
+        with self._get_connection() as src_conn:
+            dst_conn = sqlite3.connect(target_file_path)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+
+    def import_database(self, source_file_path: str) -> Dict[str, int]:
+        """Imports and merges notes and embeddings from an external database."""
+        if not os.path.exists(source_file_path):
+            raise FileNotFoundError(f"Source file not found: {source_file_path}")
+
+        with self._get_connection() as conn:
+            conn.execute("ATTACH DATABASE ? AS src_db", (source_file_path,))
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO notes_content (nid, mid, note_mod, content_hash, clean_text, clean_tags)
+                    SELECT nid, mid, note_mod, content_hash, clean_text, clean_tags FROM src_db.notes_content
+                    ON CONFLICT(nid) DO UPDATE SET
+                        mid=excluded.mid,
+                        note_mod=excluded.note_mod,
+                        content_hash=excluded.content_hash,
+                        clean_text=excluded.clean_text,
+                        clean_tags=excluded.clean_tags
+                    """
+                )
+                notes_imported = cur.rowcount
+
+                conn.execute("DELETE FROM notes_fts WHERE nid IN (SELECT nid FROM src_db.notes_content)")
+                conn.execute(
+                    """
+                    INSERT INTO notes_fts (nid, clean_text, clean_tags)
+                    SELECT nid, clean_text, clean_tags FROM src_db.notes_content
+                    """
+                )
+
+                cur_emb = conn.execute(
+                    """
+                    INSERT INTO note_embeddings (nid, model_id, content_hash, dim, vector_blob)
+                    SELECT nid, model_id, content_hash, dim, vector_blob FROM src_db.note_embeddings
+                    ON CONFLICT(nid, model_id) DO UPDATE SET
+                        content_hash=excluded.content_hash,
+                        dim=excluded.dim,
+                        vector_blob=excluded.vector_blob
+                    """
+                )
+                embeddings_imported = cur_emb.rowcount
+                conn.commit()
+                return {"notes_imported": notes_imported, "embeddings_imported": embeddings_imported}
+            finally:
+                conn.execute("DETACH DATABASE src_db")

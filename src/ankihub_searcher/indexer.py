@@ -1,4 +1,4 @@
-"""Incremental background note indexer for AnkiHubSearcher.
+"""Incremental background note indexer for Smart Search.
 
 Indexes notes from selected decks:
 - Cleans and extracts text and tags.
