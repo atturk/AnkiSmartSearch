@@ -37,6 +37,48 @@ class ScoredNote:
     clean_text_preview: str = ""
 
 
+@dataclass
+class ConceptCoverage:
+    """Tracks how well the Anki collection covers an extracted lecture concept/claim."""
+
+    topic_it: str
+    claim_en: str
+    keywords_en: List[str] = field(default_factory=list)
+    matched_notes_count: int = 0
+    matched_nids: List[int] = field(default_factory=list)
+    best_score: float = 0.0
+    best_nid: Optional[int] = None
+    best_note_preview: str = ""
+    status: str = "uncovered"  # "covered" | "partial" | "uncovered"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "topic_it": self.topic_it,
+            "claim_en": self.claim_en,
+            "keywords_en": list(self.keywords_en),
+            "matched_notes_count": int(self.matched_notes_count),
+            "matched_nids": list(self.matched_nids),
+            "best_score": float(self.best_score),
+            "best_nid": self.best_nid,
+            "best_note_preview": self.best_note_preview,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConceptCoverage":
+        return cls(
+            topic_it=str(data.get("topic_it", "")),
+            claim_en=str(data.get("claim_en", "")),
+            keywords_en=[str(x) for x in data.get("keywords_en", [])],
+            matched_notes_count=int(data.get("matched_notes_count", 0)),
+            matched_nids=[int(x) for x in data.get("matched_nids", [])],
+            best_score=float(data.get("best_score", 0.0)),
+            best_nid=int(data["best_nid"]) if data.get("best_nid") is not None else None,
+            best_note_preview=str(data.get("best_note_preview", "")),
+            status=str(data.get("status", "uncovered")),
+        )
+
+
 SYSTEM_PROMPT_STAGE1 = """You are an elite medical professor, USMLE Step 1/Step 2 expert, and AnKing deck specialist.
 Your task is to decompose the following Italian lecture notes into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
 
@@ -91,6 +133,7 @@ class SmartSearchPipeline:
         self.config = config
         self.storage = storage
         self.ai_client = ai_client
+        self.last_concept_coverage: List[ConceptCoverage] = []
 
     # ---------------- Stage 1: Concept Extraction ----------------
 
@@ -200,6 +243,7 @@ class SmartSearchPipeline:
 
         # Track results per note: nid -> {"scores": [float], "concepts": [str]}
         notes_agg: Dict[int, Dict[str, Any]] = {}
+        raw_coverage_list: List[ConceptCoverage] = []
 
         # Pre-load candidate vectors ONCE for all concepts in this unit
         loaded_nids, loaded_vecs, _ = self.storage.load_embeddings_for_notes(
@@ -210,6 +254,13 @@ class SmartSearchPipeline:
         for idx, concept in enumerate(concepts):
             q_vec = concept_vectors[idx] if idx < len(concept_vectors) else []
             if not q_vec:
+                raw_coverage_list.append(
+                    ConceptCoverage(
+                        topic_it=concept.topic_it,
+                        claim_en=concept.claim_en,
+                        keywords_en=list(concept.keywords_en),
+                    )
+                )
                 continue
 
             # A. Dense Cosine Similarity against pre-loaded matrix/vectors
@@ -267,6 +318,38 @@ class SmartSearchPipeline:
             else:
                 top_concept_candidates = concept_candidates[:effective_top_k]
 
+            # Record per-concept coverage metrics
+            best_nid: Optional[int] = None
+            best_score: float = 0.0
+            if concept_candidates:
+                best_nid, best_score = concept_candidates[0][0], round(concept_candidates[0][1], 4)
+            elif dense_hits:
+                top_d_nid, top_d_score = dense_hits[0]
+                best_nid = top_d_nid
+                best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
+
+            matched_c_nids = [nid for nid, _ in top_concept_candidates]
+            matched_cnt = len(matched_c_nids)
+            if matched_cnt == 0:
+                c_status = "uncovered"
+            elif matched_cnt == 1 or best_score < (min_threshold + 0.06):
+                c_status = "partial"
+            else:
+                c_status = "covered"
+
+            raw_coverage_list.append(
+                ConceptCoverage(
+                    topic_it=concept.topic_it,
+                    claim_en=concept.claim_en,
+                    keywords_en=list(concept.keywords_en),
+                    matched_notes_count=matched_cnt,
+                    matched_nids=matched_c_nids,
+                    best_score=best_score,
+                    best_nid=best_nid,
+                    status=c_status,
+                )
+            )
+
             c_label = concept.topic_it or concept.claim_en[:40]
             for nid, score in top_concept_candidates:
                 if nid not in notes_agg:
@@ -274,6 +357,16 @@ class SmartSearchPipeline:
                 notes_agg[nid]["scores"].append(score)
                 if c_label not in notes_agg[nid]["concepts"]:
                     notes_agg[nid]["concepts"].append(c_label)
+
+        # Populate best_note_preview for coverage items
+        best_nids_to_load = list({c.best_nid for c in raw_coverage_list if c.best_nid is not None})
+        best_content_map = self.storage.get_notes_content(best_nids_to_load) if best_nids_to_load else {}
+        for cov in raw_coverage_list:
+            if cov.best_nid is not None and cov.best_nid in best_content_map:
+                txt = best_content_map[cov.best_nid]["clean_text"]
+                cov.best_note_preview = (txt[:220] + "...") if len(txt) > 220 else txt
+
+        self.last_concept_coverage = raw_coverage_list
 
         if not notes_agg:
             return []
@@ -393,4 +486,15 @@ class SmartSearchPipeline:
         )
         if self.config.enable_llm_verification:
             candidates = self.verify_candidates(unit, candidates)
+            surviving_nids = {c.nid for c in candidates}
+            min_threshold = self.config.get_min_similarity_threshold()
+            for cov in self.last_concept_coverage:
+                cov.matched_nids = [n for n in cov.matched_nids if n in surviving_nids]
+                cov.matched_notes_count = len(cov.matched_nids)
+                if cov.matched_notes_count == 0:
+                    cov.status = "uncovered"
+                elif cov.matched_notes_count == 1 or cov.best_score < (min_threshold + 0.06):
+                    cov.status = "partial"
+                else:
+                    cov.status = "covered"
         return candidates

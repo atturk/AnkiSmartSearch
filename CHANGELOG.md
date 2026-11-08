@@ -2,6 +2,21 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.3.0] - 2026-11-08
+
+### Added
+- **Browser-Style Search Query Bar with History & Live Counter (`SearchDialog`):**
+  - Replaced the deck checkbox tree with an editable `QComboBox` supporting full Anki Browser query syntax (e.g. `"deck:AnKing Step Deck"`, `"deck:AnKing Step Deck" OR "deck:Mastering Radiology"`, tag filters, etc.).
+  - Automatically saves and restores the last used query and maintains a dropdown history of the last 20 queries.
+  - Live debounced counter below the query bar displays the exact number of matching cards, notes, and active-model indexing coverage percentage (`Carte: X (Y note) — Indicizzate: Z%`).
+- **Automatic Child Filtered Deck under Single Source Deck:**
+  - When the search query targets a single source deck (or subdecks of a single parent deck, e.g. `"deck:AnKing Step Deck"`), the created Filtered Deck is automatically placed as a child subdeck of that deck (`AnKing Step Deck::Nome Mazzo Filtrato`).
+- **Per-Claim Concept Coverage & `"Dettagli copertura"` Dialog:**
+  - Computes zero-overhead coverage metrics for every LLM-extracted key point (`Coperto`, `Parziale`, `Scoperto`), showing overall coverage in the post-search summary popup (`Copertura punti chiave: X / Y (Z%) — K scoperti`).
+  - Added `"Dettagli copertura"` button in both the post-search summary popup and the `Cronologia` window to inspect every claim, its matched note count, max similarity score, closest card preview, and a 1-click `"Copia punti scoperti / parziali"` button to create new flashcards for uncovered lecture material.
+
+---
+
 ## [0.2.1] - 2026-11-08
 
 ### Fixed

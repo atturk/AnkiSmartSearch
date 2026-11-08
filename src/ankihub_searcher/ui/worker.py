@@ -84,6 +84,7 @@ class IndexWorker(QThread):
                 selected_deck_names=self.selected_decks,
                 progress_callback=_on_progress,
                 cancel_check=_check_cancel,
+                search_query=self.config.get_effective_search_query() if self.selected_decks is None else None,
             )
             self.finished_sig.emit(res)
         except Exception as e:
@@ -140,11 +141,13 @@ class SearchBatchWorker(QThread):
             total_units = len(units)
             self.progress_sig.emit(0, total_units, f"Rilevate {total_units} unità di studio.")
 
-            # 2. Check and ensure target decks are indexed
+            # 2. Check and ensure target query notes are indexed
             indexer = DeckIndexer(self.config, self.storage, self.ai_client)
-            target_dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
-            candidate_nids = indexer.get_notes_in_decks(self.col, target_dids)
-            suspended_nids = indexer.get_notes_with_suspended_cards(self.col, target_dids)
+            active_query = self.config.get_effective_search_query()
+            candidate_nids = indexer.get_notes_for_query(self.col, active_query)
+            suspended_nids = indexer.get_notes_with_suspended_cards_for_query(self.col, active_query)
+            allowed_cids = set(indexer.get_cards_for_query(self.col, active_query))
+            parent_deck_prefix = indexer.detect_single_parent_deck(self.col, active_query)
 
             def _check_cancel() -> bool:
                 return self._is_cancelled
@@ -157,6 +160,7 @@ class SearchBatchWorker(QThread):
                 selected_deck_names=self.config.selected_decks,
                 progress_callback=_on_idx_progress,
                 cancel_check=_check_cancel,
+                search_query=active_query,
             )
 
             if self._is_cancelled:
@@ -195,12 +199,16 @@ class SearchBatchWorker(QThread):
                 )
 
                 # Safe filtered deck creation
+                cov_dicts = [c.to_dict() for c in pipeline.last_concept_coverage]
                 run_res = execute_unit_deck_creation(
                     col=self.col,
                     unit=unit,
                     matched_nids=matched_nids,
                     config=self.config,
                     storage=self.storage,
+                    concept_coverage=cov_dicts,
+                    parent_deck_prefix=parent_deck_prefix,
+                    allowed_cids=allowed_cids if allowed_cids else None,
                 )
                 results.append(run_res)
 

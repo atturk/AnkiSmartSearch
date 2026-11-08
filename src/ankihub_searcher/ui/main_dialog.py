@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set
 try:
     from aqt import mw  # type: ignore
     from aqt.qt import (  # type: ignore
+        QApplication,
         QCheckBox,
         QComboBox,
         QDialog,
@@ -37,6 +38,7 @@ try:
         QSlider,
         QTableWidget,
         QTableWidgetItem,
+        QTimer,
         QTreeWidget,
         QTreeWidgetItem,
         Qt,
@@ -45,8 +47,9 @@ try:
     )
 except ImportError:
     try:
-        from PyQt6.QtCore import Qt  # type: ignore
+        from PyQt6.QtCore import Qt, QTimer  # type: ignore
         from PyQt6.QtWidgets import (  # type: ignore
+            QApplication,
             QCheckBox,
             QComboBox,
             QDialog,
@@ -94,8 +97,176 @@ CURRENT_VERSION = "0.2.0"
 # 1. SEARCH DIALOG (Compact Main Window)
 # =====================================================================
 
+class CoverageDetailDialog(QDialog):
+    """Minimal dialog displaying per-concept coverage details and uncovered claims."""
+
+    def __init__(
+        self,
+        coverage_items: List[Dict[str, Any]],
+        title_context: str = "",
+        created_deck_names: Optional[List[str]] = None,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.coverage_items = list(coverage_items or [])
+        self.created_deck_names = list(created_deck_names or [])
+
+        win_title = "Smart Search — Dettagli Copertura"
+        if title_context:
+            win_title += f" ({title_context})"
+        self.setWindowTitle(win_title)
+        self.resize(740, 480)
+
+        # Sort: uncovered first, then partial, then covered (and ascending by score)
+        status_order = {"uncovered": 0, "partial": 1, "covered": 2}
+        self.sorted_items = sorted(
+            self.coverage_items,
+            key=lambda x: (status_order.get(str(x.get("status", "uncovered")), 0), float(x.get("best_score", 0.0))),
+        )
+
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        total = len(self.sorted_items)
+        covered = sum(1 for c in self.sorted_items if c.get("status") == "covered")
+        partial = sum(1 for c in self.sorted_items if c.get("status") == "partial")
+        uncovered = sum(1 for c in self.sorted_items if c.get("status") == "uncovered")
+        matched_any = total - uncovered
+        pct = int(round((matched_any / total) * 100)) if total > 0 else 0
+
+        summary_lbl = QLabel(
+            f"Copertura punti chiave: {matched_any} / {total} ({pct}%)  —  "
+            f"Coperti: {covered}  |  Parziali: {partial}  |  Scoperti: {uncovered}"
+        )
+        layout.addWidget(summary_lbl)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Stato", "Punto Chiave (IT)", "Claim USMLE (EN)", "Carte / Score"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setRowCount(len(self.sorted_items))
+
+        status_labels = {
+            "uncovered": "Scoperto (0)",
+            "partial": "Parziale",
+            "covered": "Coperto",
+        }
+
+        for r_idx, item in enumerate(self.sorted_items):
+            st_raw = str(item.get("status", "uncovered"))
+            st_text = status_labels.get(st_raw, st_raw)
+            topic_it = str(item.get("topic_it", ""))
+            claim_en = str(item.get("claim_en", ""))
+            notes_cnt = int(item.get("matched_notes_count", 0))
+            best_score = float(item.get("best_score", 0.0))
+
+            self.table.setItem(r_idx, 0, QTableWidgetItem(st_text))
+            self.table.setItem(r_idx, 1, QTableWidgetItem(topic_it))
+            self.table.setItem(r_idx, 2, QTableWidgetItem(claim_en))
+            self.table.setItem(r_idx, 3, QTableWidgetItem(f"{notes_cnt} note ({best_score:.2f})"))
+
+        self.table.setColumnWidth(1, 180)
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        layout.addWidget(self.table)
+
+        lbl_detail = QLabel("Dettaglio punto selezionato (selezionabile e copiabile):")
+        layout.addWidget(lbl_detail)
+
+        self.txt_detail = QPlainTextEdit()
+        self.txt_detail.setReadOnly(True)
+        self.txt_detail.setMaximumHeight(120)
+        layout.addWidget(self.txt_detail)
+
+        if self.sorted_items:
+            self.table.selectRow(0)
+
+        btn_layout = QHBoxLayout()
+
+        btn_copy_uncovered = QPushButton("Copia punti scoperti / parziali")
+        btn_copy_uncovered.clicked.connect(self._copy_uncovered_to_clipboard)
+        btn_layout.addWidget(btn_copy_uncovered)
+
+        if self.created_deck_names:
+            btn_browser = QPushButton("Browser")
+            btn_browser.clicked.connect(self._open_browser)
+            btn_layout.addWidget(btn_browser)
+
+        btn_layout.addStretch()
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setDefault(True)
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_close)
+
+        layout.addLayout(btn_layout)
+
+    def _on_row_selected(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        if row < 0 or row >= len(self.sorted_items):
+            return
+        item = self.sorted_items[row]
+        st_map = {"uncovered": "SCOPERTO", "partial": "PARZIALE", "covered": "COPERTO"}
+        st = st_map.get(str(item.get("status", "uncovered")), "SCOPERTO")
+        kws = ", ".join(item.get("keywords_en", []))
+        preview = str(item.get("best_note_preview", "")).strip() or "Nessuna nota corrispondente."
+        text = (
+            f"[{st}] {item.get('topic_it', '')}\n"
+            f"Claim (EN): {item.get('claim_en', '')}\n"
+            f"Keywords: {kws}\n"
+            f"Nota più vicina nel mazzo (score {float(item.get('best_score', 0.0)):.2f}): {preview}"
+        )
+        self.txt_detail.setPlainText(text)
+
+    def _copy_uncovered_to_clipboard(self) -> None:
+        targets = [c for c in self.sorted_items if c.get("status") in ("uncovered", "partial")]
+        if not targets:
+            targets = self.sorted_items
+        lines = []
+        for c in targets:
+            st = "SCOPERTO" if c.get("status") == "uncovered" else "PARZIALE" if c.get("status") == "partial" else "COPERTO"
+            lines.append(f"- [{st}] {c.get('topic_it', '')}: {c.get('claim_en', '')}")
+        text = "\n".join(lines)
+        try:
+            cb = QApplication.clipboard()
+            if cb:
+                cb.setText(text)
+            QMessageBox.information(
+                self,
+                "Copiato",
+                f"Copiati {len(targets)} punti chiave negli appunti.",
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Errore", f"Impossibile copiare negli appunti:\n{e}")
+
+    def _open_browser(self) -> None:
+        try:
+            import aqt
+            if aqt.mw and self.created_deck_names:
+                query = " OR ".join(f'"deck:{name}"' for name in self.created_deck_names)
+                browser = aqt.dialogs.open("Browser", aqt.mw)
+                if browser and hasattr(browser, "search_for"):
+                    browser.search_for(query)
+        except Exception as e:
+            print(f"[SmartSearch] Error opening browser: {e}")
+
+
+# =====================================================================
+# 1. SEARCH DIALOG (Compact Main Window)
+# =====================================================================
+
 class SearchDialog(QDialog):
-    """Compact, minimal main search dialog with hierarchical deck tree."""
+    """Compact, minimal main search dialog with Browser-style query input and history."""
 
     def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -103,27 +274,43 @@ class SearchDialog(QDialog):
         self.config = ConfigManager.load()
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
+        self.indexer = DeckIndexer(self.config, self.storage, self.ai_client)
 
         self.setWindowTitle("Smart Search")
-        self.resize(520, 460)
+        self.resize(540, 410)
 
         self.search_worker: Optional[SearchBatchWorker] = None
+        self._query_timer = QTimer(self)
+        self._query_timer.setSingleShot(True)
+        self._query_timer.setInterval(250)
+        self._query_timer.timeout.connect(self._update_query_stats)
+
         self._init_ui()
+        self._update_query_stats()
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        # 1. Hierarchical Deck Selection Tree
-        lbl_decks = QLabel("Mazzi in cui cercare:")
-        layout.addWidget(lbl_decks)
+        # 1. Browser-style Search Query Input with History
+        lbl_query = QLabel("Mazzi / Query in cui cercare (sintassi Browser Anki):")
+        layout.addWidget(lbl_query)
 
-        self.deck_tree = QTreeWidget()
-        self.deck_tree.setHeaderHidden(True)
-        self.deck_tree.setMaximumHeight(130)
-        self.deck_tree.itemChanged.connect(self._on_tree_item_changed)
-        layout.addWidget(self.deck_tree)
-        self._populate_deck_tree()
+        self.combo_query = QComboBox()
+        self.combo_query.setEditable(True)
+        self.combo_query.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if self.config.search_query_history:
+            self.combo_query.addItems(self.config.search_query_history)
+        self.combo_query.setCurrentText(self.config.get_effective_search_query())
+        if self.combo_query.lineEdit():
+            self.combo_query.lineEdit().setPlaceholderText(
+                'Es. "deck:AnKing Step Deck" oppure "deck:AnKing Step Deck" OR "deck:Mastering Radiology"'
+            )
+        self.combo_query.currentTextChanged.connect(self._on_query_text_changed)
+        layout.addWidget(self.combo_query)
+
+        self.lbl_query_stats = QLabel("Carte selezionate: calcolo in corso...")
+        layout.addWidget(self.lbl_query_stats)
 
         # 2. Filtered Deck Name (Optional)
         lbl_deck_name = QLabel("Nome mazzo filtrato (opzionale):")
@@ -167,132 +354,42 @@ class SearchDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
-    def _populate_deck_tree(self) -> None:
-        self.deck_tree.clear()
+    def _on_query_text_changed(self, _text: str) -> None:
+        self._query_timer.start()
+
+    def _update_query_stats(self) -> None:
         if not self.col:
+            self.lbl_query_stats.setText("Collezione Anki non disponibile.")
             return
 
-        items_by_path: Dict[str, QTreeWidgetItem] = {}
-        selected_set = set(self.config.selected_decks)
+        query = self.combo_query.currentText().strip()
+        if not query:
+            self.lbl_query_stats.setText("Inserisci una query (es. \"deck:AnKing Step Deck\").")
+            return
 
-        # Collect and sort all normal (non-filtered) deck names from collection
         try:
-            raw_decks = self.col.decks.all()
+            cids = self.indexer.get_cards_for_query(self.col, query)
+            nids = self.indexer.get_notes_for_query(self.col, query)
+            total_cards = len(cids)
+            total_notes = len(nids)
+
+            active_model = self.config.get_active_model_id()
+            indexed_notes = (
+                self.storage.count_embeddings_for_notes(nids, active_model) if total_notes > 0 else 0
+            )
+            pct = int(round((indexed_notes / total_notes) * 100)) if total_notes > 0 else 0
+
+            self.lbl_query_stats.setText(
+                f"Carte: {total_cards:,} ({total_notes:,} note) — Indicizzate: {pct}% ({indexed_notes:,} / {total_notes:,})"
+            )
+            # Persist current valid query so IndexDialog sees it immediately
+            self.config.search_query = query
+            extracted_decks = self.indexer.extract_deck_names_from_query(query)
+            if extracted_decks:
+                self.config.selected_decks = extracted_decks
+            self.config.save()
         except Exception:
-            raw_decks = self.col.decks.all_names_and_ids() if hasattr(self.col.decks, "all_names_and_ids") else []
-
-        deck_names = sorted(
-            (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
-            for d in raw_decks
-            if (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
-            and not (d.get("dyn", 0) if isinstance(d, dict) else getattr(d, "dyn", 0))
-        )
-
-        self.deck_tree.blockSignals(True)
-        for dname in deck_names:
-            parts = dname.split("::")
-            parent_item = None
-            curr_path = ""
-            for i, part in enumerate(parts):
-                curr_path = "::".join(parts[: i + 1])
-                if curr_path in items_by_path:
-                    parent_item = items_by_path[curr_path]
-                    continue
-
-                item = QTreeWidgetItem()
-                item.setText(0, part)
-                item.setData(0, Qt.ItemDataRole.UserRole, curr_path)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-
-                # Check if this path (or a parent prefix) was configured as selected
-                is_selected = (curr_path in selected_set) or any(
-                    curr_path.startswith(f"{s}::") for s in selected_set
-                )
-                item.setCheckState(0, Qt.CheckState.Checked if is_selected else Qt.CheckState.Unchecked)
-
-                if parent_item is None:
-                    self.deck_tree.addTopLevelItem(item)
-                    item.setExpanded(False)  # Collapsed by default
-                else:
-                    parent_item.addChild(item)
-                    item.setExpanded(False)
-
-                items_by_path[curr_path] = item
-                parent_item = item
-
-        # Update parent states bottom-up based on initial child states
-        for top_idx in range(self.deck_tree.topLevelItemCount()):
-            self._sync_subtree_check_state_bottom_up(self.deck_tree.topLevelItem(top_idx))
-
-        self.deck_tree.blockSignals(False)
-
-    def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        self.deck_tree.blockSignals(True)
-        state = item.checkState(column)
-        if state in (Qt.CheckState.Checked, Qt.CheckState.Unchecked):
-            self._set_children_check_state(item, state)
-        self._update_ancestors_check_state(item)
-        self.deck_tree.blockSignals(False)
-        self.config.selected_decks = self._get_selected_deck_names()
-        self.config.save()
-
-    def _set_children_check_state(self, item: QTreeWidgetItem, state: Qt.CheckState) -> None:
-        for i in range(item.childCount()):
-            child = item.child(i)
-            child.setCheckState(0, state)
-            self._set_children_check_state(child, state)
-
-    def _recompute_node_check_state_from_children(self, node: QTreeWidgetItem) -> None:
-        child_count = node.childCount()
-        if child_count == 0:
-            return
-        checked_count = 0
-        partially_count = 0
-        for i in range(child_count):
-            c_state = node.child(i).checkState(0)
-            if c_state == Qt.CheckState.Checked:
-                checked_count += 1
-            elif c_state == Qt.CheckState.PartiallyChecked:
-                partially_count += 1
-
-        if checked_count == child_count:
-            node.setCheckState(0, Qt.CheckState.Checked)
-        elif checked_count > 0 or partially_count > 0:
-            node.setCheckState(0, Qt.CheckState.PartiallyChecked)
-        else:
-            node.setCheckState(0, Qt.CheckState.Unchecked)
-
-    def _sync_subtree_check_state_bottom_up(self, item: QTreeWidgetItem) -> None:
-        for i in range(item.childCount()):
-            self._sync_subtree_check_state_bottom_up(item.child(i))
-        if item.childCount() > 0:
-            self._recompute_node_check_state_from_children(item)
-
-    def _update_ancestors_check_state(self, item: QTreeWidgetItem) -> None:
-        parent = item.parent()
-        while parent is not None:
-            self._recompute_node_check_state_from_children(parent)
-            parent = parent.parent()
-
-    def _get_selected_deck_names(self) -> List[str]:
-        selected: List[str] = []
-
-        def _traverse(item: QTreeWidgetItem) -> None:
-            state = item.checkState(0)
-            full_name = item.data(0, Qt.ItemDataRole.UserRole) or item.text(0)
-
-            if state == Qt.CheckState.Checked:
-                # The entire deck (and its subdecks, if any) is selected
-                selected.append(full_name)
-            elif state == Qt.CheckState.PartiallyChecked:
-                # Only some children are selected, recurse
-                for i in range(item.childCount()):
-                    _traverse(item.child(i))
-
-        for idx in range(self.deck_tree.topLevelItemCount()):
-            _traverse(self.deck_tree.topLevelItem(idx))
-
-        return selected
+            self.lbl_query_stats.setText("Query incompleta o sintassi non valida.")
 
     def _on_cancel_clicked(self) -> None:
         if self.search_worker and self.search_worker.isRunning():
@@ -307,12 +404,29 @@ class SearchDialog(QDialog):
             QMessageBox.warning(self, "Attenzione", "Inserisci il testo della lezione prima di avviare la ricerca.")
             return
 
-        selected_decks = self._get_selected_deck_names()
-        if not selected_decks:
-            QMessageBox.warning(self, "Attenzione", "Seleziona almeno un mazzo in cui cercare.")
+        query = self.combo_query.currentText().strip()
+        if not query:
+            QMessageBox.warning(self, "Attenzione", "Inserisci una query di ricerca valida.")
             return
 
-        self.config.selected_decks = selected_decks
+        if self.col:
+            try:
+                matched_nids = self.indexer.get_notes_for_query(self.col, query)
+                if not matched_nids:
+                    QMessageBox.warning(
+                        self,
+                        "Nessuna carta trovata",
+                        f"La query '{query}' non restituisce alcuna nota nella tua collezione.",
+                    )
+                    return
+            except Exception as e:
+                QMessageBox.warning(self, "Query non valida", f"Errore nella query di ricerca:\n{e}")
+                return
+
+        self.config.add_query_to_history(query)
+        extracted_decks = self.indexer.extract_deck_names_from_query(query)
+        if extracted_decks:
+            self.config.selected_decks = extracted_decks
         self.config.save()
 
         self.btn_search.setEnabled(False)
@@ -360,6 +474,23 @@ class SearchDialog(QDialog):
         total_already_active = sum(len(r.already_active_cids) for r in results)
         decks_created = len([r for r in results if r.total_cards_count > 0])
 
+        all_coverage: List[Dict[str, Any]] = []
+        for r in results:
+            if getattr(r, "concept_coverage", None):
+                all_coverage.extend(r.concept_coverage)
+
+        total_claims = len(all_coverage)
+        uncovered_claims = sum(1 for c in all_coverage if c.get("status") == "uncovered")
+        matched_claims = total_claims - uncovered_claims
+        cov_pct = int(round((matched_claims / total_claims) * 100)) if total_claims > 0 else 0
+
+        cov_line = ""
+        if total_claims > 0:
+            cov_line = (
+                f"\nCopertura punti chiave: {matched_claims} / {total_claims} ({cov_pct}%) — "
+                f"{uncovered_claims} scoperti"
+            )
+
         # 1. Reset Anki window so created filtered decks are immediately visible
         try:
             from aqt import mw
@@ -371,7 +502,7 @@ class SearchDialog(QDialog):
         # 2. Automatically close the SearchDialog
         self.accept()
 
-        # 3. Present clean post-search summary popup with Browser shortcut
+        # 3. Present clean post-search summary popup with Browser & Coverage Details buttons
         parent_widget = mw if mw else None
         msg_box = QMessageBox(parent_widget)
         msg_box.setWindowTitle("Ricerca completata")
@@ -380,6 +511,7 @@ class SearchDialog(QDialog):
             msg_box.setText(
                 f"Nessuna nuova carta da riattivare.\n\n"
                 f"Carte correlate già attive in studio: {total_already_active}"
+                f"{cov_line}"
             )
         else:
             msg_box.setText(
@@ -387,17 +519,22 @@ class SearchDialog(QDialog):
                 f"Nuove carte riattivate: {total_unsuspended}\n"
                 f"Carte correlate già attive: {total_already_active}\n"
                 f"Carte totali nel mazzo filtrato: {total_added}"
+                f"{cov_line}"
             )
 
         msg_box.addButton(QMessageBox.StandardButton.Ok)
         btn_browser = None
+        btn_coverage = None
         created_names = [r.deck_name for r in results if r.filtered_did and r.total_cards_count > 0]
         if created_names:
             btn_browser = msg_box.addButton("Browser", QMessageBox.ButtonRole.ActionRole)
+        if all_coverage:
+            btn_coverage = msg_box.addButton("Dettagli copertura", QMessageBox.ButtonRole.ActionRole)
 
         msg_box.exec()
+        clicked = msg_box.clickedButton()
 
-        if btn_browser and msg_box.clickedButton() == btn_browser:
+        if btn_browser and clicked == btn_browser:
             try:
                 import aqt
                 if aqt.mw:
@@ -407,6 +544,13 @@ class SearchDialog(QDialog):
                         browser.search_for(query)
             except Exception as e:
                 print(f"[SmartSearch] Error opening browser: {e}")
+        elif btn_coverage and clicked == btn_coverage:
+            cov_dlg = CoverageDetailDialog(
+                coverage_items=all_coverage,
+                created_deck_names=created_names,
+                parent=parent_widget,
+            )
+            cov_dlg.exec()
 
     def _on_search_error(self, err_msg: str) -> None:
         self.btn_search.setEnabled(True)
@@ -451,9 +595,9 @@ class HistoryDialog(QDialog):
         layout.addWidget(info_lbl)
 
         self.history_table = QTableWidget()
-        self.history_table.setColumnCount(7)
+        self.history_table.setColumnCount(8)
         self.history_table.setHorizontalHeaderLabels(
-            ["Data", "Mazzo Filtrato", "Unità", "Nel Mazzo", "Nuove Riattivate", "Già Attive", "Stato"]
+            ["Data", "Mazzo Filtrato", "Unità", "Nel Mazzo", "Nuove Riattivate", "Già Attive", "Copertura", "Stato"]
         )
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.history_table.horizontalHeader().setStretchLastSection(True)
@@ -478,6 +622,10 @@ class HistoryDialog(QDialog):
         self.btn_delete_deck_only.clicked.connect(self._on_delete_deck_only_clicked)
         btn_layout.addWidget(self.btn_delete_deck_only)
 
+        self.btn_coverage = QPushButton("Dettagli copertura")
+        self.btn_coverage.clicked.connect(self._on_coverage_clicked)
+        btn_layout.addWidget(self.btn_coverage)
+
         btn_layout.addStretch()
 
         btn_refresh = QPushButton("Aggiorna")
@@ -498,6 +646,14 @@ class HistoryDialog(QDialog):
             t_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.created_at))
             status_str = "Annullata" if r.rolled_back else "Attiva"
 
+            cov_list = getattr(r, "concept_coverage", None) or []
+            if cov_list:
+                tot_c = len(cov_list)
+                unc_c = sum(1 for c in cov_list if c.get("status") == "uncovered")
+                cov_str = f"{tot_c - unc_c}/{tot_c} ({int(round((tot_c - unc_c) / tot_c * 100))}%)"
+            else:
+                cov_str = "-"
+
             item_date = QTableWidgetItem(t_str)
             item_date.setData(Qt.ItemDataRole.UserRole, r.run_id)
 
@@ -507,7 +663,8 @@ class HistoryDialog(QDialog):
             self.history_table.setItem(row_idx, 3, QTableWidgetItem(str(len(r.total_matched_cids))))
             self.history_table.setItem(row_idx, 4, QTableWidgetItem(str(len(r.newly_unsuspended_cids))))
             self.history_table.setItem(row_idx, 5, QTableWidgetItem(str(len(r.already_active_cids))))
-            self.history_table.setItem(row_idx, 6, QTableWidgetItem(status_str))
+            self.history_table.setItem(row_idx, 6, QTableWidgetItem(cov_str))
+            self.history_table.setItem(row_idx, 7, QTableWidgetItem(status_str))
 
     def _get_selected_run_id(self) -> Optional[str]:
         selected_rows = self.history_table.selectedItems()
@@ -594,6 +751,27 @@ class HistoryDialog(QDialog):
                 QMessageBox.information(self, "Fatto", "Mazzo filtrato eliminato. Le carte restano attive.")
             else:
                 QMessageBox.warning(self, "Avviso", "Il mazzo filtrato non esiste più.")
+
+    def _on_coverage_clicked(self) -> None:
+        run_id = self._get_selected_run_id()
+        if not run_id:
+            QMessageBox.warning(self, "Attenzione", "Seleziona prima una run dalla tabella.")
+            return
+        run_rec = self.storage.get_run(run_id)
+        if not run_rec or not getattr(run_rec, "concept_coverage", None):
+            QMessageBox.information(
+                self,
+                "Dettagli Copertura",
+                "Nessun dettaglio di copertura salvato per questa run (eseguita con una versione precedente).",
+            )
+            return
+        dlg = CoverageDetailDialog(
+            coverage_items=run_rec.concept_coverage,
+            title_context=run_rec.unit_title,
+            created_deck_names=[run_rec.deck_name] if run_rec.filtered_did and not run_rec.rolled_back else None,
+            parent=self,
+        )
+        dlg.exec()
 
 
 # =====================================================================
@@ -702,13 +880,16 @@ class IndexDialog(QDialog):
 
         if self.col:
             indexer = DeckIndexer(self.config, self.storage, self.ai_client)
-            target_dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
-            target_nids = indexer.get_notes_in_decks(self.col, target_dids)
+            active_query = self.config.get_effective_search_query()
+            try:
+                target_nids = indexer.get_notes_for_query(self.col, active_query)
+            except Exception:
+                target_nids = []
             total_notes = len(target_nids)
             deck_active_count = self.storage.count_embeddings_for_notes(target_nids, active_id) if target_nids else 0
             pct = int(deck_active_count / total_notes * 100) if total_notes > 0 else 0
             self.lbl_coverage.setText(
-                f"Copertura mazzi selezionati: {deck_active_count} / {total_notes} note ({pct}%)"
+                f"Copertura query attiva ({active_query}): {deck_active_count} / {total_notes} note ({pct}%)"
             )
 
     def _start_indexing(self) -> None:
@@ -727,7 +908,7 @@ class IndexDialog(QDialog):
             config=self.config,
             storage=self.storage,
             ai_client=self.ai_client,
-            selected_decks=self.config.selected_decks,
+            selected_decks=None,
         )
         self.index_worker.progress_sig.connect(self._on_progress)
         self.index_worker.finished_sig.connect(self._on_finished)

@@ -12,6 +12,11 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "selected_decks": ["AnKing Step Deck", "Mastering Radiology"],
+    "search_query": '"deck:AnKing Step Deck"',
+    "search_query_history": [
+        '"deck:AnKing Step Deck"',
+        '"deck:AnKing Step Deck" OR "deck:Mastering Radiology"',
+    ],
     "chat_provider": "lm_studio",
     "chat_base_url": "http://127.0.0.1:1234/v1",
     "chat_api_key": "",
@@ -52,6 +57,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 @dataclass
 class ConfigManager:
     selected_decks: List[str] = field(default_factory=lambda: list(DEFAULT_CONFIG["selected_decks"]))
+    search_query: str = DEFAULT_CONFIG["search_query"]
+    search_query_history: List[str] = field(
+        default_factory=lambda: list(DEFAULT_CONFIG["search_query_history"])
+    )
     chat_provider: str = DEFAULT_CONFIG["chat_provider"]
     chat_base_url: str = DEFAULT_CONFIG["chat_base_url"]
     chat_api_key: str = DEFAULT_CONFIG["chat_api_key"]
@@ -119,11 +128,36 @@ class ConfigManager:
         """Returns configuration as a plain dictionary."""
         return asdict(self)
 
+    def get_effective_search_query(self) -> str:
+        """Returns the active Browser search query, falling back to selected_decks if empty."""
+        q = (self.search_query or "").strip()
+        if q:
+            return q
+        if self.selected_decks:
+            return " OR ".join(f'"deck:{d}"' for d in self.selected_decks if d.strip())
+        return '"deck:AnKing Step Deck"'
+
+    def add_query_to_history(self, query: str, max_items: int = 20) -> None:
+        """Sets the active search_query and prepends it to search_query_history without duplicates."""
+        clean = (query or "").strip()
+        if not clean:
+            return
+        self.search_query = clean
+        new_hist = [clean] + [q for q in (self.search_query_history or []) if q.strip() and q.strip() != clean]
+        self.search_query_history = new_hist[:max_items]
+
     def update(self, data: Dict[str, Any]) -> None:
         """Updates instance attributes from dictionary keys."""
+        has_explicit_query = "search_query" in data and bool(str(data.get("search_query", "")).strip())
         for key, val in data.items():
             if hasattr(self, key):
                 setattr(self, key, val)
+        if not has_explicit_query and "selected_decks" in data and self.selected_decks:
+            migrated_q = " OR ".join(f'"deck:{d}"' for d in self.selected_decks if str(d).strip())
+            if migrated_q:
+                self.search_query = migrated_q
+                if migrated_q not in self.search_query_history:
+                    self.search_query_history = [migrated_q] + list(self.search_query_history)
 
     @classmethod
     def load(cls, addon_name: str = "ankihub_searcher", config_path: Optional[str] = None) -> ConfigManager:

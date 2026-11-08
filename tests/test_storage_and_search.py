@@ -541,6 +541,106 @@ I should decompose this into atomic concepts.
         result_nids = {r.nid for r in results}
         self.assertEqual(result_nids, {1, 2})
 
+    def test_query_parent_deck_and_concept_coverage(self):
+        from ankihub_searcher.indexer import DeckIndexer
+
+        col = MockAnkiCol()
+        config = ConfigManager()
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        indexer = DeckIndexer(config, self.storage, mock_ai)
+
+        # 1. Single deck query -> returns that deck as parent
+        self.assertEqual(
+            indexer.detect_single_parent_deck(col, '"deck:AnKing Step Deck"'),
+            "AnKing Step Deck",
+        )
+        # Subdecks of the same parent -> returns common ancestor
+        self.assertEqual(
+            indexer.detect_single_parent_deck(
+                col, '"deck:AnKing Step Deck::#AK_Step1_v12" OR "deck:AnKing Step Deck::#AK_Step2_v12"'
+            ),
+            "AnKing Step Deck",
+        )
+        # Two disjoint top-level decks -> returns None
+        self.assertIsNone(
+            indexer.detect_single_parent_deck(
+                col, '"deck:AnKing Step Deck" OR "deck:Mastering Radiology"'
+            )
+        )
+
+        # 2. Query history management
+        config.add_query_to_history('"deck:Mastering Radiology"')
+        self.assertEqual(config.search_query, '"deck:Mastering Radiology"')
+        self.assertEqual(config.search_query_history[0], '"deck:Mastering Radiology"')
+
+        # 3. Concept coverage (covered vs uncovered) + subdeck creation under single parent deck
+        model_id = config.get_active_model_id()
+        self.storage.upsert_notes_content_batch(
+            [
+                (801, 1, 100, "h801", "NLRP3 inflammasome activates IL-1beta in gout.", "Pathology"),
+                (802, 1, 100, "h802", "Monosodium urate crystals trigger NLRP3 inflammasome.", "Pathology"),
+            ]
+        )
+        self.storage.save_embeddings_batch(
+            [
+                (801, model_id, "h801", 2, [1.0, 0.0]),
+                (802, model_id, "h802", 2, [0.98, 0.02]),
+            ]
+        )
+
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [
+                {
+                    "topic_it": "Inflammasoma NLRP3",
+                    "claim_en": "NLRP3 inflammasome activates IL-1beta in gout.",
+                    "keywords_en": ["NLRP3", "gout"],
+                    "keywords_it": ["gotta"],
+                },
+                {
+                    "topic_it": "Dettaglio non presente nel mazzo",
+                    "claim_en": "Unrelated epidemiological detail from Italian textbook.",
+                    "keywords_en": ["unrelated_xyz_token"],
+                    "keywords_it": ["inesistente"],
+                },
+            ]
+        }
+        # First concept matches [1.0, 0.0], second concept is orthogonal [0.0, 1.0]
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0], [0.0, 1.0]]
+
+        pipeline = SmartSearchPipeline(config, self.storage, mock_ai)
+        unit = LectureUnit("Gotta", "Gotta", "Testo lezione")
+        scored = pipeline.search_unit(unit, candidate_nids=[801, 802], active_model_id=model_id)
+        self.assertEqual(len(scored), 2)
+        self.assertEqual(len(pipeline.last_concept_coverage), 2)
+        self.assertEqual(pipeline.last_concept_coverage[0].status, "covered")
+        self.assertEqual(pipeline.last_concept_coverage[1].status, "uncovered")
+
+        # Execute filtered deck creation with single parent_deck_prefix="AnKing Step Deck"
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (8001, 801, 100, 0, -1)")
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (8002, 802, 100, 0, -1)")
+        col.conn.commit()
+
+        cov_dicts = [c.to_dict() for c in pipeline.last_concept_coverage]
+        run_res = execute_unit_deck_creation(
+            col=col,
+            unit=unit,
+            matched_nids=[s.nid for s in scored],
+            config=config,
+            storage=self.storage,
+            concept_coverage=cov_dicts,
+            parent_deck_prefix="AnKing Step Deck",
+        )
+        # Filtered deck must be created as a child of AnKing Step Deck!
+        self.assertEqual(run_res.deck_name, "AnKing Step Deck::Gotta")
+        self.assertEqual(len(run_res.concept_coverage), 2)
+
+        # Verify concept_coverage persisted in SQLite run_history
+        saved_run = self.storage.get_run(run_res.run_id)
+        self.assertIsNotNone(saved_run)
+        self.assertEqual(len(saved_run.concept_coverage), 2)
+        self.assertEqual(saved_run.concept_coverage[1]["status"], "uncovered")
+        col.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

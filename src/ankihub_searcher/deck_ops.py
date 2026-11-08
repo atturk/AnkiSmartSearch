@@ -30,6 +30,7 @@ class RunResult:
     newly_unsuspended_cids: List[int]
     already_active_count: int = 0
     already_active_cids: List[int] = field(default_factory=list)
+    concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -71,8 +72,9 @@ def resolve_notes_to_cards(
     col: Any,
     nids: Sequence[int],
     selected_deck_names: Sequence[str],
+    allowed_cids: Optional[Set[int]] = None,
 ) -> Tuple[List[int], List[int]]:
-    """Resolves all sibling cards (c1, c2, ...) for target nids in selected decks.
+    """Resolves all sibling cards (c1, c2, ...) for target nids in selected decks or query.
 
     Partitions them by suspension status:
     Returns (suspended_cids, active_cids).
@@ -80,9 +82,7 @@ def resolve_notes_to_cards(
     if not nids:
         return [], []
 
-    valid_dids = get_deck_ids_for_names(col, selected_deck_names)
-    if not valid_dids:
-        return [], []
+    valid_dids = get_deck_ids_for_names(col, selected_deck_names) if selected_deck_names else set()
 
     suspended_cids: List[int] = []
     active_cids: List[int] = []
@@ -95,9 +95,13 @@ def resolve_notes_to_cards(
         # Select cards: home deck is odid if odid != 0 else did
         query = f"SELECT id, did, odid, queue FROM cards WHERE nid IN ({placeholders})"
         for cid, did, odid, queue in col.db.execute(query):
-            home_did = odid if (odid and odid != 0) else did
-            if home_did not in valid_dids:
-                continue
+            if allowed_cids is not None:
+                if int(cid) not in allowed_cids:
+                    continue
+            elif valid_dids:
+                home_did = odid if (odid and odid != 0) else did
+                if home_did not in valid_dids:
+                    continue
 
             # queue == -1 means suspended
             if queue == -1:
@@ -108,27 +112,49 @@ def resolve_notes_to_cards(
     return suspended_cids, active_cids
 
 
+def _format_target_deck_name(raw_deck_name: str, parent_deck_prefix: Optional[str]) -> str:
+    """Prepends parent_deck_prefix:: to raw_deck_name if a single parent source deck is targeted."""
+    clean_name = raw_deck_name.strip()
+    if not parent_deck_prefix or not parent_deck_prefix.strip():
+        return clean_name
+    prefix = parent_deck_prefix.strip()
+    if clean_name == prefix or clean_name.startswith(f"{prefix}::"):
+        return clean_name
+    return f"{prefix}::{clean_name}"
+
+
 def execute_unit_deck_creation(
     col: Any,
     unit: LectureUnit,
     matched_nids: Sequence[int],
     config: ConfigManager,
     storage: SearchDatabase,
+    concept_coverage: Optional[List[Dict[str, Any]]] = None,
+    parent_deck_prefix: Optional[str] = None,
+    allowed_cids: Optional[Set[int]] = None,
 ) -> RunResult:
     """Unsuspends matching cards and builds a clean Filtered Deck with cid: search query."""
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    coverage_list = list(concept_coverage) if concept_coverage else []
+    target_deck_name = _format_target_deck_name(unit.deck_name, parent_deck_prefix)
 
     if not matched_nids:
         return RunResult(
             run_id=run_id,
-            deck_name=unit.deck_name,
+            deck_name=target_deck_name,
             filtered_did=0,
             total_cards_count=0,
             newly_unsuspended_count=0,
             newly_unsuspended_cids=[],
+            concept_coverage=coverage_list,
         )
 
-    suspended_cids, active_cids = resolve_notes_to_cards(col, matched_nids, config.selected_decks)
+    suspended_cids, active_cids = resolve_notes_to_cards(
+        col,
+        matched_nids,
+        config.selected_decks,
+        allowed_cids=allowed_cids,
+    )
 
     # Determine cards to place in Filtered Deck
     if config.include_active_cards_in_filtered_deck:
@@ -139,30 +165,32 @@ def execute_unit_deck_creation(
     if not deck_cids:
         # Even if 0 cards are placed in the filtered deck (because all matched cards were already active),
         # return the count of already-active matched cards so the user gets explicit confirmation!
-        if active_cids:
+        if active_cids or coverage_list:
             record = RunRecord(
                 run_id=run_id,
                 created_at=int(time.time()),
-                deck_name=unit.deck_name.strip(),
+                deck_name=target_deck_name,
                 filtered_did=0,
-                source_decks=list(config.selected_decks),
+                source_decks=[config.get_effective_search_query()] if hasattr(config, "get_effective_search_query") else list(config.selected_decks),
                 unit_title=unit.unit_title,
                 unit_preview=(unit.body_text[:150] + "...") if len(unit.body_text) > 150 else unit.body_text,
                 total_matched_cids=[],
                 newly_unsuspended_cids=[],
                 rolled_back=0,
                 already_active_cids=active_cids,
+                concept_coverage=coverage_list,
             )
             storage.save_run(record)
         return RunResult(
             run_id=run_id,
-            deck_name=unit.deck_name,
+            deck_name=target_deck_name,
             filtered_did=0,
             total_cards_count=0,
             newly_unsuspended_count=0,
             newly_unsuspended_cids=[],
             already_active_count=len(active_cids),
             already_active_cids=active_cids,
+            concept_coverage=coverage_list,
         )
 
     # 1. Unsuspend only cards that were suspended prior to this run
@@ -171,7 +199,7 @@ def execute_unit_deck_creation(
 
     # 2. Build or recreate the Filtered Deck with exact cid: query
     search_query = "cid:" + ",".join(str(cid) for cid in deck_cids)
-    deck_name = unit.deck_name.strip()
+    deck_name = target_deck_name
 
     # Safety check: if deck_name matches an existing NORMAL (non-filtered) deck
     # (e.g. user typed "AnKing Step Deck" as base deck name without markdown headers),
@@ -186,7 +214,7 @@ def execute_unit_deck_creation(
         )
         if not is_dynamic:
             timestamp = time.strftime("%Y-%m-%d %H:%M")
-            if config.batch_deck_naming_style == "subdeck":
+            if config.batch_deck_naming_style == "subdeck" or parent_deck_prefix:
                 deck_name = f"{deck_name}::Smart Search {timestamp}"
             else:
                 deck_name = f"{deck_name} - Smart Search {timestamp}"
@@ -226,13 +254,14 @@ def execute_unit_deck_creation(
         created_at=int(time.time()),
         deck_name=deck_name,
         filtered_did=filtered_did,
-        source_decks=list(config.selected_decks),
+        source_decks=[config.get_effective_search_query()] if hasattr(config, "get_effective_search_query") else list(config.selected_decks),
         unit_title=unit.unit_title,
         unit_preview=(unit.body_text[:150] + "...") if len(unit.body_text) > 150 else unit.body_text,
         total_matched_cids=deck_cids,
         newly_unsuspended_cids=suspended_cids,
         rolled_back=0,
         already_active_cids=active_cids,
+        concept_coverage=coverage_list,
     )
     storage.save_run(record)
 
@@ -245,6 +274,7 @@ def execute_unit_deck_creation(
         newly_unsuspended_cids=suspended_cids,
         already_active_count=len(active_cids),
         already_active_cids=active_cids,
+        concept_coverage=coverage_list,
     )
 
 

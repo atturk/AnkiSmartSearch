@@ -1,7 +1,7 @@
 {
   "name": "Smart Search",
   "package": "ankihub_searcher",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": "atturk",
   "homepage": "https://github.com/atturk/AnkiSmartSearch"
 }

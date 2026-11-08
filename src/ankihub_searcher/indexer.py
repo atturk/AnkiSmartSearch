@@ -10,6 +10,7 @@ Indexes notes from selected decks:
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -78,6 +79,125 @@ class DeckIndexer:
         cur = col.db.execute(query)
         return {int(row[0]) for row in cur}
 
+    @staticmethod
+    def extract_deck_names_from_query(query: str) -> List[str]:
+        """Extracts deck names from Anki Browser query syntax (e.g., '\"deck:AnKing Step Deck\"' or 'deck:\"My Deck\"')."""
+        if not query or not query.strip():
+            return []
+        pattern = re.compile(
+            r'"deck:([^"]+)"|deck:"([^"]+)"|\'deck:([^\']+)\'|deck:\'([^\']+)\'|\bdeck:([^\s)]+)',
+            re.IGNORECASE,
+        )
+        decks: List[str] = []
+        for match in pattern.finditer(query):
+            raw = next((g for g in match.groups() if g is not None), "").strip()
+            while raw.endswith("::*") or raw.endswith("*"):
+                if raw.endswith("::*"):
+                    raw = raw[:-3].strip()
+                elif raw.endswith("*"):
+                    raw = raw[:-1].strip()
+            if raw and raw not in decks:
+                decks.append(raw)
+        return decks
+
+    @staticmethod
+    def _common_deck_ancestor(deck_names: List[str]) -> Optional[str]:
+        """Finds the deepest common deck ancestor across a list of deck names, or None if disjoint."""
+        cleaned = [d.strip() for d in deck_names if d and d.strip()]
+        if not cleaned:
+            return None
+        if len(cleaned) == 1:
+            return cleaned[0]
+        split_paths = [d.split("::") for d in cleaned]
+        common: List[str] = []
+        for parts in zip(*split_paths):
+            if len(set(parts)) == 1:
+                common.append(parts[0])
+            else:
+                break
+        return "::".join(common) if common else None
+
+    def get_cards_for_query(self, col: Any, query: str) -> List[int]:
+        """Returns card IDs matching an Anki Browser query."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        if hasattr(col, "find_cards"):
+            return [int(cid) for cid in col.find_cards(q)]
+        # Fallback for mock collections in tests
+        deck_names = self.extract_deck_names_from_query(q) or self.config.selected_decks
+        dids = self.find_target_deck_ids(col, deck_names)
+        if not dids:
+            return []
+        placeholders = ",".join(str(d) for d in dids)
+        cur = col.db.execute(f"SELECT id FROM cards WHERE did IN ({placeholders}) OR odid IN ({placeholders})")
+        return [int(row[0]) for row in cur]
+
+    def get_notes_for_query(self, col: Any, query: str) -> List[int]:
+        """Returns distinct note IDs matching an Anki Browser query."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        if hasattr(col, "find_notes"):
+            return [int(nid) for nid in col.find_notes(q)]
+        # Fallback for mock collections in tests
+        deck_names = self.extract_deck_names_from_query(q) or self.config.selected_decks
+        dids = self.find_target_deck_ids(col, deck_names)
+        return self.get_notes_in_decks(col, dids)
+
+    def get_notes_with_suspended_cards_for_query(self, col: Any, query: str) -> Set[int]:
+        """Returns note IDs matching the query that have at least one suspended card."""
+        q = (query or "").strip()
+        if not q:
+            return set()
+        if hasattr(col, "find_notes"):
+            try:
+                return {int(nid) for nid in col.find_notes(f"({q}) is:suspended")}
+            except Exception:
+                pass
+        deck_names = self.extract_deck_names_from_query(q) or self.config.selected_decks
+        dids = self.find_target_deck_ids(col, deck_names)
+        return self.get_notes_with_suspended_cards(col, dids)
+
+    def detect_single_parent_deck(self, col: Any, query: str) -> Optional[str]:
+        """Determines if the search query targets a single source deck (or subdeck hierarchy).
+
+        Returns the single parent deck name if all targeted cards belong to one deck tree,
+        or None if multiple unrelated top-level decks are targeted.
+        """
+        q = (query or "").strip()
+        if not q:
+            return None
+
+        explicit_decks = self.extract_deck_names_from_query(q)
+        if explicit_decks:
+            return self._common_deck_ancestor(explicit_decks)
+
+        # If no explicit deck: clause in query (e.g., tag-only query), inspect matched cards' home decks
+        try:
+            cids = self.get_cards_for_query(col, q)
+            if not cids:
+                return None
+            sample_cids = cids[:2000]
+            placeholders = ",".join(str(c) for c in sample_cids)
+            cur = col.db.execute(
+                f"SELECT DISTINCT CASE WHEN odid != 0 THEN odid ELSE did END FROM cards WHERE id IN ({placeholders})"
+            )
+            home_dids = [int(row[0]) for row in cur if row[0]]
+            if not home_dids:
+                return None
+
+            deck_names: List[str] = []
+            for did in home_dids:
+                d_obj = col.decks.get(did)
+                if d_obj:
+                    d_name = d_obj.get("name", "") if isinstance(d_obj, dict) else getattr(d_obj, "name", "")
+                    if d_name:
+                        deck_names.append(d_name)
+            return self._common_deck_ancestor(deck_names)
+        except Exception:
+            return None
+
     def index_selected_decks(
         self,
         col: Any,
@@ -85,14 +205,23 @@ class DeckIndexer:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         batch_size: int = 32,
+        search_query: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Runs incremental indexing on notes from selected decks.
+        """Runs incremental indexing on notes from a Browser search query or selected decks.
 
         Commits embeddings after every batch to guarantee instant pause/resume safety.
         """
-        decks_to_index = selected_deck_names if selected_deck_names is not None else self.config.selected_decks
-        target_dids = self.find_target_deck_ids(col, decks_to_index)
-        nids = self.get_notes_in_decks(col, target_dids)
+        if search_query and search_query.strip():
+            nids = self.get_notes_for_query(col, search_query.strip())
+        elif selected_deck_names is not None:
+            target_dids = self.find_target_deck_ids(col, selected_deck_names)
+            nids = self.get_notes_in_decks(col, target_dids)
+        elif self.config.search_query and self.config.search_query.strip() and hasattr(col, "find_notes"):
+            nids = self.get_notes_for_query(col, self.config.search_query.strip())
+        else:
+            decks_to_index = self.config.selected_decks
+            target_dids = self.find_target_deck_ids(col, decks_to_index)
+            nids = self.get_notes_in_decks(col, target_dids)
 
         if not nids:
             if progress_callback:
