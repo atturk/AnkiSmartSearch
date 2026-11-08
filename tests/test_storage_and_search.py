@@ -482,6 +482,12 @@ I should decompose this into atomic concepts.
         self.assertIn("openrouter::text-embedding-3-small", stats)
         self.assertEqual(stats["openrouter::text-embedding-3-small"], 1)
 
+        # Test export_db
+        exported_path = os.path.join(self.temp_dir.name, "exported_backup.db")
+        size_mb = self.storage.export_db(exported_path)
+        self.assertTrue(os.path.exists(exported_path))
+        self.assertGreaterEqual(size_mb, 0.0)
+
         # 2. Test slot separation: active notes don't steal top_k_per_concept from suspended notes
         config = ConfigManager(
             sensitivity=0.55,

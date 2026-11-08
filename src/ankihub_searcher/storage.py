@@ -517,6 +517,29 @@ class SearchDatabase:
 
         return {"notes_merged": max(0, notes_merged), "embeddings_merged": max(0, embeddings_merged)}
 
+    def export_db(self, target_path: str) -> float:
+        """Exports a clean, self-contained SQLite backup (flushing WAL) to target_path.
+
+        Returns the size of the exported file in MB.
+        """
+        abs_target = os.path.abspath(target_path)
+        if abs_target == os.path.abspath(self.db_path):
+            raise ValueError("Il file di destinazione non può coincidere con il database attivo.")
+
+        os.makedirs(os.path.dirname(abs_target), exist_ok=True)
+        if os.path.exists(abs_target):
+            os.remove(abs_target)
+
+        with self._get_connection() as src_conn:
+            src_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            dest_conn = sqlite3.connect(abs_target)
+            try:
+                src_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+
+        return round(os.path.getsize(abs_target) / (1024 * 1024), 2)
+
     # ---------------- FTS5 Lexical Search ----------------
 
     def search_fts(

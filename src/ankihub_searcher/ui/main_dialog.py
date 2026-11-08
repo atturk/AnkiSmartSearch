@@ -667,11 +667,15 @@ class AnkiHubSearcherDialog(QDialog):
         models_layout.addWidget(self.models_table)
 
         purge_layout = QHBoxLayout()
-        btn_import_db = QPushButton("📥 Importa / Unisci Indice da altro .db...")
+        btn_export_db = QPushButton("📤 Esporta Indice (.db)...")
+        btn_export_db.clicked.connect(self._export_db)
+        purge_layout.addWidget(btn_export_db)
+
+        btn_import_db = QPushButton("📥 Importa / Unisci da altro .db...")
         btn_import_db.clicked.connect(self._import_external_db)
         purge_layout.addWidget(btn_import_db)
 
-        btn_purge_inactive = QPushButton("🧹 Elimina Cache di Modelli Non Attivi")
+        btn_purge_inactive = QPushButton("🧹 Elimina Cache Modelli Non Attivi")
         btn_purge_inactive.clicked.connect(self._purge_inactive_models)
         purge_layout.addWidget(btn_purge_inactive)
 
@@ -680,6 +684,31 @@ class AnkiHubSearcherDialog(QDialog):
         purge_layout.addWidget(btn_refresh_idx)
         models_layout.addLayout(purge_layout)
         layout.addWidget(models_group)
+
+    def _export_db(self) -> None:
+        default_path = os.path.expanduser("~/Desktop/ankihub_searcher_export.db")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Esporta Indice AnkiHubSearcher (.db)",
+            default_path,
+            "SQLite Database (*.db);;All Files (*)",
+        )
+        if not file_path:
+            return
+        if not file_path.endswith(".db"):
+            file_path += ".db"
+        try:
+            size_mb = self.storage.export_db(file_path)
+            QMessageBox.information(
+                self,
+                "Esportazione Completata",
+                f"Indice esportato con successo!\n\n"
+                f"File: {file_path}\n"
+                f"Dimensione: {size_mb} MB\n\n"
+                f"Ora puoi inviarlo via AirDrop sull'altro Mac e importarlo con '📥 Importa / Unisci da altro .db...'.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Esportazione", f"Impossibile esportare il database:\n{e}")
 
     def _import_external_db(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
