@@ -66,6 +66,18 @@ class DeckIndexer:
         cur = col.db.execute(query)
         return [row[0] for row in cur]
 
+    def get_notes_with_suspended_cards(self, col: Any, dids: List[int]) -> Set[int]:
+        """Returns note IDs that have at least one suspended card (queue == -1) in the given decks."""
+        if not dids:
+            return set()
+        placeholders = ",".join(str(d) for d in dids)
+        query = (
+            f"SELECT DISTINCT nid FROM cards "
+            f"WHERE queue = -1 AND (did IN ({placeholders}) OR odid IN ({placeholders}))"
+        )
+        cur = col.db.execute(query)
+        return {int(row[0]) for row in cur}
+
     def index_selected_decks(
         self,
         col: Any,
@@ -109,6 +121,9 @@ class DeckIndexer:
         notes_meta: Dict[int, Tuple[int, str]] = {}
         notes_raw_data: Dict[int, Tuple[int, int, str, str, str]] = {}
 
+        # Fast-path: load stored (note_mod, content_hash) so unchanged notes skip regex HTML cleaning
+        stored_mod_map = self.storage.get_stored_notes_mod_map()
+
         # Fetch in chunks to avoid overwhelming memory
         chunk_size = 1000
         for i in range(0, len(nids), chunk_size):
@@ -117,7 +132,22 @@ class DeckIndexer:
 
             chunk = nids[i : i + chunk_size]
             placeholders = ",".join(str(x) for x in chunk)
-            query = f"SELECT id, mid, mod, flds, tags FROM notes WHERE id IN ({placeholders})"
+
+            # First check which notes in this chunk are new or have a modified `mod` timestamp
+            dirty_nids: List[int] = []
+            mod_query = f"SELECT id, mod FROM notes WHERE id IN ({placeholders})"
+            for nid, note_mod in col.db.execute(mod_query):
+                saved = stored_mod_map.get(nid)
+                if saved is not None and saved[0] == note_mod:
+                    notes_meta[nid] = saved
+                else:
+                    dirty_nids.append(nid)
+
+            if not dirty_nids:
+                continue
+
+            dirty_placeholders = ",".join(str(x) for x in dirty_nids)
+            query = f"SELECT id, mid, mod, flds, tags FROM notes WHERE id IN ({dirty_placeholders})"
             for nid, mid, note_mod, flds_str, tags_str in col.db.execute(query):
                 model = models_by_mid.get(mid)
                 model_name = model["name"] if model else ""

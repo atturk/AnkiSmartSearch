@@ -17,7 +17,7 @@ import sqlite3
 import struct
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Sequence, Set, Tuple
 
 try:
@@ -42,6 +42,7 @@ class RunRecord:
     total_matched_cids: List[int]
     newly_unsuspended_cids: List[int]
     rolled_back: int = 0
+    already_active_cids: List[int] = field(default_factory=list)
 
 
 def normalize_l2(vec: Sequence[float]) -> List[float]:
@@ -148,10 +149,17 @@ class SearchDatabase:
                     unit_preview TEXT NOT NULL,
                     total_matched_cids_json TEXT NOT NULL,
                     newly_unsuspended_cids_json TEXT NOT NULL,
-                    rolled_back INTEGER DEFAULT 0
+                    rolled_back INTEGER DEFAULT 0,
+                    already_active_cids_json TEXT DEFAULT '[]'
                 )
                 """
             )
+            # Seamless schema migration for pre-0.1.1 databases
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(run_history)")
+            existing_cols = {row["name"] for row in cur.fetchall()}
+            if "already_active_cids_json" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN already_active_cids_json TEXT DEFAULT '[]'")
             conn.commit()
 
     # ---------------- Note Content & FTS Operations ----------------
@@ -193,6 +201,13 @@ class SearchDatabase:
                 fts_data,
             )
             conn.commit()
+
+    def get_stored_notes_mod_map(self) -> Dict[int, Tuple[int, str]]:
+        """Returns {nid: (note_mod, content_hash)} for fast incremental checks."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT nid, note_mod, content_hash FROM notes_content")
+            return {row["nid"]: (row["note_mod"], row["content_hash"]) for row in cur.fetchall()}
 
     def get_notes_needing_indexing(
         self,
@@ -467,6 +482,41 @@ class SearchDatabase:
             conn.commit()
             return cur.rowcount
 
+    def merge_external_db(self, external_db_path: str) -> Dict[str, int]:
+        """Merges notes_content and note_embeddings from an external ankihub_searcher.db file."""
+        if not os.path.exists(external_db_path):
+            raise FileNotFoundError(f"Database file not found: {external_db_path}")
+
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("ATTACH DATABASE ? AS ext_db", (external_db_path,))
+            try:
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO notes_content (nid, mid, note_mod, content_hash, clean_text, clean_tags)
+                    SELECT nid, mid, note_mod, content_hash, clean_text, clean_tags FROM ext_db.notes_content
+                    """
+                )
+                notes_merged = cur.rowcount
+
+                cur.execute(
+                    """
+                    INSERT INTO note_embeddings (nid, model_id, content_hash, dim, vector_blob)
+                    SELECT nid, model_id, content_hash, dim, vector_blob FROM ext_db.note_embeddings
+                    WHERE true
+                    ON CONFLICT(nid, model_id) DO UPDATE SET
+                        content_hash=excluded.content_hash,
+                        dim=excluded.dim,
+                        vector_blob=excluded.vector_blob
+                    """
+                )
+                embeddings_merged = cur.rowcount
+                conn.commit()
+            finally:
+                cur.execute("DETACH DATABASE ext_db")
+
+        return {"notes_merged": max(0, notes_merged), "embeddings_merged": max(0, embeddings_merged)}
+
     # ---------------- FTS5 Lexical Search ----------------
 
     def search_fts(
@@ -555,12 +605,13 @@ class SearchDatabase:
                 INSERT INTO run_history (
                     run_id, created_at, deck_name, filtered_did, source_decks_json,
                     unit_title, unit_preview, total_matched_cids_json,
-                    newly_unsuspended_cids_json, rolled_back
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    newly_unsuspended_cids_json, rolled_back, already_active_cids_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     deck_name=excluded.deck_name,
                     filtered_did=excluded.filtered_did,
-                    rolled_back=excluded.rolled_back
+                    rolled_back=excluded.rolled_back,
+                    already_active_cids_json=excluded.already_active_cids_json
                 """,
                 (
                     record.run_id,
@@ -573,6 +624,7 @@ class SearchDatabase:
                     json.dumps(record.total_matched_cids),
                     json.dumps(record.newly_unsuspended_cids),
                     record.rolled_back,
+                    json.dumps(record.already_active_cids),
                 ),
             )
             conn.commit()
@@ -584,6 +636,7 @@ class SearchDatabase:
             cur.execute("SELECT * FROM run_history ORDER BY created_at DESC")
             records = []
             for row in cur.fetchall():
+                active_json = row["already_active_cids_json"] if "already_active_cids_json" in row.keys() else "[]"
                 records.append(
                     RunRecord(
                         run_id=row["run_id"],
@@ -596,6 +649,7 @@ class SearchDatabase:
                         total_matched_cids=json.loads(row["total_matched_cids_json"]),
                         newly_unsuspended_cids=json.loads(row["newly_unsuspended_cids_json"]),
                         rolled_back=row["rolled_back"],
+                        already_active_cids=json.loads(active_json or "[]"),
                     )
                 )
             return records
@@ -608,6 +662,7 @@ class SearchDatabase:
             row = cur.fetchone()
             if not row:
                 return None
+            active_json = row["already_active_cids_json"] if "already_active_cids_json" in row.keys() else "[]"
             return RunRecord(
                 run_id=row["run_id"],
                 created_at=row["created_at"],
@@ -619,6 +674,7 @@ class SearchDatabase:
                 total_matched_cids=json.loads(row["total_matched_cids_json"]),
                 newly_unsuspended_cids=json.loads(row["newly_unsuspended_cids_json"]),
                 rolled_back=row["rolled_back"],
+                already_active_cids=json.loads(active_json or "[]"),
             )
 
     def mark_run_rolled_back(self, run_id: str) -> None:

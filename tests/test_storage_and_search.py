@@ -309,6 +309,8 @@ I should decompose this into atomic concepts.
         self.assertEqual(run_res.total_cards_count, 2)  # only suspended cards included by default
         self.assertEqual(run_res.newly_unsuspended_count, 2)
         self.assertEqual(set(run_res.newly_unsuspended_cids), {1001, 2001})
+        self.assertEqual(run_res.already_active_count, 1)
+        self.assertEqual(run_res.already_active_cids, [1002])
 
         # Verify unsuspend was called strictly on {1001, 2001}
         col.sched.unsuspend_cards.assert_called_once()
@@ -466,6 +468,53 @@ I should decompose this into atomic concepts.
         self.assertEqual(summary2["embeddings_indexed"], 0)
 
         col.conn.close()
+
+    def test_merge_external_db_and_slot_separation(self):
+        # 1. Test merging an external DB with another model's embeddings
+        ext_db_path = os.path.join(self.temp_dir.name, "external_air.db")
+        ext_db = SearchDatabase(ext_db_path)
+        ext_db.upsert_notes_content_batch([(500, 1, 1000, "h500", "External note text", "Pathology")])
+        ext_db.save_embeddings_batch([(500, "openrouter::text-embedding-3-small", "h500", 3, [0.1, 0.2, 0.9])])
+
+        merge_res = self.storage.merge_external_db(ext_db_path)
+        self.assertGreaterEqual(merge_res["embeddings_merged"], 1)
+        stats = {s["model_id"]: s["note_count"] for s in self.storage.get_indexed_models_stats()}
+        self.assertIn("openrouter::text-embedding-3-small", stats)
+        self.assertEqual(stats["openrouter::text-embedding-3-small"], 1)
+
+        # 2. Test slot separation: active notes don't steal top_k_per_concept from suspended notes
+        config = ConfigManager(
+            sensitivity=0.55,
+            top_k_per_concept=1,
+            max_cards_per_unit=5,
+            include_active_cards_in_filtered_deck=False,
+        )
+        model_id = config.get_active_model_id()
+        self.storage.upsert_notes_content_batch(
+            [
+                (1, 1, 100, "h1", "Active note with highest similarity.", "Pathology"),
+                (2, 1, 100, "h2", "Suspended note with second highest similarity.", "Pathology"),
+            ]
+        )
+        self.storage.save_embeddings_batch(
+            [
+                (1, model_id, "h1", 2, [1.0, 0.0]),
+                (2, model_id, "h2", 2, [0.95, 0.05]),
+            ]
+        )
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [{"topic_it": "Test", "claim_en": "Test claim", "keywords_en": ["note"], "keywords_it": []}]
+        }
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        pipeline = SmartSearchPipeline(config, self.storage, mock_ai)
+        unit = LectureUnit("Test", "Test Deck", "Test body")
+        # Note 1 is already active, Note 2 is suspended (suspended_nids={2})
+        # Even with top_k_per_concept=1, Note 2 must NOT be dropped because Note 1 is active!
+        results = pipeline.search_unit(unit, candidate_nids=[1, 2], active_model_id=model_id, suspended_nids={2})
+        result_nids = {r.nid for r in results}
+        self.assertEqual(result_nids, {1, 2})
 
 
 if __name__ == "__main__":

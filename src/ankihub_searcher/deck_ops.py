@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .config_manager import ConfigManager
@@ -28,6 +28,8 @@ class RunResult:
     total_cards_count: int
     newly_unsuspended_count: int
     newly_unsuspended_cids: List[int]
+    already_active_count: int = 0
+    already_active_cids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -135,6 +137,23 @@ def execute_unit_deck_creation(
         deck_cids = list(suspended_cids)
 
     if not deck_cids:
+        # Even if 0 cards are placed in the filtered deck (because all matched cards were already active),
+        # return the count of already-active matched cards so the user gets explicit confirmation!
+        if active_cids:
+            record = RunRecord(
+                run_id=run_id,
+                created_at=int(time.time()),
+                deck_name=unit.deck_name.strip(),
+                filtered_did=0,
+                source_decks=list(config.selected_decks),
+                unit_title=unit.unit_title,
+                unit_preview=(unit.body_text[:150] + "...") if len(unit.body_text) > 150 else unit.body_text,
+                total_matched_cids=[],
+                newly_unsuspended_cids=[],
+                rolled_back=0,
+                already_active_cids=active_cids,
+            )
+            storage.save_run(record)
         return RunResult(
             run_id=run_id,
             deck_name=unit.deck_name,
@@ -142,6 +161,8 @@ def execute_unit_deck_creation(
             total_cards_count=0,
             newly_unsuspended_count=0,
             newly_unsuspended_cids=[],
+            already_active_count=len(active_cids),
+            already_active_cids=active_cids,
         )
 
     # 1. Unsuspend only cards that were suspended prior to this run
@@ -211,6 +232,7 @@ def execute_unit_deck_creation(
         total_matched_cids=deck_cids,
         newly_unsuspended_cids=suspended_cids,
         rolled_back=0,
+        already_active_cids=active_cids,
     )
     storage.save_run(record)
 
@@ -221,6 +243,8 @@ def execute_unit_deck_creation(
         total_cards_count=len(deck_cids),
         newly_unsuspended_count=len(suspended_cids),
         newly_unsuspended_cids=suspended_cids,
+        already_active_count=len(active_cids),
+        already_active_cids=active_cids,
     )
 
 

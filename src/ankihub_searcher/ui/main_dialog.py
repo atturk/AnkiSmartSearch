@@ -20,6 +20,7 @@ try:
         QCheckBox,
         QComboBox,
         QDialog,
+        QFileDialog,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
@@ -47,6 +48,7 @@ except ImportError:
             QCheckBox,
             QComboBox,
             QDialog,
+            QFileDialog,
             QGroupBox,
             QHBoxLayout,
             QHeaderView,
@@ -225,7 +227,11 @@ class AnkiHubSearcherDialog(QDialog):
         self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
         chk_layout.addWidget(self.chk_llm_verify)
 
-        self.chk_include_active = QCheckBox("Includi anche carte già non-sospese")
+        self.chk_include_active = QCheckBox("Inserisci nel mazzo filtrato anche le carte già attive")
+        self.chk_include_active.setToolTip(
+            "Se disattivato (default), nel mazzo filtrato finiscono solo le carte nuove appena unsospese, "
+            "mentre il contatore ti mostra comunque quante carte correlate erano già attive nella tua collezione."
+        )
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
         chk_layout.addWidget(self.chk_include_active)
         opt_layout.addLayout(chk_layout)
@@ -417,17 +423,34 @@ class AnkiHubSearcherDialog(QDialog):
                     pass
             total_added = sum(r.total_cards_count for r in results)
             total_unsuspended = sum(r.newly_unsuspended_count for r in results)
-            self.lbl_search_status.setText(
-                f"✅ Completato! Creati {len(results)} mazzi filtrati ({total_added} carte totali, {total_unsuspended} unsospese)."
-            )
-            QMessageBox.information(
-                self,
-                "Ricerca Completata!",
-                f"Creati {len(results)} mazzi filtrati con successo!\n\n"
-                f"Carte totali nel mazzo: {total_added}\n"
-                f"Nuove carte unsospese: {total_unsuspended}\n\n"
-                f"Puoi iniziare subito il ripasso su Anki!",
-            )
+            total_already_active = sum(getattr(r, "already_active_count", 0) for r in results)
+            decks_created = sum(1 for r in results if r.filtered_did)
+
+            if total_added == 0 and total_already_active > 0:
+                self.lbl_search_status.setText(
+                    f"ℹ️ 0 nuove carte da unsospendere — {total_already_active} carte correlate erano GIÀ attive!"
+                )
+                QMessageBox.information(
+                    self,
+                    "Argomenti Già Attivi in Studio!",
+                    f"ℹ️ Nessuna nuova carta da unsospendere per questa lezione!\n\n"
+                    f"✅ Carte correlate che avevi GIÀ attive (non-sospese): {total_already_active}\n"
+                    f"🆕 Nuove carte unsospese: 0\n\n"
+                    f"Tutte le carte rilevanti trovate per questi argomenti fanno già parte del tuo studio attivo.",
+                )
+            else:
+                self.lbl_search_status.setText(
+                    f"✅ Completato! {decks_created} mazzi filtrati ({total_unsuspended} nuove unsospese, {total_already_active} già attive)."
+                )
+                QMessageBox.information(
+                    self,
+                    "Ricerca Completata!",
+                    f"Creati {decks_created} mazzi filtrati con successo!\n\n"
+                    f"🆕 Nuove carte unsospese: {total_unsuspended}\n"
+                    f"✅ Carte correlate GIÀ attive in studio: {total_already_active}\n"
+                    f"📦 Carte totali inserite nel Mazzo Filtrato: {total_added}\n\n"
+                    f"Puoi iniziare subito il ripasso su Anki!",
+                )
 
         self._refresh_history_tab()
         self._refresh_index_tab()
@@ -452,9 +475,9 @@ class AnkiHubSearcherDialog(QDialog):
         layout.addWidget(info_lbl)
 
         self.history_table = QTableWidget()
-        self.history_table.setColumnCount(7)
+        self.history_table.setColumnCount(8)
         self.history_table.setHorizontalHeaderLabels(
-            ["Run ID", "Data/Ora", "Mazzo Filtrato", "Unità", "Carte nel Mazzo", "Carte Unsospese", "Stato"]
+            ["Run ID", "Data/Ora", "Mazzo Filtrato", "Unità", "Nel Mazzo", "Nuove Unsospese", "Già Attive", "Stato"]
         )
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.history_table.horizontalHeader().setStretchLastSection(True)
@@ -501,7 +524,8 @@ class AnkiHubSearcherDialog(QDialog):
             self.history_table.setItem(row_idx, 3, QTableWidgetItem(r.unit_title))
             self.history_table.setItem(row_idx, 4, QTableWidgetItem(str(len(r.total_matched_cids))))
             self.history_table.setItem(row_idx, 5, QTableWidgetItem(str(len(r.newly_unsuspended_cids))))
-            self.history_table.setItem(row_idx, 6, QTableWidgetItem(status_str))
+            self.history_table.setItem(row_idx, 6, QTableWidgetItem(str(len(getattr(r, "already_active_cids", [])))))
+            self.history_table.setItem(row_idx, 7, QTableWidgetItem(status_str))
 
     def _get_selected_run_id(self) -> Optional[str]:
         selected_rows = self.history_table.selectedItems()
@@ -643,6 +667,10 @@ class AnkiHubSearcherDialog(QDialog):
         models_layout.addWidget(self.models_table)
 
         purge_layout = QHBoxLayout()
+        btn_import_db = QPushButton("📥 Importa / Unisci Indice da altro .db...")
+        btn_import_db.clicked.connect(self._import_external_db)
+        purge_layout.addWidget(btn_import_db)
+
         btn_purge_inactive = QPushButton("🧹 Elimina Cache di Modelli Non Attivi")
         btn_purge_inactive.clicked.connect(self._purge_inactive_models)
         purge_layout.addWidget(btn_purge_inactive)
@@ -652,6 +680,28 @@ class AnkiHubSearcherDialog(QDialog):
         purge_layout.addWidget(btn_refresh_idx)
         models_layout.addLayout(purge_layout)
         layout.addWidget(models_group)
+
+    def _import_external_db(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleziona il file ankihub_searcher.db da importare/unire",
+            "",
+            "SQLite Database (*.db);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            res = self.storage.merge_external_db(file_path)
+            self._refresh_index_tab()
+            QMessageBox.information(
+                self,
+                "Unione Indice Completata",
+                f"Indice unito con successo!\n\n"
+                f"Vettori importati/aggiornati: {res['embeddings_merged']}\n"
+                f"Note importate: {res['notes_merged']}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Importazione", f"Impossibile unire il database:\n{e}")
 
     def _refresh_index_tab(self) -> None:
         self.config.selected_decks = self._get_selected_deck_names()

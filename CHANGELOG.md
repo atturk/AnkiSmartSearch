@@ -2,6 +2,18 @@
 
 All notable changes to **AnkiSmartSearch (AnkiHubSearcher)** are documented in this file.
 
+## [0.1.1] - 2026-11-08
+
+### Added
+- **Already-Active Cards Counter & Report (Default ON):** Every search run now reports both **newly unsuspended cards** and **correlated cards that were already active (unsuspended)** in your collection — including a dedicated notification when 100% of relevant cards for a lecture are already active in your study queue, plus a new `"Già Attive"` column in the *Cronologia & Rollback* table.
+- **Top-K Slot Protection for New Cards:** Already-active cards no longer consume `top_k_per_concept` or `max_cards_per_unit` slots from suspended cards when *"Inserisci nel mazzo filtrato anche le carte già attive"* is unchecked.
+- **1-Click Multi-Mac Database Merger (`📥 Importa / Unisci Indice da altro .db...`):** Merge `notes_content` and `note_embeddings` across different machines/models (e.g., combining OpenAI embeddings from MacBook Air with Qwen3 embeddings from MacBook Pro) directly from the *Gestione Indice* tab.
+
+### Performance
+- **Ultra-Fast Pre-Search Incremental Check (`0.02s`):** `DeckIndexer` now compares `notes.mod` timestamps against stored metadata before running HTML/Cloze/Tag regex cleaning, cutting pre-search verification on 28,600+ notes from ~2.5s down to ~20ms while still automatically re-indexing and re-embedding any note modified by the user or AnkiHub.
+
+---
+
 ## [0.1.0] - 2026-11-08
 
 ### Added

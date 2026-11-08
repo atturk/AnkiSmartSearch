@@ -169,6 +169,7 @@ class SmartSearchPipeline:
         concepts: List[ExtractedConcept],
         candidate_nids: Optional[List[int]],
         active_model_id: str,
+        suspended_nids: Optional[Set[int]] = None,
     ) -> List[ScoredNote]:
         """Performs dense vector search + BM25 lexical search per concept and fuses results."""
         if not concepts:
@@ -244,9 +245,27 @@ class SmartSearchPipeline:
                 if combined >= min_threshold:
                     concept_candidates.append((nid, combined))
 
-            # Keep top-K for this concept
+            # Keep top-K for this concept.
+            # When include_active_cards_in_filtered_deck is False and suspended_nids is provided,
+            # already-active notes do NOT steal top-K slots from suspended notes!
             concept_candidates.sort(key=lambda x: x[1], reverse=True)
-            top_concept_candidates = concept_candidates[:effective_top_k]
+            if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
+                top_concept_candidates: List[Tuple[int, float]] = []
+                susp_kept = 0
+                active_kept = 0
+                for nid, score in concept_candidates:
+                    if nid in suspended_nids:
+                        if susp_kept < effective_top_k:
+                            top_concept_candidates.append((nid, score))
+                            susp_kept += 1
+                    else:
+                        if active_kept < effective_top_k:
+                            top_concept_candidates.append((nid, score))
+                            active_kept += 1
+                    if susp_kept >= effective_top_k and active_kept >= effective_top_k:
+                        break
+            else:
+                top_concept_candidates = concept_candidates[:effective_top_k]
 
             c_label = concept.topic_it or concept.claim_en[:40]
             for nid, score in top_concept_candidates:
@@ -286,6 +305,13 @@ class SmartSearchPipeline:
             )
 
         scored_notes.sort(key=lambda x: x.score, reverse=True)
+        if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
+            # Ensure suspended notes get up to max_cards_per_unit slots without being displaced by active notes
+            susp_notes = [sn for sn in scored_notes if sn.nid in suspended_nids][: self.config.max_cards_per_unit]
+            act_notes = [sn for sn in scored_notes if sn.nid not in suspended_nids][: self.config.max_cards_per_unit]
+            combined_final = susp_notes + act_notes
+            combined_final.sort(key=lambda x: x.score, reverse=True)
+            return combined_final
         return scored_notes[: self.config.max_cards_per_unit]
 
     # ---------------- Stage 3: Optional LLM Verification ----------------
@@ -355,10 +381,16 @@ class SmartSearchPipeline:
         unit: LectureUnit,
         candidate_nids: Optional[List[int]],
         active_model_id: str,
+        suspended_nids: Optional[Set[int]] = None,
     ) -> List[ScoredNote]:
         """Runs Stage 1, Stage 2, and optional Stage 3 search for a lecture unit."""
         concepts = self.extract_concepts(unit)
-        candidates = self.retrieve_for_concepts(concepts, candidate_nids, active_model_id)
+        candidates = self.retrieve_for_concepts(
+            concepts,
+            candidate_nids,
+            active_model_id,
+            suspended_nids=suspended_nids,
+        )
         if self.config.enable_llm_verification:
             candidates = self.verify_candidates(unit, candidates)
         return candidates

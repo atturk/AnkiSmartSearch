@@ -144,6 +144,7 @@ class SearchBatchWorker(QThread):
             indexer = DeckIndexer(self.config, self.storage, self.ai_client)
             target_dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
             candidate_nids = indexer.get_notes_in_decks(self.col, target_dids)
+            suspended_nids = indexer.get_notes_with_suspended_cards(self.col, target_dids)
 
             def _check_cancel() -> bool:
                 return self._is_cancelled
@@ -182,6 +183,7 @@ class SearchBatchWorker(QThread):
                     unit=unit,
                     candidate_nids=candidate_nids,
                     active_model_id=active_model_id,
+                    suspended_nids=suspended_nids,
                 )
 
                 matched_nids = [sn.nid for sn in scored_notes]
