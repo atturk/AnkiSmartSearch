@@ -1,0 +1,15 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# User database & runtime Anki files
+user_files/
+*.db
+*.db-shm
+*.db-wal
+src/ankihub_searcher/meta.json
+
+# OS files
+.DS_Store
+.env

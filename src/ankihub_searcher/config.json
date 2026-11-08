@@ -1,0 +1,27 @@
+{
+  "selected_decks": ["AnKing Step Deck", "Mastering Radiology"],
+  "chat_provider": "lm_studio",
+  "chat_base_url": "http://127.0.0.1:1234/v1",
+  "chat_api_key": "",
+  "chat_model": "",
+  "embed_provider": "lm_studio",
+  "embed_base_url": "http://127.0.0.1:1234/v1",
+  "embed_api_key": "",
+  "embed_model": "",
+  "embed_language_strategy": "translate_to_en",
+  "sensitivity": 0.55,
+  "top_k_per_concept": 8,
+  "max_cards_per_unit": 80,
+  "hybrid_dense_weight": 0.78,
+  "enable_llm_verification": false,
+  "include_active_cards_in_filtered_deck": false,
+  "batch_deck_naming_style": "dash",
+  "rollback_keep_reviewed_default": true,
+  "indexed_fields_by_model": {
+    "AnKingOverhaul (AnKing Step Deck / AnKingMed)": ["Text", "Extra"],
+    "Mastering Radiology (AnkiCollab) (Mastering Radiology / drradiology)-a1ef2": ["Text", "Extra"],
+    "Mastering Radiology (Mastering Radiology / drradiology)": ["Text", "Extra"]
+  },
+  "default_indexed_field_names": ["Text", "Extra", "Front", "Back", "Back Extra", "Header", "Footer", "Remarks", "Answer"],
+  "index_tags": true
+}
