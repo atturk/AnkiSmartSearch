@@ -220,9 +220,9 @@ class SearchDialog(QDialog):
                 items_by_path[curr_path] = item
                 parent_item = item
 
-        # Update parent states based on initial child states
+        # Update parent states bottom-up based on initial child states
         for top_idx in range(self.deck_tree.topLevelItemCount()):
-            self._update_parent_check_state(self.deck_tree.topLevelItem(top_idx))
+            self._sync_subtree_check_state_bottom_up(self.deck_tree.topLevelItem(top_idx))
 
         self.deck_tree.blockSignals(False)
 
@@ -231,7 +231,7 @@ class SearchDialog(QDialog):
         state = item.checkState(column)
         if state in (Qt.CheckState.Checked, Qt.CheckState.Unchecked):
             self._set_children_check_state(item, state)
-        self._update_parent_check_state(item)
+        self._update_ancestors_check_state(item)
         self.deck_tree.blockSignals(False)
         self.config.selected_decks = self._get_selected_deck_names()
         self.config.save()
@@ -242,35 +242,37 @@ class SearchDialog(QDialog):
             child.setCheckState(0, state)
             self._set_children_check_state(child, state)
 
-    def _update_parent_check_state(self, item: QTreeWidgetItem) -> None:
-        # First ensure all children of item are updated if it has children
-        for i in range(item.childCount()):
-            child = item.child(i)
-            if child.childCount() > 0:
-                self._update_parent_check_state(child)
-
-        parent = item.parent()
-        if not parent:
+    def _recompute_node_check_state_from_children(self, node: QTreeWidgetItem) -> None:
+        child_count = node.childCount()
+        if child_count == 0:
             return
-
-        child_count = parent.childCount()
         checked_count = 0
         partially_count = 0
         for i in range(child_count):
-            c_state = parent.child(i).checkState(0)
+            c_state = node.child(i).checkState(0)
             if c_state == Qt.CheckState.Checked:
                 checked_count += 1
             elif c_state == Qt.CheckState.PartiallyChecked:
                 partially_count += 1
 
         if checked_count == child_count:
-            parent.setCheckState(0, Qt.CheckState.Checked)
+            node.setCheckState(0, Qt.CheckState.Checked)
         elif checked_count > 0 or partially_count > 0:
-            parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+            node.setCheckState(0, Qt.CheckState.PartiallyChecked)
         else:
-            parent.setCheckState(0, Qt.CheckState.Unchecked)
+            node.setCheckState(0, Qt.CheckState.Unchecked)
 
-        self._update_parent_check_state(parent)
+    def _sync_subtree_check_state_bottom_up(self, item: QTreeWidgetItem) -> None:
+        for i in range(item.childCount()):
+            self._sync_subtree_check_state_bottom_up(item.child(i))
+        if item.childCount() > 0:
+            self._recompute_node_check_state_from_children(item)
+
+    def _update_ancestors_check_state(self, item: QTreeWidgetItem) -> None:
+        parent = item.parent()
+        while parent is not None:
+            self._recompute_node_check_state_from_children(parent)
+            parent = parent.parent()
 
     def _get_selected_deck_names(self) -> List[str]:
         selected: List[str] = []
