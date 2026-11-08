@@ -175,22 +175,18 @@ class SearchDialog(QDialog):
         items_by_path: Dict[str, QTreeWidgetItem] = {}
         selected_set = set(self.config.selected_decks)
 
-        # Collect and sort all deck names from collection
-        if hasattr(self.col.decks, "all_names_and_ids"):
-            raw_decks = self.col.decks.all_names_and_ids()
-            deck_names = sorted(
-                d.name if hasattr(d, "name") else d.get("name", "")
-                for d in raw_decks
-                if (d.name if hasattr(d, "name") else d.get("name", ""))
-                and not (d.dyn if hasattr(d, "dyn") else d.get("dyn", 0))
-            )
-        else:
-            deck_names = sorted(
-                (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
-                for d in self.col.decks.all()
-                if (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
-                and not (d.get("dyn", 0) if isinstance(d, dict) else getattr(d, "dyn", 0))
-            )
+        # Collect and sort all normal (non-filtered) deck names from collection
+        try:
+            raw_decks = self.col.decks.all()
+        except Exception:
+            raw_decks = self.col.decks.all_names_and_ids() if hasattr(self.col.decks, "all_names_and_ids") else []
+
+        deck_names = sorted(
+            (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
+            for d in raw_decks
+            if (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", ""))
+            and not (d.get("dyn", 0) if isinstance(d, dict) else getattr(d, "dyn", 0))
+        )
 
         self.deck_tree.blockSignals(True)
         for dname in deck_names:

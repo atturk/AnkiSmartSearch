@@ -43,6 +43,8 @@ def open_search_dialog() -> None:
             dialog = SearchDialog(col=mw.col, parent=mw)
             dialog.exec()
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[SmartSearch] Error opening search dialog: {e}")
 
 
