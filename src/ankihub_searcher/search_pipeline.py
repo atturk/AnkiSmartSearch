@@ -95,29 +95,23 @@ SYSTEM_PROMPT_STAGE1 = """You are an elite medical professor, USMLE Step 1/Step 
 Your task is to decompose the following Italian lecture text into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
 
 CRITICAL INSTRUCTIONS:
-1. Extract an atomic concept for EVERY distinct entity mentioned in the text:
-   - Every disease, syndrome, or pathology.
-   - Every molecular/cellular mechanism, pathway, or receptor.
-   - Every molecule, protein, cytokine, antibody, or biomarker.
-   - Every drug, pharmacological class, or therapeutic agent.
-   - Every clinical sign, symptom, or diagnostic finding.
-   - Every numerical criterion, cutoff, stage, or diagnostic threshold.
-2. STRICT RULES:
+1. Extract an atomic concept for every medical entity that the lecturer EXPLAINS or CHARACTERIZES (diseases, molecular mechanisms, molecules, drugs, signs, diagnostic criteria).
+2. STRICT NEGATIVE RULES:
+   - Do NOT create concepts for entities mentioned only in passing as fleeting examples (e.g., "una pielonefrite sospetta", "febbre di 39 °C"). Ignore non-medical digressions, trivia, anecdotes, costs, or administrative organization.
    - NEVER merge distinct entities together into a single concept (e.g., do not combine two different drugs or two separate cytokines).
-   - Forbid generic concepts without a specific entity (e.g., avoid vague concepts like "general therapy" or "pathology overview").
-   - Ignore non-medical digressions entirely (costs, hospital administration, course organization, historical trivia, personal anecdotes).
-3. Resolve Italian medical terminology, historical acronyms, and eponyms into standard USMLE English equivalents:
+   - Forbid generic concepts without a specific entity (e.g., avoid vague topics like "general therapy" or "pathology overview").
+3. FIELD SPECIFICATIONS:
+   - "quote_it": The exact Italian sentence or phrase from the lecture text from which this concept originates.
+   - "topic_it": Short Italian topic summary naming the specific entity.
+   - "claim_en": Exactly ONE concise sentence stating the core medical fact, without generic fluff or extra sentences.
+   - "keywords_en": ONLY specific, searchable medical terms (disease names, molecules, drugs, clinical signs, eponyms, acronyms). NEVER include generic terms like "tissue injury", "metabolic pathways", "pathophysiology", "irreversible damage", "clinical management".
+   - "keywords_it": 2-5 original specific Italian terms from the lecture.
+4. Resolve Italian medical terminology, historical acronyms, and eponyms into standard USMLE English equivalents:
    - e.g., "NALP3" -> "NLRP3 inflammasome"
    - e.g., "pirofosfato di calcio" -> "calcium pyrophosphate dihydrate (CPPD)", "pseudogout"
    - e.g., "acido urico" -> "uric acid", "monosodium urate", "gout"
    - e.g., "fattore di Hageman" -> "Factor XII", "Hageman factor"
    - e.g., "segno di Cullen" -> "Cullen sign", "acute pancreatitis"
-4. For each concept, provide:
-   - "quote_it": The exact Italian sentence or phrase from the lecture text from which this concept originates.
-   - "topic_it": Short Italian topic summary naming the specific entity.
-   - "claim_en": 1-2 concise, fact-dense English sentences summarizing the mechanism, pathology, clinical signs, or radiology findings as tested on USMLE/AnKing cards.
-   - "keywords_en": 4-10 precise English keywords, synonyms, eponyms, and acronyms.
-   - "keywords_it": 3-6 original Italian terms from the lecture.
 
 5. Do NOT overthink or write long reasoning monologues. Be fast, direct, and output ONLY the JSON object immediately.
 
@@ -177,6 +171,16 @@ STAGE1_JSON_SCHEMA: Dict[str, Any] = {
         "additionalProperties": False,
     },
 }
+
+
+def extract_first_sentence(text: str) -> str:
+    """Extracts the first sentence from a text block, stripping trailing punctuation."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    match = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)
+    first = match[0].strip() if match else cleaned
+    return first.rstrip(".!?").strip()
 
 
 class SmartSearchPipeline:
@@ -316,10 +320,15 @@ class SmartSearchPipeline:
         # 1. Build query texts for embedding based on language strategy
         query_texts: List[str] = []
         for c in concepts:
+            kws = ", ".join(k.strip() for k in c.keywords_en if k.strip())
             if self.config.embed_language_strategy == "multilingual_direct":
-                text = f"{c.topic_it} | {c.claim_en} | {', '.join(c.keywords_en)}"
+                text = f"{c.topic_it} | {c.claim_en} | {kws}"
             else:  # translate_to_en (default)
-                text = f"{c.claim_en} | {', '.join(c.keywords_en)}"
+                first_sentence = extract_first_sentence(c.claim_en)
+                if first_sentence and kws:
+                    text = f"{first_sentence} | {kws}"
+                else:
+                    text = first_sentence or kws or c.claim_en
             query_texts.append(text)
 
         # Resolve optional query instruction (e.g. for qwen3-embedding)
@@ -344,8 +353,8 @@ class SmartSearchPipeline:
         # Semantic floor: prevents purely lexical hits with 0 semantic relation
         min_dense_floor = max(0.20, min_threshold - 0.18)
         alpha = self.config.hybrid_dense_weight
-        rel_window = getattr(self.config, "relative_score_window", 0.08)
-        max_notes_concept = getattr(self.config, "max_notes_per_concept", 30)
+        rel_window = getattr(self.config, "relative_score_window", 0.05)
+        max_notes_concept = getattr(self.config, "max_notes_per_concept", 10)
 
         # Track results per note: nid -> {"scores": [float], "concepts": [str]}
         notes_agg: Dict[int, Dict[str, Any]] = {}

@@ -30,6 +30,7 @@ from ankihub_searcher.search_pipeline import (
     ScoredNote,
     SmartSearchPipeline,
     Stage1ExtractionError,
+    extract_first_sentence,
 )
 from ankihub_searcher.storage import (
     RunRecord,
@@ -464,7 +465,7 @@ I should decompose this into atomic concepts.
             top_k_per_concept=10,
         )
         self.assertEqual(cfg.get_active_model_id(), "openrouter::openai/text-embedding-3-small")
-        self.assertAlmostEqual(cfg.get_min_similarity_threshold(), 0.515, places=3)
+        self.assertAlmostEqual(cfg.get_min_similarity_threshold(), 0.59, places=2)
         self.assertEqual(cfg.get_effective_top_k(), 10)
 
         # Field resolution
@@ -992,9 +993,10 @@ I should decompose this into atomic concepts.
         legacy_data = {"top_k_per_concept": 5}
         cfg_legacy = ConfigManager()
         cfg_legacy.update(legacy_data)
-        self.assertEqual(cfg_legacy.top_k_per_concept, 5)
-        self.assertEqual(cfg_legacy.relative_score_window, 0.08)
-        self.assertEqual(cfg_legacy.max_notes_per_concept, 30)
+        self.assertIsNone(cfg_legacy.top_k_per_concept)
+        self.assertEqual(cfg_legacy.relative_score_window, 0.05)
+        self.assertEqual(cfg_legacy.max_notes_per_concept, 10)
+        self.assertEqual(cfg_legacy.config_version, 4)
 
         model_id = config.get_active_model_id()
         # Seed 4 notes with different similarity levels:
@@ -1944,6 +1946,106 @@ I should decompose this into atomic concepts.
                 base_url="http://localhost:1234/v1",
             )
         self.assertIn("risposta troncata: aumentare chat_max_tokens", str(ctx2.exception))
+
+    def test_selection_and_config_v4_migration_and_query_sentence(self):
+        # 1. Test new defaults and threshold mapping
+        cfg = ConfigManager()
+        self.assertEqual(cfg.sensitivity, 0.5)
+        self.assertEqual(cfg.relative_score_window, 0.05)
+        self.assertEqual(cfg.max_notes_per_concept, 10)
+        self.assertEqual(cfg.max_cards_per_unit, 150)
+        self.assertEqual(cfg.config_version, 4)
+
+        # get_min_similarity_threshold: 0.70 - s * 0.20
+        self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
+        self.assertEqual(ConfigManager(sensitivity=0.0).get_min_similarity_threshold(), 0.70)
+        self.assertEqual(ConfigManager(sensitivity=1.0).get_min_similarity_threshold(), 0.50)
+
+        # 2. Test config migration v4
+        legacy_cfg = {
+            "chat_base_url": "http://my-host:1234/v1",
+            "chat_model": "gpt-custom",
+            "sensitivity": 0.85,
+            "relative_score_window": 0.20,
+            "max_notes_per_concept": 50,
+            "max_cards_per_unit": 300,
+            "top_k_per_concept": 8,
+            "search_query": '"deck:MyDeck"',
+        }
+        migrated, was_migrated = ConfigManager.migrate_dict(legacy_cfg)
+        self.assertTrue(was_migrated)
+        self.assertEqual(migrated["config_version"], 4)
+        self.assertEqual(migrated["sensitivity"], 0.5)
+        self.assertEqual(migrated["relative_score_window"], 0.05)
+        self.assertEqual(migrated["max_notes_per_concept"], 10)
+        self.assertEqual(migrated["max_cards_per_unit"], 150)
+        self.assertNotIn("top_k_per_concept", migrated)
+        # Verify other user settings were strictly preserved
+        self.assertEqual(migrated["chat_base_url"], "http://my-host:1234/v1")
+        self.assertEqual(migrated["chat_model"], "gpt-custom")
+        self.assertEqual(migrated["search_query"], '"deck:MyDeck"')
+
+        # Version 4 config is NOT re-migrated
+        v4_cfg = {
+            "config_version": 4,
+            "sensitivity": 0.65,
+            "relative_score_window": 0.03,
+            "max_notes_per_concept": 15,
+        }
+        migrated_v4, was_migrated_v4 = ConfigManager.migrate_dict(v4_cfg)
+        self.assertFalse(was_migrated_v4)
+        self.assertEqual(migrated_v4["sensitivity"], 0.65)
+        self.assertEqual(migrated_v4["relative_score_window"], 0.03)
+
+        # 3. Test extract_first_sentence
+        self.assertEqual(
+            extract_first_sentence("Allopurinol inhibits xanthine oxidase. It reduces uric acid."),
+            "Allopurinol inhibits xanthine oxidase",
+        )
+        self.assertEqual(
+            extract_first_sentence("Colchicine treats acute gout flares! Second sentence."),
+            "Colchicine treats acute gout flares",
+        )
+        self.assertEqual(
+            extract_first_sentence("Single sentence without punctuation"),
+            "Single sentence without punctuation",
+        )
+
+        # 4. Test embedding query text construction (first sentence of claim_en + ' | ' + keywords)
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+        pipeline = SmartSearchPipeline(cfg, self.storage, mock_ai)
+
+        concept = ExtractedConcept(
+            topic_it="Allopurinolo",
+            claim_en="Allopurinol inhibits xanthine oxidase, decreasing uric acid. It is first-line for chronic gout.",
+            keywords_en=["allopurinol", "xanthine oxidase", "gout"],
+            keywords_it=["allopurinolo"],
+            quote_it="Allopurinolo inibitore xantina ossidasi.",
+        )
+        pipeline.retrieve_for_concepts([concept], active_model_id="test-model", candidate_nids={101})
+
+        # Verify query texts passed to get_embeddings
+        embed_call_args = mock_ai.get_embeddings.call_args[1]
+        sent_queries = embed_call_args["texts"]
+        self.assertEqual(len(sent_queries), 1)
+        self.assertEqual(
+            sent_queries[0],
+            "Allopurinol inhibits xanthine oxidase, decreasing uric acid | allopurinol, xanthine oxidase, gout",
+        )
+
+        # Verify with qwen3-embedding model instruction
+        cfg_qwen3 = ConfigManager(embed_model="Alibaba-NLP/gte-Qwen2-1.5B-instruct-qwen3-embedding")
+        pipe_qwen3 = SmartSearchPipeline(cfg_qwen3, self.storage, mock_ai)
+        pipe_qwen3.retrieve_for_concepts([concept], active_model_id="Alibaba-NLP/gte-Qwen2-1.5B-instruct-qwen3-embedding", candidate_nids={101})
+        qwen3_sent_queries = mock_ai.get_embeddings.call_args[1]["texts"]
+        self.assertTrue(
+            qwen3_sent_queries[0].startswith("Instruct: Given a medical lecture concept, retrieve flashcards that test it\nQuery: ")
+        )
+        self.assertIn(
+            "Allopurinol inhibits xanthine oxidase, decreasing uric acid | allopurinol, xanthine oxidase, gout",
+            qwen3_sent_queries[0],
+        )
 
 
 if __name__ == "__main__":

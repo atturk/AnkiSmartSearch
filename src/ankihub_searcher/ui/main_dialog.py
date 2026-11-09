@@ -1216,7 +1216,8 @@ class SettingsDialog(QDialog):
         self.slider_sens.valueChanged.connect(self._on_sens_slider_changed)
         sens_row.addWidget(self.slider_sens)
 
-        self.lbl_sens_val = QLabel(f"{int(self.config.sensitivity * 100)}%")
+        thresh = round(0.70 - self.config.sensitivity * 0.20, 2)
+        self.lbl_sens_val = QLabel(f"{int(self.config.sensitivity * 100)}% (soglia ~{thresh:.2f})")
         sens_row.addWidget(self.lbl_sens_val)
         search_layout.addLayout(sens_row)
 
@@ -1373,7 +1374,8 @@ class SettingsDialog(QDialog):
 
     def _load_config_to_ui(self) -> None:
         self.slider_sens.setValue(int(self.config.sensitivity * 100))
-        self.lbl_sens_val.setText(f"{int(self.config.sensitivity * 100)}%")
+        thresh = round(0.70 - self.config.sensitivity * 0.20, 2)
+        self.lbl_sens_val.setText(f"{int(self.config.sensitivity * 100)}% (soglia ~{thresh:.2f})")
         self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
 
@@ -1410,7 +1412,8 @@ class SettingsDialog(QDialog):
             self.combo_strategy.setCurrentIndex(idx_strat)
 
     def _on_sens_slider_changed(self, val: int) -> None:
-        self.lbl_sens_val.setText(f"{val}%")
+        thresh = round(0.70 - (val / 100.0) * 0.20, 2)
+        self.lbl_sens_val.setText(f"{val}% (soglia ~{thresh:.2f})")
 
     def _on_chat_preset_changed(self, idx: int) -> None:
         if idx == 0:
