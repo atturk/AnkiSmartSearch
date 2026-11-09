@@ -3403,6 +3403,71 @@ print("__JSON_RESULT__" + json.dumps(output))
         self.assertAlmostEqual(cfg.keyword_min_similarity, 0.64, places=2)
         col.conn.close()
 
+    def test_search_dialog_two_tabs_and_retry(self):
+        """Item 30: two tabs in SearchDialog, mode validation, profile definition, and retry tighter."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog, QMessageBox
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        dlg = SearchDialog(col=col)
+
+        # 1. Profile is defined
+        self.assertIsNotNone(dlg.profile)
+
+        # 2. Tabs initialized and selected according to config
+        self.assertIsNotNone(dlg.input_tabs)
+        self.assertIsNotNone(dlg.txt_keywords)
+        self.assertIsNotNone(dlg.txt_lecture)
+
+        # 3. Test validation for empty keyword
+        dlg.input_tabs.setCurrentIndex(0)
+        dlg.txt_keywords.setText("")
+        dlg.combo_query.setCurrentText("deck:Test")
+        warn_msgs = []
+        with patch.object(QMessageBox, "warning", side_effect=lambda parent, title, msg: warn_msgs.append(msg)):
+            dlg._start_search()
+        self.assertTrue(any("Inserisci almeno una keyword" in m for m in warn_msgs))
+
+        # 4. Test validation for empty text
+        dlg.input_tabs.setCurrentIndex(1)
+        dlg.txt_lecture.setText("")
+        warn_msgs.clear()
+        with patch.object(QMessageBox, "warning", side_effect=lambda parent, title, msg: warn_msgs.append(msg)):
+            dlg._start_search()
+        self.assertTrue(any("Inserisci il testo della lezione" in m for m in warn_msgs))
+
+        # 5. Test _do_retry_tighter in keyword mode
+        dlg.last_search_mode = "keyword"
+        dlg.last_search_text = "ApoB48\nLDL"
+        dlg.txt_base_deck.setText("BaseLipidi")
+        dlg.config.keyword_min_similarity = 0.52
+
+        mock_result = MagicMock()
+        mock_result.unit_title = "Unità 1"
+        mock_result.concept_coverage = [
+            {
+                "topic_it": "ApoB48",
+                "claim_en": "ApoB48",
+                "keywords_en": ["ApoB48"],
+                "keywords_it": ["ApoB48"],
+                "quote_it": "ApoB48",
+                "source": "keyword",
+            }
+        ]
+
+        with patch.object(dlg, "_do_batch_rollback", side_effect=lambda run_ids, on_done=None: on_done() if on_done else None):
+            with patch.object(SearchBatchWorker, "start"):
+                dlg._do_retry_tighter(run_ids=["run1"], results=[mock_result])
+
+        self.assertEqual(dlg.search_worker.input_mode, "keyword")
+        self.assertAlmostEqual(dlg.search_worker.override_min_threshold, 0.55, places=2)
+        self.assertEqual(dlg.search_worker.raw_text, "ApoB48\nLDL")
+        self.assertEqual(dlg.search_worker.base_deck_name, "BaseLipidi")
+        self.assertIn("Unità 1", dlg.search_worker.precomputed_concepts)
+        self.assertEqual(dlg.search_worker.precomputed_concepts["Unità 1"][0].source, "keyword")
+
+        col.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

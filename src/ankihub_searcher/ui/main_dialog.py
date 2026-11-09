@@ -92,12 +92,26 @@ except ImportError:
         class _HeadlessWidget(metaclass=_HeadlessMeta):
             def __init__(self, *args, **kwargs):
                 self._val = 0.0
+                self._idx = 0
+                self._text = ""
 
             def setValue(self, val):
                 self._val = val
 
             def value(self):
                 return self._val if self._val is not None else 0.0
+
+            def setCurrentIndex(self, idx):
+                self._idx = idx
+
+            def currentIndex(self):
+                return self._idx
+
+            def toPlainText(self):
+                return self._text
+
+            def setPlainText(self, text):
+                self._text = text
 
             def isChecked(self):
                 return False
@@ -106,13 +120,16 @@ except ImportError:
                 pass
 
             def text(self):
-                return ""
+                return self._text
 
             def setText(self, val):
-                pass
+                self._text = val
 
             def currentText(self):
-                return ""
+                return self._text
+
+            def setCurrentText(self, val):
+                self._text = val
 
             def currentData(self):
                 return ""
@@ -183,6 +200,8 @@ def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, An
     partial = sum(1 for c in coverage_items if c.get("status") == "partial")
     uncovered = sum(1 for c in coverage_items if c.get("status") == "uncovered")
     pct = int(round((covered / total) * 100)) if total > 0 else 0
+    is_kw = any(c.get("source") == "keyword" for c in coverage_items)
+    title = "Copertura keyword" if is_kw else "Copertura concetti"
     return {
         "total": total,
         "covered": covered,
@@ -190,7 +209,7 @@ def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, An
         "uncovered": uncovered,
         "pct": pct,
         "summary_label": (
-            f"Copertura concetti: {covered} / {total} ({pct}%)  —  "
+            f"{title}: {covered} / {total} ({pct}%)  —  "
             f"Coperti: {covered}  |  Parziali: {partial}  |  Scoperti: {uncovered}"
         ),
         "history_str": f"{covered}/{total} ({pct}%)" if total > 0 else "-",
@@ -402,6 +421,9 @@ class SearchDialog(QDialog):
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
         self.indexer = DeckIndexer(self.config, self.storage, self.ai_client)
+        self.profile = _get_current_profile_name()
+        self.last_search_mode = getattr(self.config, "search_input_mode", "keyword")
+        self.last_search_text = ""
 
         self.setWindowTitle("Smart Search")
         self.resize(540, 410)
@@ -454,15 +476,26 @@ class SearchDialog(QDialog):
         self.txt_base_deck.setPlaceholderText("Es. Patologia Generale")
         layout.addWidget(self.txt_base_deck)
 
-        # 3. Lecture Text Input
-        lbl_text = QLabel("Testo della lezione:")
-        layout.addWidget(lbl_text)
+        # 3. Input Tabs (Keyword / Testo)
+        self.input_tabs = QTabWidget()
+
+        self.txt_keywords = QPlainTextEdit()
+        self.txt_keywords.setPlaceholderText("ApoB48\nChilomicroni\nRecettore LDL")
+        self.input_tabs.addTab(self.txt_keywords, "Keyword")
 
         self.txt_lecture = QPlainTextEdit()
         self.txt_lecture.setPlaceholderText(
             "Incolla qui il testo della lezione o appunti in Markdown..."
         )
-        layout.addWidget(self.txt_lecture)
+        self.input_tabs.addTab(self.txt_lecture, "Testo")
+
+        initial_mode = getattr(self.config, "search_input_mode", "keyword")
+        if initial_mode == "text":
+            self.input_tabs.setCurrentIndex(1)
+        else:
+            self.input_tabs.setCurrentIndex(0)
+
+        layout.addWidget(self.input_tabs)
 
         # 4. Minimal Progress Bar & Status (Hidden unless running)
         self.lbl_status = QLabel("")
@@ -527,15 +560,24 @@ class SearchDialog(QDialog):
             self.reject()
 
     def _start_search(self) -> None:
-        raw_text = self.txt_lecture.toPlainText().strip()
-        if not raw_text:
-            QMessageBox.warning(self, "Attenzione", "Inserisci il testo della lezione prima di avviare la ricerca.")
-            return
-
         query = self.combo_query.currentText().strip()
         if not query:
             QMessageBox.warning(self, "Attenzione", "Inserisci una query di ricerca valida.")
             return
+
+        current_tab_idx = self.input_tabs.currentIndex()
+        if current_tab_idx == 0:
+            active_mode = "keyword"
+            raw_text = self.txt_keywords.toPlainText().strip()
+            if not raw_text:
+                QMessageBox.warning(self, "Attenzione", "Inserisci almeno una keyword.")
+                return
+        else:
+            active_mode = "text"
+            raw_text = self.txt_lecture.toPlainText().strip()
+            if not raw_text:
+                QMessageBox.warning(self, "Attenzione", "Inserisci il testo della lezione.")
+                return
 
         if self.col:
             try:
@@ -553,10 +595,14 @@ class SearchDialog(QDialog):
 
         self.config.search_query = query
         self.config.add_query_to_history(query)
+        self.config.search_input_mode = active_mode
         extracted_decks = self.indexer.extract_deck_names_from_query(query)
         if extracted_decks:
             self.config.selected_decks = extracted_decks
         self.config.save()
+
+        self.last_search_mode = active_mode
+        self.last_search_text = raw_text
 
         self.btn_search.setEnabled(False)
         self.btn_cancel.setText("Interrompi")
@@ -583,7 +629,8 @@ class SearchDialog(QDialog):
             raw_text=raw_text,
             base_deck_name=self.txt_base_deck.text().strip(),
             precomputed_data=presearch_data,
-            profile=_get_current_profile_name(),
+            profile=self.profile,
+            input_mode=active_mode,
         )
         self.search_worker.progress_sig.connect(self._on_search_progress)
         self.search_worker.finished_sig.connect(self._on_search_finished)
@@ -622,8 +669,10 @@ class SearchDialog(QDialog):
         cov_stats = compute_coverage_stats(all_coverage)
         cov_line = ""
         if cov_stats["total"] > 0:
+            is_kw = self.last_search_mode == "keyword" or any(c.get("source") == "keyword" for c in all_coverage)
+            label = "Copertura keyword" if is_kw else "Copertura concetti"
             cov_line = (
-                f"\n\nCopertura concetti: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
+                f"\n\n{label}: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
                 f"• Coperti: {cov_stats['covered']}\n"
                 f"• Parziali: {cov_stats['partial']}\n"
                 f"• Scoperti: {cov_stats['uncovered']}"
@@ -774,7 +823,12 @@ class SearchDialog(QDialog):
                 )
 
     def _do_retry_tighter(self, run_ids: List[str], results: List[Any]) -> None:
-        curr_thresh = self.config.get_min_similarity_threshold()
+        mode = self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
+        if mode == "keyword":
+            curr_thresh = self.config.get_keyword_min_similarity_threshold()
+        else:
+            curr_thresh = self.config.get_min_similarity_threshold()
+
         new_thresh = min(0.95, round(curr_thresh + 0.03, 4))
         curr_max = getattr(self.config, "max_notes_per_concept", 10)
         new_max = max(3, int(round(curr_max * 2.0 / 3.0)))
@@ -791,12 +845,22 @@ class SearchDialog(QDialog):
                         keywords_en=c.get("keywords_en", []),
                         keywords_it=c.get("keywords_it", []),
                         quote_it=c.get("quote_it", ""),
+                        source=str(c.get("source", "keyword" if mode == "keyword" else "llm")),
                     )
                     for c in cov
                     if c.get("claim_en") or c.get("topic_it")
                 ]
                 if c_list:
                     precomputed_concepts[u_title] = c_list
+
+        raw_text = self.last_search_text
+        if not raw_text:
+            if mode == "keyword":
+                raw_text = self.txt_keywords.toPlainText().strip()
+            else:
+                raw_text = self.txt_lecture.toPlainText().strip()
+
+        base_deck = self.txt_base_deck.text().strip()
 
         def _on_rollback_finished():
             self.btn_search.setEnabled(False)
@@ -809,23 +873,24 @@ class SearchDialog(QDialog):
                 f"Riprova più stretto: soglia {new_thresh:.2f} (+0.03), max {new_max} note/concetto..."
             )
 
-            self.worker = SearchBatchWorker(
+            self.search_worker = SearchBatchWorker(
                 col=self.col,
                 config=self.config,
                 storage=self.storage,
                 ai_client=self.ai_client,
-                raw_text=self.txt_lecture.toPlainText().strip(),
-                base_deck_name=self.txt_deck_name.text().strip(),
+                raw_text=raw_text,
+                base_deck_name=base_deck,
                 parent=self,
                 profile=self.profile,
+                input_mode=mode,
             )
-            self.worker.precomputed_concepts = precomputed_concepts
-            self.worker.override_min_threshold = new_thresh
-            self.worker.override_max_notes_per_concept = new_max
-            self.worker.progress_sig.connect(self._on_search_progress)
-            self.worker.finished_sig.connect(self._on_search_finished)
-            self.worker.error_sig.connect(self._on_search_error)
-            self.worker.start()
+            self.search_worker.precomputed_concepts = precomputed_concepts
+            self.search_worker.override_min_threshold = new_thresh
+            self.search_worker.override_max_notes_per_concept = new_max
+            self.search_worker.progress_sig.connect(self._on_search_progress)
+            self.search_worker.finished_sig.connect(self._on_search_finished)
+            self.search_worker.error_sig.connect(self._on_search_error)
+            self.search_worker.start()
 
         self._do_batch_rollback(run_ids, on_done=_on_rollback_finished)
 
