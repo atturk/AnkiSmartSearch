@@ -6,9 +6,11 @@ Prevents freezing Anki's main thread while communicating progress through Qt sig
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 try:
     from aqt.qt import QObject, QThread, pyqtSignal  # type: ignore
@@ -208,7 +210,15 @@ class SearchBatchWorker(QThread):
                 return
 
             total_units = len(units)
-            self.progress_sig.emit(0, total_units, f"Rilevate {total_units} unità di studio.")
+            total_steps = total_units * 100
+            self._last_progress_val = 0
+
+            def emit_prog(val: int, msg: str) -> None:
+                v = max(self._last_progress_val, min(val, total_steps))
+                self._last_progress_val = v
+                self.progress_sig.emit(v, total_steps, msg)
+
+            emit_prog(0, f"Rilevate {total_units} unità di studio.")
 
             # 2. Check and ensure target query notes are indexed
             if self.precomputed_data is not None:
@@ -245,7 +255,7 @@ class SearchBatchWorker(QThread):
                 return self._is_cancelled
 
             def _on_idx_progress(cur: int, tot: int, msg: str) -> None:
-                self.progress_sig.emit(0, total_units, f"[Verifica Indice] {msg}")
+                emit_prog(0, f"[Verifica Indice] {msg}")
 
             idx_res = indexer.index_selected_decks(
                 col=self.col,
@@ -273,15 +283,64 @@ class SearchBatchWorker(QThread):
                 if self._is_cancelled:
                     break
 
-                self.progress_sig.emit(
-                    idx - 1,
-                    total_units,
-                    f"[{idx}/{total_units}] Elaborazione IA: {unit.unit_title}...",
-                )
+                unit_base = (idx - 1) * 100
+                prefix = f"[{idx}/{total_units}] " if total_units > 1 else ""
+
+                parsed = urlparse(self.config.chat_base_url)
+                host = parsed.netloc or parsed.path or self.config.chat_base_url
+                model_name = self.config.chat_model or "LLM"
 
                 # Search pipeline (re-use precomputed concepts if provided to skip Stage 1)
                 if precomputed and unit.unit_title in precomputed:
                     concepts = precomputed[unit.unit_title]
+                    emit_prog(unit_base + 70, f"{prefix}Riutilizzo di {len(concepts)} concetti: {unit.unit_title}")
+                    unit_error = ""
+                else:
+                    # Sotto-passo 1: Invio richiesta (10%)
+                    emit_prog(unit_base + 10, f"{prefix}Invio richiesta a {model_name} ({host})…")
+
+                    # Sotto-passo 2: In attesa della risposta dell'IA (60%)
+                    stop_heartbeat = threading.Event()
+                    start_time = time.time()
+
+                    def _heartbeat():
+                        while not stop_heartbeat.wait(1.0):
+                            elapsed = int(time.time() - start_time)
+                            wait_prog = min(68, 10 + int(elapsed * 2))
+                            emit_prog(
+                                unit_base + wait_prog,
+                                f"{prefix}In attesa della risposta dell'IA… {elapsed} s",
+                            )
+
+                    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+                    hb_thread.start()
+
+                    try:
+                        concepts = pipeline.extract_concepts(unit)
+                        unit_error = ""
+                    except Exception as e:
+                        concepts = []
+                        unit_error = str(e)
+                    finally:
+                        stop_heartbeat.set()
+                        hb_thread.join(timeout=1.0)
+
+                    emit_prog(unit_base + 70, f"{prefix}Risposta ricevuta: {len(concepts)} concetti")
+
+                if not concepts:
+                    scored_notes = []
+                    pipeline.last_concept_coverage = []
+                else:
+                    # Sotto-passo 3: Ricerca vettoriale (20%)
+                    num_notes = len(candidate_nids) if candidate_nids is not None else 0
+                    if num_notes == 0:
+                        try:
+                            num_notes = self.storage.count_embeddings(active_model_id)
+                        except Exception:
+                            num_notes = 0
+
+                    emit_prog(unit_base + 75, f"{prefix}Ricerca vettoriale tra {num_notes} note…")
+
                     scored_notes = pipeline.retrieve_for_concepts(
                         concepts=concepts,
                         candidate_nids=candidate_nids,
@@ -290,15 +349,22 @@ class SearchBatchWorker(QThread):
                         min_threshold=getattr(self, "override_min_threshold", None),
                         max_notes_per_concept=getattr(self, "override_max_notes_per_concept", None),
                     )
-                    unit_error = ""
-                else:
-                    scored_notes = pipeline.search_unit(
-                        unit=unit,
-                        candidate_nids=candidate_nids,
-                        active_model_id=active_model_id,
-                        suspended_nids=suspended_nids,
-                    )
-                    unit_error = getattr(pipeline, "last_unit_error", "")
+
+                    if self.config.enable_llm_verification:
+                        scored_notes = pipeline.verify_candidates(unit, scored_notes, concepts=concepts)
+                        surviving_nids = {c.nid for c in scored_notes}
+                        min_threshold = self.config.get_min_similarity_threshold()
+                        for cov in pipeline.last_concept_coverage:
+                            cov.matched_nids = [n for n in cov.matched_nids if n in surviving_nids]
+                            cov.matched_notes_count = len(cov.matched_nids)
+                            if cov.matched_notes_count == 0:
+                                cov.status = "uncovered"
+                            elif cov.matched_notes_count == 1 or cov.best_score < (min_threshold + 0.06):
+                                cov.status = "partial"
+                            else:
+                                cov.status = "covered"
+
+                    emit_prog(unit_base + 90, f"{prefix}Ricerca completata ({len(scored_notes)} note)")
 
                 matched_nids = [sn.nid for sn in scored_notes]
                 note_scores = {sn.nid: sn.score for sn in scored_notes}
@@ -322,18 +388,17 @@ class SearchBatchWorker(QThread):
             # Disambiguate notes across units: assign each note exclusively to the unit where it scored highest
             assign_notes_to_best_units(units_search_data)
 
-            self.progress_sig.emit(
-                total_units,
-                total_units,
-                "Applicazione modifiche alla collezione (creazione mazzi)...",
-            )
+            # Sotto-passo 4: Creazione mazzo filtrato (10%)
+            emit_prog(total_units * 95, "Creazione mazzo filtrato…")
 
-            # 4. Delegate collection writes to the main thread with undo entry
+            # Delegate collection writes to the main thread with undo entry
             self._delegate_deck_creations(
                 units_search_data=units_search_data,
                 parent_deck_prefix=parent_deck_prefix,
                 allowed_cids=allowed_cids if allowed_cids else None,
                 total_units=total_units,
+                total_steps=total_steps,
+                emit_prog=emit_prog,
             )
 
         except Exception as e:
@@ -345,7 +410,18 @@ class SearchBatchWorker(QThread):
         parent_deck_prefix: Optional[str],
         allowed_cids: Optional[Set[int]],
         total_units: int,
+        total_steps: Optional[int] = None,
+        emit_prog: Optional[Callable[[int, str], None]] = None,
     ) -> None:
+        if total_steps is None:
+            total_steps = total_units * 100
+
+        def _finish_progress():
+            if emit_prog is not None:
+                emit_prog(total_steps, "Completato con successo!")
+            else:
+                self.progress_sig.emit(total_steps, total_steps, "Completato con successo!")
+
         # Case A: Injected runner (tests or custom host)
         if self.main_thread_runner is not None:
 
@@ -361,7 +437,7 @@ class SearchBatchWorker(QThread):
                         profile=self.profile,
                         search_id=getattr(self, "search_id", ""),
                     )
-                    self.progress_sig.emit(total_units, total_units, "Completato con successo!")
+                    _finish_progress()
                     self.finished_sig.emit(
                         {
                             "status": "cancelled" if self._is_cancelled else "done",
@@ -405,7 +481,7 @@ class SearchBatchWorker(QThread):
                             return _get_op_changes(changes)
 
                         def _on_success(changes: Any):
-                            self.progress_sig.emit(total_units, total_units, "Completato con successo!")
+                            _finish_progress()
                             self.finished_sig.emit(
                                 {
                                     "status": "cancelled" if self._is_cancelled else "done",
@@ -428,7 +504,7 @@ class SearchBatchWorker(QThread):
                             allowed_cids=allowed_cids,
                             profile=self.profile,
                         )
-                        self.progress_sig.emit(total_units, total_units, "Completato con successo!")
+                        _finish_progress()
                         self.finished_sig.emit(
                             {
                                 "status": "cancelled" if self._is_cancelled else "done",
@@ -452,7 +528,7 @@ class SearchBatchWorker(QThread):
                 parent_deck_prefix=parent_deck_prefix,
                 allowed_cids=allowed_cids,
             )
-            self.progress_sig.emit(total_units, total_units, "Completato con successo!")
+            _finish_progress()
             self.finished_sig.emit(
                 {
                     "status": "cancelled" if self._is_cancelled else "done",

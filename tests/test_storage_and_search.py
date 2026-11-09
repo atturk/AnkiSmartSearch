@@ -3046,6 +3046,99 @@ print("__JSON_RESULT__" + json.dumps(output))
                     self.assertEqual(len(fake_mw_menubar.form.menubar.menus), 1)
                     self.assertEqual(len(fake_mw_menubar.form.menuTools.submenus), 0)
 
+    def test_search_batch_worker_explicit_progress_and_monotonicity(self):
+        """Verifies Item 23: explicit progress sub-steps per unit with heartbeat and monotonic progress."""
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        mid = "model_prog_test"
+        # Seed vectors for active model
+        self.storage.save_embeddings_batch([
+            (7001, mid, "h7001", 2, [1.0, 0.0]),
+            (7002, mid, "h7002", 2, [0.0, 1.0]),
+        ])
+        col.decks_dict[901] = {"id": 901, "name": "DeckProg", "dyn": 1}
+
+        cfg = ConfigManager.load()
+        cfg.embed_model = mid
+        cfg.chat_model = "gemma-test-model"
+        cfg.chat_base_url = "http://127.0.0.1:1234/v1"
+
+        raw_text = "# Unita Uno\nTesto della prima unita.\n\n# Unita Due\nTesto della seconda unita.\n"
+
+        progress_records = []
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        def delayed_chat(*args, **kwargs):
+            # Sleep 1.1s so heartbeat thread emits at least one 'In attesa della risposta dell'IA'
+            time.sleep(1.1)
+            return {
+                "concepts": [
+                    {
+                        "topic_it": "Febbre",
+                        "claim_en": "Fever is elevated temperature.",
+                        "keywords_en": ["fever"],
+                        "keywords_it": ["febbre"],
+                        "quote_it": "temperatura elevata",
+                    }
+                ]
+            }
+        mock_ai.chat_completion_json.side_effect = delayed_chat
+
+        def fake_main_runner(task):
+            task()
+
+        precomputed_data = {
+            "candidate_nids": {7001, 7002},
+            "suspended_nids": {7001, 7002},
+            "allowed_cids": {7001, 7002},
+            "parent_deck_prefix": None,
+            "precomputed_notes_data": None,
+        }
+
+        worker = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text=raw_text,
+            base_deck_name="ProgTestDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=fake_main_runner,
+        )
+
+        worker.progress_sig.connect(lambda cur, tot, msg: progress_records.append((cur, tot, msg)))
+        worker.run()
+
+        self.assertTrue(len(progress_records) > 0)
+
+        # 1. Monotonic progression
+        for i in range(len(progress_records) - 1):
+            cur_i = progress_records[i][0]
+            cur_next = progress_records[i + 1][0]
+            self.assertLessEqual(
+                cur_i,
+                cur_next,
+                f"Progress not monotonic at step {i}: {cur_i} > {cur_next} (msg: {progress_records[i+1][2]})"
+            )
+
+        # 2. Total value is 200 (2 units * 100 points) and final progress reached 100%
+        self.assertEqual(progress_records[0][1], 200)
+        self.assertEqual(progress_records[-1][0], 200)
+        self.assertEqual(progress_records[-1][1], 200)
+
+        # 3. Explicit messages present in trajectory
+        all_msgs = [r[2] for r in progress_records]
+        self.assertTrue(any("Invio richiesta a gemma-test-model (127.0.0.1:1234)" in m for m in all_msgs), f"Missing send msg in: {all_msgs}")
+        self.assertTrue(any("In attesa della risposta dell'IA" in m for m in all_msgs), f"Missing wait msg in: {all_msgs}")
+        self.assertTrue(any("Risposta ricevuta: 1 concetti" in m for m in all_msgs), f"Missing concepts msg in: {all_msgs}")
+        self.assertTrue(any("Ricerca vettoriale tra" in m for m in all_msgs), f"Missing vector search msg in: {all_msgs}")
+        self.assertTrue(any("Creazione mazzo filtrato" in m for m in all_msgs), f"Missing deck creation msg in: {all_msgs}")
+
+        col.conn.close()
+
 
 
 
