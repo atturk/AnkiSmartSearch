@@ -78,3 +78,34 @@ Default della soglia keyword: 0.52 (separata dalla soglia della modalità Testo)
 ### 31. Versione 0.5.0
 - `python3 scripts/build_addon.py --set-version 0.5.0`; CHANGELOG (sezione 0.5.0 in italiano) e README (modalità
   Keyword: formato, una per riga, header markdown per più unità; keyword in inglese danno risultati migliori).
+
+## Aggiunte dopo la prima implementazione
+
+Decisioni dell'utente (2026-11-09 sera): la scheda "Testo" resta il workflow attuale invariato. Il popup si apre
+SEMPRE sulla scheda "Keyword" (non sull'ultima usata). In modalità Keyword l'LLM serve solo a tradurre le keyword.
+
+Calibrazione con keyword tradotte nella forma USMLE (24 keyword di prova): il primo risultato è sempre corretto,
+top 0.60-0.74. Nuova soglia keyword di default: 0.55.
+
+### 32. Popup sempre su Keyword
+- `SearchDialog` seleziona sempre la scheda "Keyword" all'apertura; `search_input_mode` resta solo come
+  informazione dell'ultima ricerca (serve a "Riprova più stretto").
+
+### 33. Traduzione delle keyword con l'LLM (search_pipeline.py, ui/worker.py, impostazioni)
+- `SmartSearchPipeline.translate_keywords(units) -> Dict[str, str]`: UNA chiamata `chat_completion_json` per
+  ricerca con tutte le keyword di tutte le unità (raggruppate per titolo di unità, così le sigle si disambiguano
+  dal contesto: in italiano "PCR" = proteina C reattiva). Prompt: per ogni keyword italiana restituisci il termine
+  medico inglese standard usato su USMLE/AnKing; sigle note restano sigle, ma se ambigue espandile
+  (es. "IDL" -> "IDL (intermediate-density lipoprotein)"); una sola traduzione breve per keyword, niente frasi.
+  Risposta JSON `{"translations":[{"it":"...","en":"..."}]}`; usa lo schema JSON se `chat_use_json_schema` come
+  per Stage 1. Ripara/accetta il JSON come Stage 1; una riprova in caso di errore.
+- `concepts_from_keywords(keywords, translations=None)`: `topic_it=quote_it=keywords_it=[originale]`,
+  `claim_en=keywords_en=[traduzione]` (originale se manca). Il testo vettorizzato è `claim_en`.
+- Worker in modalità keyword: se `keyword_translate` è attivo e il modello chat è configurato, prima della
+  ricerca un passo "Traduzione di N keyword con {modello}…" (con cronometro come l'attesa Stage 1). Se la
+  chiamata fallisce o il modello chat non è configurato, usa le keyword originali e riporta l'avviso nel
+  riepilogo finale: "Traduzione non riuscita: keyword usate senza traduzione." (non è un errore di unità).
+- Config: `keyword_translate: true`, `keyword_min_similarity: 0.55` (anche per chi ha già il 0.52 della voce 29,
+  dato che non è mai stato rilasciato). Impostazioni, scheda "Ricerca": checkbox "Traduci keyword in inglese".
+- Test: traduzione mappata sulle keyword giuste con ai_client finto; fallback alle originali su eccezione con
+  avviso; nessuna chiamata chat con `keyword_translate=false`; una sola chiamata per due unità.
