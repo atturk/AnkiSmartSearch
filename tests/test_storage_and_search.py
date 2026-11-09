@@ -1035,6 +1035,28 @@ I should decompose this into atomic concepts.
         self.assertTrue(len(hits_quoted) >= 1)
         self.assertEqual(hits_quoted[0][0], 1101)
 
+        # 3b. Test hyphenated keywords: 'IL-1', 'TNF-alpha', 'heparin-induced thrombocytopenia'
+        # Ensures no 'no such column' error and finds matching notes in actual FTS5 DB
+        self.storage.upsert_notes_content_batch(
+            [
+                (1201, 1, 100, "h1201", "IL-1 beta is produced by the NLRP3 inflammasome.", "Immunology"),
+                (1202, 1, 100, "h1202", "Infliximab is a monoclonal antibody targeting TNF-alpha.", "Pharm"),
+                (1203, 1, 100, "h1203", "Autoimmune reaction causing heparin-induced thrombocytopenia (HIT).", "Heme"),
+            ]
+        )
+
+        hits_il1 = self.storage.search_fts(["IL-1"])
+        self.assertTrue(len(hits_il1) >= 1)
+        self.assertEqual(hits_il1[0][0], 1201)
+
+        hits_tnf = self.storage.search_fts(["TNF-alpha"])
+        self.assertTrue(len(hits_tnf) >= 1)
+        self.assertEqual(hits_tnf[0][0], 1202)
+
+        hits_hit = self.storage.search_fts(["heparin-induced thrombocytopenia"])
+        self.assertTrue(len(hits_hit) >= 1)
+        self.assertEqual(hits_hit[0][0], 1203)
+
         # 4. Test candidate filtering with 30,000 NIDs (avoids SQLite variable limits)
         # Note 1101 is included in the 30k candidates; Note 1102 is NOT.
         large_candidates = list(range(2000, 32000)) + [1101]

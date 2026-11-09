@@ -616,9 +616,10 @@ class SearchDatabase:
             return []
 
         # Sanitize query tokens:
-        # 1. Discard tokens < 3 characters and stopwords (English + Italian).
-        # 2. Multi-word keywords -> phrase query ("acute pancreatitis") in OR with significant individual tokens.
-        # 3. Escape internal double quotes in phrases.
+        # 1. Discard bareword tokens < 3 characters and stopwords (English + Italian).
+        # 2. Multi-word or hyphenated keywords -> phrase query ("il 1", "acute pancreatitis") in OR with significant individual tokens.
+        # 3. Ensure no barewords contain hyphens (which FTS5 parses as operators) or characters other than [a-zA-Z0-9_].
+        # 4. Escape internal double quotes in phrases.
         query_parts: List[str] = []
         seen_terms: Set[str] = set()
 
@@ -626,31 +627,27 @@ class SearchDatabase:
             if not kw or not kw.strip():
                 continue
 
-            raw_words = re.findall(r"\b[A-Za-z0-9_-]+\b", kw)
-            sig_words: List[str] = []
-            for w in raw_words:
-                clean_w = w.strip("-_")
-                if len(clean_w) >= 3 and clean_w.lower() not in _FTS_STOPWORDS:
-                    sig_words.append(clean_w)
-
-            if not sig_words:
+            # Split on whitespace, hyphens, and other punctuation
+            all_words = re.findall(r"[A-Za-z0-9_]+", kw)
+            if not all_words:
                 continue
 
-            # Multi-word phrase query in FTS5
-            if len(sig_words) > 1:
-                escaped_phrase = " ".join(sig_words).replace('"', '""')
+            # Multi-word or hyphenated phrase query in FTS5: preserves short alphanumeric parts like '1' inside the phrase
+            if len(all_words) > 1:
+                escaped_phrase = " ".join(all_words).replace('"', '""')
                 phrase_clause = f'"{escaped_phrase}"'
                 if phrase_clause not in seen_terms:
                     seen_terms.add(phrase_clause)
                     query_parts.append(phrase_clause)
 
-            # Individual tokens with prefix matching for singular/plural inflection
-            for w in sig_words:
-                stem = re.sub(r"(?:ies|es|s)$", "", w.lower())
-                token = f"{stem}*" if len(stem) >= 3 else f"{w.lower()}*"
-                if token not in seen_terms:
-                    seen_terms.add(token)
-                    query_parts.append(token)
+            # Individual bareword tokens: strictly letters, digits, underscores, len >= 3, not in stopwords
+            for w in all_words:
+                if len(w) >= 3 and w.lower() not in _FTS_STOPWORDS and re.match(r"^[A-Za-z0-9_]+$", w):
+                    stem = re.sub(r"(?:ies|es|s)$", "", w.lower())
+                    token = f"{stem}*" if len(stem) >= 3 else f"{w.lower()}*"
+                    if token not in seen_terms:
+                        seen_terms.add(token)
+                        query_parts.append(token)
 
         if not query_parts:
             return []
