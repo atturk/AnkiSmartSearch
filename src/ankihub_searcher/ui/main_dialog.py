@@ -359,9 +359,15 @@ class CoverageDetailDialog(QDialog):
 class SearchDialog(QDialog):
     """Compact, minimal main search dialog with Browser-style query input and history."""
 
-    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        col: Optional[Any] = None,
+        parent: Optional[QWidget] = None,
+        initial_query: Optional[str] = None,
+    ):
         super().__init__(parent)
         self.col = col or (mw.col if mw else None)
+        self.initial_query = initial_query
         self.config = ConfigManager.load()
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
@@ -392,7 +398,14 @@ class SearchDialog(QDialog):
         self.combo_query.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         if self.config.search_query_history:
             self.combo_query.addItems(self.config.search_query_history)
-        self.combo_query.setCurrentText(self.config.get_effective_search_query())
+        eff_init = (
+            self.initial_query.strip()
+            if (self.initial_query is not None and self.initial_query.strip())
+            else self.config.get_effective_search_query()
+        )
+        if eff_init and self.combo_query.findText(eff_init) == -1:
+            self.combo_query.insertItem(0, eff_init)
+        self.combo_query.setCurrentText(eff_init)
         if self.combo_query.lineEdit():
             self.combo_query.lineEdit().setPlaceholderText(
                 'Es. "deck:AnKing Step Deck" oppure "deck:AnKing Step Deck" OR "deck:Mastering Radiology"'
@@ -1419,7 +1432,47 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(select_group)
 
-        # 2. Modello Chat (LLM)
+        # 2. Carte Simili (Browser)
+        similar_group = QGroupBox("Carte Simili (Browser)")
+        similar_layout = QVBoxLayout(similar_group)
+
+        row_similar_scope = QHBoxLayout()
+        row_similar_scope.addWidget(QLabel("Ambito di ricerca:"))
+        self.combo_similar_scope = QComboBox()
+        self.combo_similar_scope.addItem("Query Smart Search salvata", "query")
+        self.combo_similar_scope.addItem("Tutte le note indicizzate", "all")
+        self.combo_similar_scope.addItem("Query personalizzata", "custom")
+        self.combo_similar_scope.currentIndexChanged.connect(self._on_similar_scope_changed)
+        row_similar_scope.addWidget(self.combo_similar_scope)
+        similar_layout.addLayout(row_similar_scope)
+
+        row_similar_custom = QHBoxLayout()
+        row_similar_custom.addWidget(QLabel("Query personalizzata:"))
+        self.txt_similar_custom = QLineEdit()
+        self.txt_similar_custom.setPlaceholderText('Es. "deck:AnKing Step Deck" -is:suspended')
+        row_similar_custom.addWidget(self.txt_similar_custom)
+        similar_layout.addLayout(row_similar_custom)
+
+        row_similar_params = QHBoxLayout()
+        row_similar_params.addWidget(QLabel("Similarità minima (0.40 - 0.95):"))
+        self.spin_similar_score = QDoubleSpinBox()
+        self.spin_similar_score.setRange(0.40, 0.95)
+        self.spin_similar_score.setSingleStep(0.01)
+        self.spin_similar_score.setDecimals(2)
+        self.spin_similar_score.setValue(getattr(self.config, "similar_min_score", 0.70))
+        row_similar_params.addWidget(self.spin_similar_score)
+
+        row_similar_params.addSpacing(15)
+        row_similar_params.addWidget(QLabel("Max note simili:"))
+        self.spin_similar_max_notes = QSpinBox()
+        self.spin_similar_max_notes.setRange(1, 200)
+        self.spin_similar_max_notes.setValue(getattr(self.config, "similar_max_notes", 20))
+        row_similar_params.addWidget(self.spin_similar_max_notes)
+        similar_layout.addLayout(row_similar_params)
+
+        layout.addWidget(similar_group)
+
+        # 3. Modello Chat (LLM)
         chat_group = QGroupBox("Modello Chat (Decomposizione Concettuale)")
         chat_layout = QVBoxLayout(chat_group)
 
@@ -1596,6 +1649,18 @@ class SettingsDialog(QDialog):
         idx_strat = self.combo_strategy.findData(self.config.embed_language_strategy)
         if idx_strat != -1:
             self.combo_strategy.setCurrentIndex(idx_strat)
+
+        idx_scope = self.combo_similar_scope.findData(getattr(self.config, "similar_scope", "query"))
+        if idx_scope != -1:
+            self.combo_similar_scope.setCurrentIndex(idx_scope)
+        self.txt_similar_custom.setText(getattr(self.config, "similar_custom_query", ""))
+        self.txt_similar_custom.setEnabled(getattr(self.config, "similar_scope", "query") == "custom")
+        self.spin_similar_score.setValue(getattr(self.config, "similar_min_score", 0.70))
+        self.spin_similar_max_notes.setValue(getattr(self.config, "similar_max_notes", 20))
+
+    def _on_similar_scope_changed(self, _index: int = 0) -> None:
+        is_custom = self.combo_similar_scope.currentData() == "custom"
+        self.txt_similar_custom.setEnabled(is_custom)
 
     def _on_thresh_slider_changed(self, val: int) -> None:
         thresh = val / 100.0
@@ -1802,6 +1867,11 @@ class SettingsDialog(QDialog):
         self.config.embed_model = self.combo_embed_model.currentText().strip()
         self.config.embed_language_strategy = self.combo_strategy.currentData() or "translate_to_en"
         self.config.index_tags = self.chk_index_tags.isChecked()
+
+        self.config.similar_scope = self.combo_similar_scope.currentData() or "query"
+        self.config.similar_custom_query = self.txt_similar_custom.text().strip()
+        self.config.similar_min_score = round(self.spin_similar_score.value(), 2)
+        self.config.similar_max_notes = self.spin_similar_max_notes.value()
 
         # Save selected fields for active model
         m_name = self.combo_note_models.currentText()

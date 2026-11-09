@@ -21,7 +21,7 @@ from .deck_ops import (
     rollback_run,
 )
 from .indexer import DeckIndexer
-from .search_pipeline import SmartSearchPipeline
+from .search_pipeline import SmartSearchPipeline, find_similar_notes
 from .storage import SearchDatabase
 from .text_utils import clean_html_and_cloze, clean_tags, parse_markdown_units
 from .ui.main_dialog import (
@@ -34,13 +34,13 @@ from .ui.main_dialog import (
 from .updater import run_update_check_ui
 
 
-def open_search_dialog() -> None:
+def open_search_dialog(initial_query: Optional[str] = None) -> None:
     """Instantiates and presents the SearchDialog inside Anki."""
     try:
         from aqt import mw  # type: ignore
 
         if mw:
-            dialog = SearchDialog(col=mw.col, parent=mw)
+            dialog = SearchDialog(col=mw.col, parent=mw, initial_query=initial_query)
             dialog.exec()
     except Exception as e:
         import traceback
@@ -130,6 +130,10 @@ def init_addon() -> None:
         action_update = QAction("Verifica aggiornamenti", mw)
         action_update.triggered.connect(lambda: run_update_check_ui(mw))
         menu.addAction(action_update)
+
+        # Register Smart Search Browser menu hooks
+        from .browser_menu import setup_browser_menu
+        setup_browser_menu()
 
     except ImportError:
         # Running in standalone test environment outside Anki

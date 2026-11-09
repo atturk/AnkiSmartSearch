@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .ai_client import AIClientError, OpenAICompatibleClient
 from .config_manager import ConfigManager
-from .storage import SearchDatabase
+from .storage import HAS_NUMPY, SearchDatabase, normalize_l2, np
 from .text_utils import LectureUnit, normalize_inline_latex
 
 
@@ -737,3 +737,80 @@ class SmartSearchPipeline:
                 else:
                     cov.status = "covered"
         return candidates
+
+
+def find_similar_notes(
+    storage: SearchDatabase,
+    selected_nids: Sequence[int],
+    active_model_id: str,
+    candidate_nids: Optional[Union[Set[int], Sequence[int]]] = None,
+    min_score: float = 0.70,
+    max_notes: int = 20,
+) -> Tuple[List[Tuple[int, float]], List[int]]:
+    """Finds notes similar to the selected notes via vector cosine similarity.
+
+    1. Loads vectors for selected_nids from storage for active_model_id.
+    2. Identifies unindexed note IDs among selected_nids. If any exist, returns ([], missing_nids).
+    3. Computes the normalized mean vector across all selected notes.
+    4. Loads vectors for candidate notes (within candidate_nids if specified, or all indexed notes if None).
+    5. Excludes the selected notes themselves.
+    6. Filters candidate notes by score >= min_score, ordered descending, capped at max_notes.
+
+    Returns:
+        (matched_notes, missing_nids)
+        where matched_notes is a list of (nid, similarity_score).
+    """
+    if not selected_nids:
+        return [], []
+
+    sel_nids_list, sel_vecs, dim = storage.load_embeddings_for_notes(
+        list(selected_nids), active_model_id
+    )
+    indexed_set = set(sel_nids_list)
+    missing = [nid for nid in selected_nids if nid not in indexed_set]
+    if missing:
+        return [], missing
+
+    if not sel_nids_list:
+        return [], []
+
+    # Compute normalized mean vector
+    if HAS_NUMPY and isinstance(sel_vecs, np.ndarray):
+        mean_arr = np.mean(sel_vecs, axis=0)
+        norm_mean = normalize_l2(mean_arr.tolist())
+    else:
+        if len(sel_vecs) == 1:
+            norm_mean = normalize_l2(sel_vecs[0])
+        else:
+            dim_len = len(sel_vecs[0])
+            sum_vec = [0.0] * dim_len
+            for v in sel_vecs:
+                for d in range(dim_len):
+                    sum_vec[d] += v[d]
+            norm_mean = normalize_l2(sum_vec)
+
+    # Candidate notes
+    cand_list: Optional[Sequence[int]] = None
+    if candidate_nids is not None:
+        cand_list = list(candidate_nids)
+        if len(cand_list) == 0:
+            return [], []
+
+    cand_nids_list, cand_vecs, _ = storage.load_embeddings_for_notes(
+        cand_list, active_model_id
+    )
+    if not cand_nids_list:
+        return [], []
+
+    similarities = storage.compute_similarities_from_loaded(
+        cand_nids_list, cand_vecs, norm_mean
+    )
+
+    sel_set = set(selected_nids)
+    matched = [
+        (nid, round(float(score), 4))
+        for nid, score in similarities
+        if nid not in sel_set and score >= min_score
+    ]
+    return matched[:max_notes], []
+

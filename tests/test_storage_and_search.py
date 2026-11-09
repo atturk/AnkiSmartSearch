@@ -2347,6 +2347,243 @@ I should decompose this into atomic concepts.
         self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
         self.assertEqual(cfg.max_notes_per_concept, 10)
 
+    def test_find_similar_notes_single_and_multiple(self):
+        from ankihub_searcher.search_pipeline import find_similar_notes
+
+        mid = "test-embed-model"
+        # Seed embeddings:
+        # Note 10: [1.0, 0.0, 0.0]
+        # Note 20: [0.96, 0.28, 0.0] -> high sim to 10 (~0.96)
+        # Note 30: [0.0, 1.0, 0.0]   -> orthogonal to 10 (0.0)
+        # Note 40: [0.7071, 0.7071, 0.0] -> 45 degrees, sim to 10 is ~0.71, sim to mean(10,30) is 1.0
+        vecs = [
+            (10, [1.0, 0.0, 0.0]),
+            (20, [0.96, 0.28, 0.0]),
+            (30, [0.0, 1.0, 0.0]),
+            (40, [0.7071, 0.7071, 0.0]),
+        ]
+        self.storage.save_embeddings_batch(
+            [(nid, mid, f"hash_{nid}", len(v), v) for nid, v in vecs]
+        )
+
+        # 1. Single note selected: Note 10
+        matched, missing = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[10],
+            active_model_id=mid,
+            min_score=0.70,
+            max_notes=10,
+        )
+        self.assertEqual(missing, [])
+        # Note 10 must be excluded from results!
+        matched_nids = [nid for nid, _ in matched]
+        self.assertNotIn(10, matched_nids)
+        # Note 20 (score ~0.96) and Note 40 (score ~0.71) should match
+        self.assertIn(20, matched_nids)
+        self.assertIn(40, matched_nids)
+        # Note 30 (score 0.0) must be filtered out
+        self.assertNotIn(30, matched_nids)
+        # Ordered descending by score
+        self.assertEqual(matched_nids[0], 20)
+
+        # 2. Multiple notes selected: Note 10 and Note 30
+        # Mean vector is [0.5, 0.5, 0.0], normalized to [1/√2, 1/√2, 0.0]
+        # Note 40 has similarity 1.0 to the mean vector!
+        matched_mult, missing_mult = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[10, 30],
+            active_model_id=mid,
+            min_score=0.70,
+            max_notes=10,
+        )
+        self.assertEqual(missing_mult, [])
+        mult_nids = [nid for nid, _ in matched_mult]
+        self.assertNotIn(10, mult_nids)
+        self.assertNotIn(30, mult_nids)
+        self.assertEqual(mult_nids[0], 40)
+        self.assertAlmostEqual(matched_mult[0][1], 1.0, places=2)
+
+    def test_find_similar_notes_missing_and_scopes(self):
+        from ankihub_searcher.search_pipeline import find_similar_notes
+
+        mid = "test-embed-model-scope"
+        self.storage.save_embeddings_batch(
+            [
+                (101, mid, "h101", 2, [1.0, 0.0]),
+                (102, mid, "h102", 2, [0.9, 0.1]),
+                (103, mid, "h103", 2, [0.8, 0.2]),
+            ]
+        )
+
+        # 1. Unindexed note in selection returns missing
+        matched, missing = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[101, 999],
+            active_model_id=mid,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(missing, [999])
+
+        # 2. Candidate scope restriction
+        matched_scope, missing_scope = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[101],
+            active_model_id=mid,
+            candidate_nids={103},  # only allow 103
+            min_score=0.50,
+        )
+        self.assertEqual(missing_scope, [])
+        self.assertEqual([nid for nid, _ in matched_scope], [103])
+
+        # 3. Empty candidate scope
+        matched_empty, _ = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[101],
+            active_model_id=mid,
+            candidate_nids=set(),
+        )
+        self.assertEqual(matched_empty, [])
+
+    def test_browser_menu_integration(self):
+        from ankihub_searcher.browser_menu import (
+            get_browser_search_text,
+            on_browser_menus_did_init,
+            on_find_similar_cards_clicked,
+            _update_similar_action_state,
+        )
+
+        mid = "test-browser-mid"
+        self.storage.save_embeddings_batch(
+            [
+                (501, mid, "h501", 2, [1.0, 0.0]),
+                (502, mid, "h502", 2, [0.95, 0.05]),
+            ]
+        )
+
+        class MockAction:
+            def __init__(self, text=""):
+                self.text = text
+                self.enabled = True
+                self.shortcut = ""
+                self.callbacks = []
+
+            def setEnabled(self, val):
+                self.enabled = bool(val)
+
+            def setShortcut(self, sc):
+                self.shortcut = sc
+
+            @property
+            def triggered(self):
+                act_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        act_self.callbacks.append(fn)
+                return _Sig()
+
+            def trigger(self):
+                for cb in self.callbacks:
+                    cb()
+
+        class MockMenu:
+            def __init__(self, title=""):
+                self.title = title
+                self.actions = []
+                self._about_to_show_cbs = []
+
+            def addAction(self, text):
+                act = MockAction(text)
+                self.actions.append(act)
+                return act
+
+            @property
+            def aboutToShow(self):
+                menu_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        menu_self._about_to_show_cbs.append(fn)
+                return _Sig()
+
+        class MockMenubar:
+            def __init__(self):
+                self.menus = []
+
+            def addMenu(self, title):
+                m = MockMenu(title)
+                self.menus.append(m)
+                return m
+
+        class MockBrowser:
+            def __init__(self, col=None, selected_nids=None, current_search_str=""):
+                self.col = col
+                self._selected = list(selected_nids or [])
+                self._search_str = current_search_str
+                self.executed_searches = []
+                self.form = type("Form", (), {"menubar": MockMenubar()})()
+
+            def selected_notes(self):
+                return list(self._selected)
+
+            def current_search(self):
+                return self._search_str
+
+            def search_for(self, query):
+                self.executed_searches.append(query)
+                self._search_str = query
+
+        col = MockAnkiCol()
+        browser = MockBrowser(col=col, selected_nids=[], current_search_str='"deck:AnKing"')
+
+        # 1. Initialize browser menus
+        on_browser_menus_did_init(browser)
+        self.assertEqual(len(browser.form.menubar.menus), 1)
+        menu = browser.form.menubar.menus[0]
+        self.assertEqual(menu.title, "Smart Search")
+        self.assertEqual(len(menu.actions), 2)
+
+        act_search = menu.actions[0]
+        act_similar = menu.actions[1]
+        self.assertEqual(act_search.text, "Cerca con la query corrente…")
+        self.assertEqual(act_similar.text, "Trova carte simili")
+        self.assertEqual(act_similar.shortcut, "Ctrl+Shift+S")
+
+        # Initial selection is empty -> act_similar disabled
+        self.assertFalse(act_similar.enabled)
+
+        # 2. Test selection toggle
+        browser._selected = [501]
+        _update_similar_action_state(browser)
+        self.assertTrue(act_similar.enabled)
+
+        browser._selected = []
+        _update_similar_action_state(browser)
+        self.assertFalse(act_similar.enabled)
+
+        # 3. Test get_browser_search_text
+        self.assertEqual(get_browser_search_text(browser), '"deck:AnKing"')
+
+        # 4. Test "Trova carte simili" execution
+        browser._selected = [501]
+        with patch.object(ConfigManager, "load") as mock_load:
+            cfg = ConfigManager(
+                embed_model="test-embed-model",
+                embed_provider="test",
+                similar_scope="all",
+                similar_min_score=0.70,
+                similar_max_notes=10,
+            )
+            # Match model id
+            cfg.get_active_model_id = lambda: mid
+            mock_load.return_value = cfg
+
+            with patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage):
+                act_similar.trigger()
+
+        # Browser search should have been updated with "nid:502"
+        self.assertIn("nid:502", browser.executed_searches)
+        col.conn.close()
+
+
 
 
 
