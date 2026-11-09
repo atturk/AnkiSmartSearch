@@ -667,6 +667,19 @@ I should decompose this into atomic concepts.
         parsed_valid = OpenAICompatibleClient.extract_clean_json(valid_json)
         self.assertEqual(parsed_valid["text"], 'Line 1\nLine 2\tTabbed "quote" \\ slash A')
 
+        # 4. Test with 'TGF-$\beta$' and 'NF-$\kappa$B' (LaTeX escapes that would become control chars \x08 or invalid JSON)
+        raw_tgf_beta = r'{"claim": "Attivazione di TGF-$\beta$"}'
+        parsed_tgf_beta = OpenAICompatibleClient.extract_clean_json(raw_tgf_beta)
+        self.assertNotIn("\x08", parsed_tgf_beta["claim"])
+        self.assertIn(r"\beta", parsed_tgf_beta["claim"])
+
+        raw_both = r'{"cytokine": "TGF-$\beta$", "transcription_factor": "NF-$\kappa$B"}'
+        parsed_both = OpenAICompatibleClient.extract_clean_json(raw_both)
+        self.assertNotIn("\x08", parsed_both["cytokine"])
+        self.assertNotIn("\x0c", parsed_both["cytokine"])
+        self.assertIn(r"\beta", parsed_both["cytokine"])
+        self.assertIn(r"\kappa", parsed_both["transcription_factor"])
+
     def test_chat_completion_json_schema_and_400_fallback(self):
         client = OpenAICompatibleClient()
 

@@ -26,8 +26,55 @@ class AIClientError(Exception):
         self.status_code = status_code
 
 
+_LATEX_COMMANDS_BFNRT = {
+    # Greek letters
+    "beta",
+    "nu",
+    "rho",
+    "varrho",
+    "tau",
+    "theta",
+    "vartheta",
+    # Common math / layout commands
+    "frac",
+    "times",
+    "text",
+    "textbf",
+    "textit",
+    "textnormal",
+    "mathrm",
+    "mathbf",
+    "mathit",
+    "nabla",
+    "neq",
+    "ne",
+    "right",
+    "rightarrow",
+    "Rightarrow",
+    "top",
+    "to",
+    "bar",
+    "bm",
+    "bold",
+    "begin",
+    "bullet",
+    "forall",
+    "notin",
+    "neg",
+    "not",
+    "tilde",
+    "tan",
+}
+_RE_WORD_START = re.compile(r"^[a-zA-Z]+")
+
+
 def repair_json_escapes(raw_text: str) -> str:
-    """Repairs invalid JSON escape sequences by doubling backslashes not followed by '"/bfnrtu'."""
+    """Repairs invalid JSON escape sequences by doubling backslashes.
+
+    Doubles backslashes not followed by '"/bfnrtu' or when followed by
+    letters forming known LaTeX commands (e.g. \\beta, \\frac, \\nu, \\rho,
+    \\tau, \\theta, \\times, etc.) to prevent invalid control characters.
+    """
     res: List[str] = []
     i = 0
     n = len(raw_text)
@@ -37,6 +84,12 @@ def repair_json_escapes(raw_text: str) -> str:
         if c == "\\":
             if i + 1 < n:
                 nxt = raw_text[i + 1]
+                # Check if this escape forms a known LaTeX command (e.g. \beta, \frac)
+                m = _RE_WORD_START.match(raw_text[i + 1 :])
+                if m and m.group(0).lower() in _LATEX_COMMANDS_BFNRT:
+                    res.append("\\\\")
+                    i += 1
+                    continue
                 if nxt in valid_single:
                     res.append(c)
                     res.append(nxt)
@@ -149,9 +202,25 @@ class OpenAICompatibleClient:
         if not raw_text or not raw_text.strip():
             raise AIClientError("LLM returned empty text.")
 
+        def _has_control_chars(obj: Any) -> bool:
+            if isinstance(obj, str):
+                return "\x08" in obj or "\x0c" in obj
+            if isinstance(obj, dict):
+                return any(_has_control_chars(k) or _has_control_chars(v) for k, v in obj.items())
+            if isinstance(obj, list):
+                return any(_has_control_chars(item) for item in obj)
+            return False
+
         def _try_parse(candidate_str: str) -> Optional[Any]:
             try:
-                return json.loads(candidate_str)
+                parsed = json.loads(candidate_str)
+                if _has_control_chars(parsed):
+                    repaired = repair_json_escapes(candidate_str)
+                    try:
+                        return json.loads(repaired)
+                    except json.JSONDecodeError:
+                        return parsed
+                return parsed
             except json.JSONDecodeError:
                 try:
                     repaired = repair_json_escapes(candidate_str)
