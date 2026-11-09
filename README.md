@@ -8,12 +8,13 @@ Paste your Italian lecture unit (or an entire Markdown document with multiple un
 
 ## ✨ Key Features
 
-- **⚡ Modalità "Keyword" (Lite, senza LLM):**
-  - Cerca rapidamente inserendo a mano una lista di keyword mediche, **una per riga**.
-  - **Zero token chat:** Ogni keyword viene vettorizzata da sola con il modello di embedding locale o remoto e cercata direttamente tra le note senza richiedere chiamate LLM di decomposizione.
+- **⚡ Modalità "Keyword" (Lite / Veloce):**
+  - Cerca rapidamente inserendo una lista di keyword mediche, **una per riga**. Il popup di ricerca si apre **sempre sulla scheda "Keyword"** come predefinita.
+  - **Traduzione automatica con LLM (opzionale, attiva di default):** Se hai configurato un modello chat, le keyword (anche in italiano) vengono tradotte nei termini medici standard in inglese USMLE / AnKing con una sola chiamata chat iniziale (`keyword_translate: true`). Le keyword vengono raggruppate per titolo di unità per disambiguare le sigle dal contesto (es. "PCR" = *C-reactive protein*). Se il modello chat non è configurato o la chiamata fallisce, il sistema usa in automatico le keyword originali con avviso nel riepilogo.
+  - **Zero token di decomposizione:** A differenza della modalità "Testo", non c'è decomposizione di paragrafi o verifica Stage 3; le keyword vengono vettorizzate e cercate direttamente.
   - **Parsing flessibile:** Riconosce ed elimina automaticamente marcatori di elenco (`-`, `*`, `+`, `•`, `1.`, `1)`), spazi e punteggiatura finale; deduplica preservando la prima grafia; normalizza il LaTeX inline.
   - **Multi-unità Markdown:** Usa le intestazioni Markdown (`# Unità 1`, `## Sezione 2`) sopra le keyword per generare mazzi filtrati distinti in un unico passaggio batch.
-  - 💡 *Consiglio:* Le keyword in **inglese** (es. `chylomicrons`, `LDL receptor`, `PCSK9 inhibitor`) ottengono punteggi di similarità più alti (top 0.60–0.74) rispetto all'italiano (0.45–0.57). Soglia keyword predefinita: `0.52`.
+  - 💡 *Calibrazione:* Con la traduzione in inglese o keyword in inglese (es. `chylomicrons`, `LDL receptor`, `PCSK9 inhibitor`), i risultati top raggiungono similarità 0.60–0.74. Soglia keyword predefinita: `0.55`.
 - **🔬 3-Stage Hybrid Medical Search (Modalità "Testo"):**
   1. **Stage 1 — LLM Concept Decomposition:** Breaks down dense Italian paragraphs into atomic English USMLE claims & medical keywords (supports **LM Studio** locally and **OpenRouter** / OpenAI-compatible APIs remotely).
   2. **Stage 2 — Dense Embeddings + SQLite FTS5 BM25:** Combines vector cosine similarity with tokenized BM25 keyword ranking.
