@@ -1278,6 +1278,9 @@ class SettingsDialog(QDialog):
         row_chat_model.addWidget(btn_test_chat)
         chat_layout.addLayout(row_chat_model)
 
+        self.chk_chat_schema = QCheckBox("Forza output JSON strutturato via schema (sperimentale, disattivato di default)")
+        chat_layout.addWidget(self.chk_chat_schema)
+
         layout.addWidget(chat_group)
 
         # 3. Modello Embedding
@@ -1381,6 +1384,7 @@ class SettingsDialog(QDialog):
         self.txt_chat_url.setText(self.config.chat_base_url)
         self.txt_chat_key.setText(self.config.chat_api_key)
         self.combo_chat_model.setCurrentText(self.config.chat_model)
+        self.chk_chat_schema.setChecked(getattr(self.config, "chat_use_json_schema", False))
 
         self.txt_embed_url.setText(self.config.embed_base_url)
         self.txt_embed_key.setText(self.config.embed_api_key)
@@ -1496,6 +1500,7 @@ class SettingsDialog(QDialog):
         self.config.chat_base_url = self.txt_chat_url.text().strip()
         self.config.chat_api_key = self.txt_chat_key.text().strip()
         self.config.chat_model = self.combo_chat_model.currentText().strip()
+        self.config.chat_use_json_schema = self.chk_chat_schema.isChecked()
 
         self.config.embed_base_url = self.txt_embed_url.text().strip()
         self.config.embed_api_key = self.txt_embed_key.text().strip()

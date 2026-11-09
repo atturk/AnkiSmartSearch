@@ -1865,6 +1865,86 @@ I should decompose this into atomic concepts.
         self.assertTrue(bool(failed_res.unit_error))
         self.assertEqual(failed_res.total_cards_count, 0)
 
+    def test_stage1_json_schema_option_retry_and_length_truncation(self):
+        # 1. Option chat_use_json_schema: default False -> json_schema is None
+        cfg_default = ConfigManager()
+        self.assertFalse(cfg_default.chat_use_json_schema)
+        self.assertEqual(cfg_default.chat_max_tokens, 16384)
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [{"topic_it": "Test", "claim_en": "Claim", "keywords_en": ["k"], "keywords_it": []}]
+        }
+        pipe_default = SmartSearchPipeline(cfg_default, self.storage, mock_ai)
+        unit = LectureUnit("Unit 1", "Deck 1", "Medical lecture text")
+        pipe_default.extract_concepts(unit)
+
+        # Verified json_schema is None when chat_use_json_schema is False
+        call_kwargs = mock_ai.chat_completion_json.call_args[1]
+        self.assertIsNone(call_kwargs["json_schema"])
+        self.assertEqual(call_kwargs["max_tokens"], 16384)
+
+        # 1b. chat_use_json_schema = True -> json_schema is STAGE1_JSON_SCHEMA
+        cfg_schema = ConfigManager(chat_use_json_schema=True)
+        pipe_schema = SmartSearchPipeline(cfg_schema, self.storage, mock_ai)
+        mock_ai.reset_mock()
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [{"topic_it": "Test", "claim_en": "Claim", "keywords_en": ["k"], "keywords_it": []}]
+        }
+        pipe_schema.extract_concepts(unit)
+        call_kwargs_schema = mock_ai.chat_completion_json.call_args[1]
+        self.assertEqual(call_kwargs_schema["json_schema"], STAGE1_JSON_SCHEMA)
+
+        # 2. When response_format active and returns 0 concepts: retry once without response_format
+        mock_ai.reset_mock()
+        mock_ai.chat_completion_json.side_effect = [
+            {"concepts": []},  # 1st call with schema: 0 concepts
+            {"concepts": [{"topic_it": "Gout", "claim_en": "Colchicine treats acute gout", "keywords_en": ["colchicine"], "keywords_it": []}]},  # fallback without schema: success
+        ]
+        res_concepts = pipe_schema.extract_concepts(unit)
+        self.assertEqual(len(res_concepts), 1)
+        self.assertEqual(res_concepts[0].topic_it, "Gout")
+        self.assertEqual(mock_ai.chat_completion_json.call_count, 2)
+        first_call_schema = mock_ai.chat_completion_json.call_args_list[0][1]["json_schema"]
+        second_call_schema = mock_ai.chat_completion_json.call_args_list[1][1]["json_schema"]
+        self.assertIsNotNone(first_call_schema)
+        self.assertIsNone(second_call_schema)
+
+        # 4. finish_reason == 'length' raises AIClientError with 'risposta troncata: aumentare chat_max_tokens'
+        real_client = OpenAICompatibleClient()
+        real_client._make_request = lambda *args, **kwargs: {
+            "choices": [
+                {
+                    "message": {"content": '{"concepts": [{"topic_it": "Trun'},
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        with self.assertRaises(AIClientError) as ctx:
+            real_client.chat_completion_json(
+                messages=[{"role": "user", "content": "test"}],
+                model="test",
+                base_url="http://localhost:1234/v1",
+            )
+        self.assertIn("risposta troncata: aumentare chat_max_tokens", str(ctx.exception))
+
+        # Also when JSON is somehow superficially parsed but finish_reason == 'length'
+        real_client._make_request = lambda *args, **kwargs: {
+            "choices": [
+                {
+                    "message": {"content": '{"concepts": []}'},
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        with self.assertRaises(AIClientError) as ctx2:
+            real_client.chat_completion_json(
+                messages=[{"role": "user", "content": "test"}],
+                model="test",
+                base_url="http://localhost:1234/v1",
+            )
+        self.assertIn("risposta troncata: aumentare chat_max_tokens", str(ctx2.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

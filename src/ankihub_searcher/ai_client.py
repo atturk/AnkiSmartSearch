@@ -276,7 +276,7 @@ class OpenAICompatibleClient:
         temperature: float = 0.1,
         timeout: int = 240,
         json_schema: Optional[Dict[str, Any]] = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 16384,
     ) -> Any:
         """Calls POST /v1/chat/completions and returns parsed JSON content."""
         norm_url = self._normalize_base_url(base_url)
@@ -326,12 +326,27 @@ class OpenAICompatibleClient:
         if not choices:
             raise AIClientError("No choices returned in chat completion response.")
 
-        first_msg = choices[0].get("message", {})
+        first_choice = choices[0]
+        finish_reason = first_choice.get("finish_reason")
+        first_msg = first_choice.get("message", {})
         raw_content = first_msg.get("content", "") or ""
         if not raw_content.strip():
             # Fallback if a reasoning model placed JSON inside reasoning_content
             raw_content = first_msg.get("reasoning_content", "") or ""
-        return self.extract_clean_json(raw_content)
+
+        try:
+            parsed = self.extract_clean_json(raw_content)
+        except Exception as e:
+            if finish_reason == "length":
+                raise AIClientError(
+                    f"risposta troncata: aumentare chat_max_tokens (finish_reason: length, error: {e})"
+                ) from e
+            raise
+
+        if finish_reason == "length":
+            raise AIClientError("risposta troncata: aumentare chat_max_tokens")
+
+        return parsed
 
     def get_embeddings(
         self,

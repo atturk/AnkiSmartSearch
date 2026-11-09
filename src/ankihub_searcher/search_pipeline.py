@@ -220,50 +220,74 @@ class SmartSearchPipeline:
             {"role": "user", "content": user_prompt},
         ]
 
+        def _parse_concepts(res_obj: Any) -> List[ExtractedConcept]:
+            raw_concepts = []
+            if isinstance(res_obj, dict) and "concepts" in res_obj:
+                raw_concepts = res_obj["concepts"]
+            elif isinstance(res_obj, list):
+                raw_concepts = res_obj
+
+            parsed_list: List[ExtractedConcept] = []
+            for item in raw_concepts:
+                if not isinstance(item, dict):
+                    continue
+                topic_it = str(item.get("topic_it", "")).strip()
+                claim_en = str(item.get("claim_en", "")).strip()
+                kws_en = [str(k).strip() for k in item.get("keywords_en", []) if str(k).strip()]
+                kws_it = [str(k).strip() for k in item.get("keywords_it", []) if str(k).strip()]
+                quote_it = str(item.get("quote_it", "")).strip()
+
+                if claim_en or kws_en or topic_it:
+                    parsed_list.append(
+                        ExtractedConcept(
+                            topic_it=topic_it or unit.unit_title,
+                            claim_en=claim_en or topic_it,
+                            keywords_en=kws_en or [unit.unit_title],
+                            keywords_it=kws_it,
+                            quote_it=quote_it,
+                        )
+                    )
+            return parsed_list
+
         last_err: Optional[Exception] = None
-        max_tokens = getattr(self.config, "chat_max_tokens", 4096)
+        max_tokens = getattr(self.config, "chat_max_tokens", 16384)
+        use_schema = bool(getattr(self.config, "chat_use_json_schema", False))
 
         for attempt in range(2):
             try:
+                schema_to_use = STAGE1_JSON_SCHEMA if use_schema else None
                 res = self.ai_client.chat_completion_json(
                     messages=messages,
                     model=self.config.chat_model,
                     base_url=self.config.chat_base_url,
                     api_key=self.config.chat_api_key,
                     temperature=0.1,
-                    json_schema=STAGE1_JSON_SCHEMA,
+                    json_schema=schema_to_use,
                     max_tokens=max_tokens,
                 )
 
-                raw_concepts = []
-                if isinstance(res, dict) and "concepts" in res:
-                    raw_concepts = res["concepts"]
-                elif isinstance(res, list):
-                    raw_concepts = res
-
-                concepts: List[ExtractedConcept] = []
-                for item in raw_concepts:
-                    if not isinstance(item, dict):
-                        continue
-                    topic_it = str(item.get("topic_it", "")).strip()
-                    claim_en = str(item.get("claim_en", "")).strip()
-                    kws_en = [str(k).strip() for k in item.get("keywords_en", []) if str(k).strip()]
-                    kws_it = [str(k).strip() for k in item.get("keywords_it", []) if str(k).strip()]
-                    quote_it = str(item.get("quote_it", "")).strip()
-
-                    if claim_en or kws_en or topic_it:
-                        concepts.append(
-                            ExtractedConcept(
-                                topic_it=topic_it or unit.unit_title,
-                                claim_en=claim_en or topic_it,
-                                keywords_en=kws_en or [unit.unit_title],
-                                keywords_it=kws_it,
-                                quote_it=quote_it,
-                            )
-                        )
-
+                concepts = _parse_concepts(res)
                 if concepts:
                     return concepts
+
+                # If parsed response contains 0 concepts and response_format was active,
+                # retry once without response_format before counting the attempt as failed.
+                if schema_to_use is not None:
+                    print(
+                        f"[SmartSearch] Notice: 0 concepts with response_format active in attempt {attempt + 1}, retrying once without response_format..."
+                    )
+                    res_no_schema = self.ai_client.chat_completion_json(
+                        messages=messages,
+                        model=self.config.chat_model,
+                        base_url=self.config.chat_base_url,
+                        api_key=self.config.chat_api_key,
+                        temperature=0.1,
+                        json_schema=None,
+                        max_tokens=max_tokens,
+                    )
+                    concepts_no_schema = _parse_concepts(res_no_schema)
+                    if concepts_no_schema:
+                        return concepts_no_schema
 
                 raise Stage1ExtractionError("LLM response did not contain any valid medical concepts.")
 
@@ -578,6 +602,7 @@ class SmartSearchPipeline:
                     model=self.config.chat_model,
                     base_url=self.config.chat_base_url,
                     api_key=self.config.chat_api_key,
+                    max_tokens=getattr(self.config, "chat_max_tokens", 16384),
                 )
                 if isinstance(res, dict) and "relevant_nids" in res:
                     for nid in res["relevant_nids"]:
