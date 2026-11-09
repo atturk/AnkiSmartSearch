@@ -77,8 +77,45 @@ except ImportError:
         mw = None
     except ImportError:
         # Running headless
-        QDialog = object  # type: ignore
-        QTreeWidgetItem = object  # type: ignore
+        class _HeadlessMeta(type):
+            def __getattr__(cls, name):
+                return _HeadlessWidget()
+
+        class _HeadlessWidget(metaclass=_HeadlessMeta):
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __getattr__(self, name):
+                return _HeadlessWidget()
+
+            def __call__(self, *args, **kwargs):
+                return _HeadlessWidget()
+
+        QApplication = _HeadlessWidget  # type: ignore
+        QCheckBox = _HeadlessWidget  # type: ignore
+        QComboBox = _HeadlessWidget  # type: ignore
+        QDialog = _HeadlessWidget  # type: ignore
+        QFileDialog = _HeadlessWidget  # type: ignore
+        QGroupBox = _HeadlessWidget  # type: ignore
+        QHBoxLayout = _HeadlessWidget  # type: ignore
+        QHeaderView = _HeadlessWidget  # type: ignore
+        QLabel = _HeadlessWidget  # type: ignore
+        QLineEdit = _HeadlessWidget  # type: ignore
+        QListWidget = _HeadlessWidget  # type: ignore
+        QListWidgetItem = _HeadlessWidget  # type: ignore
+        QMessageBox = _HeadlessWidget  # type: ignore
+        QPlainTextEdit = _HeadlessWidget  # type: ignore
+        QProgressBar = _HeadlessWidget  # type: ignore
+        QPushButton = _HeadlessWidget  # type: ignore
+        QSlider = _HeadlessWidget  # type: ignore
+        QTableWidget = _HeadlessWidget  # type: ignore
+        QTableWidgetItem = _HeadlessWidget  # type: ignore
+        QTreeWidget = _HeadlessWidget  # type: ignore
+        QTreeWidgetItem = _HeadlessWidget  # type: ignore
+        QVBoxLayout = _HeadlessWidget  # type: ignore
+        QWidget = _HeadlessWidget  # type: ignore
+        Qt = _HeadlessWidget  # type: ignore
+        QTimer = _HeadlessWidget  # type: ignore
         mw = None
 
 
@@ -91,6 +128,30 @@ from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
 CURRENT_VERSION = "0.2.0"
+
+
+def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Computes honest coverage metrics:
+    - 'covered', 'partial', and 'uncovered' counted separately.
+    - Percentage counts ONLY fully covered concepts.
+    """
+    total = len(coverage_items)
+    covered = sum(1 for c in coverage_items if c.get("status") == "covered")
+    partial = sum(1 for c in coverage_items if c.get("status") == "partial")
+    uncovered = sum(1 for c in coverage_items if c.get("status") == "uncovered")
+    pct = int(round((covered / total) * 100)) if total > 0 else 0
+    return {
+        "total": total,
+        "covered": covered,
+        "partial": partial,
+        "uncovered": uncovered,
+        "pct": pct,
+        "summary_label": (
+            f"Copertura concetti: {covered} / {total} ({pct}%)  —  "
+            f"Coperti: {covered}  |  Parziali: {partial}  |  Scoperti: {uncovered}"
+        ),
+        "history_str": f"{covered}/{total} ({pct}%)" if total > 0 else "-",
+    }
 
 
 def _get_current_profile_name() -> str:
@@ -126,7 +187,7 @@ class CoverageDetailDialog(QDialog):
         if title_context:
             win_title += f" ({title_context})"
         self.setWindowTitle(win_title)
-        self.resize(740, 480)
+        self.resize(800, 480)
 
         # Sort: uncovered first, then partial, then covered (and ascending by score)
         status_order = {"uncovered": 0, "partial": 1, "covered": 2}
@@ -141,26 +202,20 @@ class CoverageDetailDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        total = len(self.sorted_items)
-        covered = sum(1 for c in self.sorted_items if c.get("status") == "covered")
-        partial = sum(1 for c in self.sorted_items if c.get("status") == "partial")
-        uncovered = sum(1 for c in self.sorted_items if c.get("status") == "uncovered")
-        matched_any = total - uncovered
-        pct = int(round((matched_any / total) * 100)) if total > 0 else 0
-
-        summary_lbl = QLabel(
-            f"Copertura punti chiave: {matched_any} / {total} ({pct}%)  —  "
-            f"Coperti: {covered}  |  Parziali: {partial}  |  Scoperti: {uncovered}"
-        )
+        stats = compute_coverage_stats(self.sorted_items)
+        summary_lbl = QLabel(stats["summary_label"])
         layout.addWidget(summary_lbl)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Stato", "Punto Chiave (IT)", "Claim USMLE (EN)", "Carte / Score"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(
+            ["Stato", "Concetto (IT)", "Citazione testo", "Claim USMLE (EN)", "Carte / Score"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setRowCount(len(self.sorted_items))
@@ -177,16 +232,19 @@ class CoverageDetailDialog(QDialog):
             if item.get("shared_with"):
                 st_text += f" (con {item['shared_with']})"
             topic_it = str(item.get("topic_it", ""))
+            quote_it = str(item.get("quote_it", ""))
             claim_en = str(item.get("claim_en", ""))
             notes_cnt = int(item.get("matched_notes_count", 0))
             best_score = float(item.get("best_score", 0.0))
 
             self.table.setItem(r_idx, 0, QTableWidgetItem(st_text))
             self.table.setItem(r_idx, 1, QTableWidgetItem(topic_it))
-            self.table.setItem(r_idx, 2, QTableWidgetItem(claim_en))
-            self.table.setItem(r_idx, 3, QTableWidgetItem(f"{notes_cnt} note ({best_score:.2f})"))
+            self.table.setItem(r_idx, 2, QTableWidgetItem(quote_it))
+            self.table.setItem(r_idx, 3, QTableWidgetItem(claim_en))
+            self.table.setItem(r_idx, 4, QTableWidgetItem(f"{notes_cnt} note ({best_score:.2f})"))
 
-        self.table.setColumnWidth(1, 180)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 170)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         layout.addWidget(self.table)
 
@@ -235,8 +293,11 @@ class CoverageDetailDialog(QDialog):
         preview = str(item.get("best_note_preview", "")).strip() or "Nessuna nota corrispondente."
         shared_with = item.get("shared_with", "")
         shared_line = f"\nCondivisa con: {shared_with}" if shared_with else ""
+        quote_it = str(item.get("quote_it", "")).strip()
+        quote_line = f"Citazione testo: «{quote_it}»\n" if quote_it else ""
         text = (
             f"[{st}] {item.get('topic_it', '')}\n"
+            f"{quote_line}"
             f"Claim (EN): {item.get('claim_en', '')}\n"
             f"Keywords: {kws}\n"
             f"Nota più vicina nel mazzo (score {float(item.get('best_score', 0.0)):.2f}): {preview}"
@@ -251,7 +312,8 @@ class CoverageDetailDialog(QDialog):
         lines = []
         for c in targets:
             st = "SCOPERTO" if c.get("status") == "uncovered" else "PARZIALE" if c.get("status") == "partial" else "COPERTO"
-            lines.append(f"- [{st}] {c.get('topic_it', '')}: {c.get('claim_en', '')}")
+            q = f" (cit: «{c.get('quote_it', '')}»)" if c.get("quote_it") else ""
+            lines.append(f"- [{st}] {c.get('topic_it', '')}{q}: {c.get('claim_en', '')}")
         text = "\n".join(lines)
         try:
             cb = QApplication.clipboard()
@@ -506,23 +568,26 @@ class SearchDialog(QDialog):
             if getattr(r, "concept_coverage", None):
                 all_coverage.extend(r.concept_coverage)
 
-        total_claims = len(all_coverage)
-        uncovered_claims = sum(1 for c in all_coverage if c.get("status") == "uncovered")
-        matched_claims = total_claims - uncovered_claims
-        cov_pct = int(round((matched_claims / total_claims) * 100)) if total_claims > 0 else 0
-
+        cov_stats = compute_coverage_stats(all_coverage)
         cov_line = ""
-        if total_claims > 0:
+        if cov_stats["total"] > 0:
             cov_line = (
-                f"\nCopertura punti chiave: {matched_claims} / {total_claims} ({cov_pct}%) — "
-                f"{uncovered_claims} scoperti"
+                f"\n\nCopertura concetti: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
+                f"• Coperti: {cov_stats['covered']}\n"
+                f"• Parziali: {cov_stats['partial']}\n"
+                f"• Scoperti: {cov_stats['uncovered']}"
             )
 
         err_units = [r for r in results if getattr(r, "unit_error", "")]
         err_section = ""
         if err_units:
             err_lines = [f"• {r.unit_title}: {r.unit_error}" for r in err_units]
-            err_section = "\n\n⚠️ Errori Stage 1:\n" + "\n".join(err_lines)
+            err_section = (
+                "⚠️ ATTENZIONE — Errori Stage 1:\n"
+                "Nessuna carta riattivata per le seguenti unità a causa di errori nel testo/parsing:\n"
+                + "\n".join(err_lines)
+                + "\n\n"
+            )
 
         # 1. Automatically close the SearchDialog (CollectionOp handles UI refresh)
         self.accept()
@@ -530,23 +595,36 @@ class SearchDialog(QDialog):
         # 2. Present clean post-search summary popup with Browser & Coverage Details buttons
         parent_widget = mw if mw else None
         msg_box = QMessageBox(parent_widget)
-        msg_box.setWindowTitle("Ricerca completata")
+        if err_units:
+            msg_box.setWindowTitle("Ricerca completata con errori")
+            try:
+                msg_box.setIcon(QMessageBox.Icon.Warning)
+            except Exception:
+                pass
+        else:
+            msg_box.setWindowTitle("Ricerca completata")
 
         if total_added == 0 and total_already_active > 0:
             msg_box.setText(
+                f"{err_section}"
                 f"Nessuna nuova carta da riattivare.\n\n"
                 f"Carte correlate già attive in studio: {total_already_active}"
                 f"{cov_line}"
+            )
+        elif total_added == 0 and not total_already_active and err_units:
+            msg_box.setText(
                 f"{err_section}"
+                f"Nessun mazzo filtrato creato a causa degli errori sopra indicati."
+                f"{cov_line}"
             )
         else:
             msg_box.setText(
+                f"{err_section}"
                 f"Mazzi filtrati creati: {decks_created}\n"
                 f"Nuove carte riattivate: {total_unsuspended}\n"
                 f"Carte correlate già attive: {total_already_active}\n"
                 f"Carte totali nel mazzo filtrato: {total_added}"
                 f"{cov_line}"
-                f"{err_section}"
             )
 
         msg_box.addButton(QMessageBox.StandardButton.Ok)
@@ -685,9 +763,8 @@ class HistoryDialog(QDialog):
 
             cov_list = getattr(r, "concept_coverage", None) or []
             if cov_list:
-                tot_c = len(cov_list)
-                unc_c = sum(1 for c in cov_list if c.get("status") == "uncovered")
-                cov_str = f"{tot_c - unc_c}/{tot_c} ({int(round((tot_c - unc_c) / tot_c * 100))}%)"
+                stats = compute_coverage_stats(cov_list)
+                cov_str = stats["history_str"]
             else:
                 cov_str = "-"
 
@@ -700,7 +777,12 @@ class HistoryDialog(QDialog):
             self.history_table.setItem(row_idx, 3, QTableWidgetItem(str(len(r.total_matched_cids))))
             self.history_table.setItem(row_idx, 4, QTableWidgetItem(str(len(r.newly_unsuspended_cids))))
             self.history_table.setItem(row_idx, 5, QTableWidgetItem(str(len(r.already_active_cids))))
-            self.history_table.setItem(row_idx, 6, QTableWidgetItem(cov_str))
+            item_cov = QTableWidgetItem(cov_str)
+            if cov_list:
+                item_cov.setToolTip(
+                    f"Coperti: {stats['covered']} | Parziali: {stats['partial']} | Scoperti: {stats['uncovered']}"
+                )
+            self.history_table.setItem(row_idx, 6, item_cov)
             item_status = QTableWidgetItem(status_str)
             if unit_err:
                 item_status.setToolTip(unit_err)

@@ -39,6 +39,7 @@ from ankihub_searcher.storage import (
     unpack_vector,
 )
 from ankihub_searcher.text_utils import LectureUnit
+from ankihub_searcher.ui.main_dialog import CoverageDetailDialog, compute_coverage_stats
 
 
 class MockAnkiCol:
@@ -1768,6 +1769,101 @@ I should decompose this into atomic concepts.
             current_profile="UserA",
         )
         self.assertEqual(res_leg.run_id, "run_prof_legacy")
+
+    def test_honest_coverage_and_summary_with_quote_it(self):
+        # 1. Test compute_coverage_stats empty case
+        empty_stats = compute_coverage_stats([])
+        self.assertEqual(empty_stats["total"], 0)
+        self.assertEqual(empty_stats["covered"], 0)
+        self.assertEqual(empty_stats["partial"], 0)
+        self.assertEqual(empty_stats["uncovered"], 0)
+        self.assertEqual(empty_stats["pct"], 0)
+        self.assertEqual(empty_stats["history_str"], "-")
+
+        # 2. Test honest calculation: 2 covered, 2 partial, 1 uncovered (total 5)
+        # The percentage MUST ONLY count covered concepts: 2/5 = 40% (not 4/5 = 80%)
+        coverage_data = [
+            {
+                "topic_it": "Allopurinolo",
+                "quote_it": "Allopurinolo inibitore xantina ossidasi.",
+                "claim_en": "Allopurinol inhibits xanthine oxidase",
+                "status": "covered",
+                "matched_notes_count": 2,
+                "best_score": 0.88,
+            },
+            {
+                "topic_it": "Colchicina",
+                "quote_it": "Colchicina blocca i microtubuli.",
+                "claim_en": "Colchicine inhibits microtubule polymerization",
+                "status": "covered",
+                "matched_notes_count": 1,
+                "best_score": 0.85,
+            },
+            {
+                "topic_it": "Febuxostat",
+                "quote_it": "Febuxostat alternativa per iperuricemia.",
+                "claim_en": "Febuxostat alternative xanthine oxidase inhibitor",
+                "status": "partial",
+                "matched_notes_count": 1,
+                "best_score": 0.65,
+            },
+            {
+                "topic_it": "Probenecid",
+                "quote_it": "Probenecid aumenta escrezione urati.",
+                "claim_en": "Probenecid increases uric acid excretion",
+                "status": "partial",
+                "matched_notes_count": 1,
+                "best_score": 0.62,
+            },
+            {
+                "topic_it": "Pegloticasi",
+                "quote_it": "Pegloticasi forma ricombinante urato ossidasi.",
+                "claim_en": "Pegloticase converts uric acid to allantoin",
+                "status": "uncovered",
+                "matched_notes_count": 0,
+                "best_score": 0.40,
+            },
+        ]
+
+        stats = compute_coverage_stats(coverage_data)
+        self.assertEqual(stats["total"], 5)
+        self.assertEqual(stats["covered"], 2)
+        self.assertEqual(stats["partial"], 2)
+        self.assertEqual(stats["uncovered"], 1)
+        # Percentage counts only covered: 2/5 = 40%
+        self.assertEqual(stats["pct"], 40)
+        self.assertEqual(stats["history_str"], "2/5 (40%)")
+        self.assertIn("Copertura concetti: 2 / 5 (40%)", stats["summary_label"])
+        self.assertIn("Coperti: 2", stats["summary_label"])
+        self.assertIn("Parziali: 2", stats["summary_label"])
+        self.assertIn("Scoperti: 1", stats["summary_label"])
+
+        # 3. Test CoverageDetailDialog items sorting and quote_it preservation
+        dlg = CoverageDetailDialog(coverage_items=coverage_data)
+        self.assertEqual(len(dlg.sorted_items), 5)
+        # Uncovered first, then partial, then covered
+        self.assertEqual(dlg.sorted_items[0]["status"], "uncovered")
+        self.assertEqual(dlg.sorted_items[1]["status"], "partial")
+        self.assertEqual(dlg.sorted_items[2]["status"], "partial")
+        self.assertEqual(dlg.sorted_items[3]["status"], "covered")
+        self.assertEqual(dlg.sorted_items[4]["status"], "covered")
+        # quote_it is present and preserved next to each concept
+        self.assertEqual(dlg.sorted_items[0]["quote_it"], "Pegloticasi forma ricombinante urato ossidasi.")
+        self.assertEqual(dlg.sorted_items[3]["quote_it"], "Colchicina blocca i microtubuli.")
+        self.assertEqual(dlg.sorted_items[4]["quote_it"], "Allopurinolo inibitore xantina ossidasi.")
+
+        # 4. Test stage 1 error units highlighted in results
+        failed_res = RunResult(
+            run_id="run_err_1",
+            deck_name="",
+            filtered_did=0,
+            total_cards_count=0,
+            newly_unsuspended_count=0,
+            newly_unsuspended_cids=[],
+            unit_error="Stage 1 extraction failed: JSON schema mismatch",
+        )
+        self.assertTrue(bool(failed_res.unit_error))
+        self.assertEqual(failed_res.total_cards_count, 0)
 
 
 if __name__ == "__main__":
