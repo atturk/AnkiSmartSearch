@@ -305,10 +305,11 @@ class SearchBatchWorker(QThread):
 
                     def _heartbeat():
                         while not stop_heartbeat.wait(1.0):
+                            # La barra resta ferma al passo "richiesta inviata": durante l'attesa
+                            # avanza solo il cronometro nel messaggio (nessuna percentuale inventata).
                             elapsed = int(time.time() - start_time)
-                            wait_prog = min(68, 10 + int(elapsed * 2))
                             emit_prog(
-                                unit_base + wait_prog,
+                                unit_base + 10,
                                 f"{prefix}In attesa della risposta dell'IA… {elapsed} s",
                             )
 
