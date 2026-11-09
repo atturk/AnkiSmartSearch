@@ -489,11 +489,8 @@ class SearchDialog(QDialog):
         )
         self.input_tabs.addTab(self.txt_lecture, "Testo")
 
-        initial_mode = getattr(self.config, "search_input_mode", "keyword")
-        if initial_mode == "text":
-            self.input_tabs.setCurrentIndex(1)
-        else:
-            self.input_tabs.setCurrentIndex(0)
+        # Always open on the "Keyword" tab (index 0)
+        self.input_tabs.setCurrentIndex(0)
 
         layout.addWidget(self.input_tabs)
 

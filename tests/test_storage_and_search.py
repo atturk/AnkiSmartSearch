@@ -3468,6 +3468,17 @@ print("__JSON_RESULT__" + json.dumps(output))
 
         col.conn.close()
 
+    def test_search_dialog_always_opens_on_keyword_tab(self):
+        """Item 32: SearchDialog always selects Keyword tab on open regardless of search_input_mode."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog
+
+        col = MockAnkiCol()
+        with patch.object(ConfigManager, "load", return_value=ConfigManager(search_input_mode="text")):
+            dlg = SearchDialog(col=col)
+            self.assertEqual(dlg.input_tabs.currentIndex(), 0)
+            self.assertEqual(dlg.last_search_mode, "text")
+        col.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
