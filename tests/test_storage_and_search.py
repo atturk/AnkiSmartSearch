@@ -2457,6 +2457,7 @@ I should decompose this into atomic concepts.
             [
                 (501, mid, "h501", 2, [1.0, 0.0]),
                 (502, mid, "h502", 2, [0.95, 0.05]),
+                (503, mid, "h503", 2, [0.92, 0.08]),
             ]
         )
 
@@ -2579,8 +2580,8 @@ I should decompose this into atomic concepts.
             with patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage):
                 act_similar.trigger()
 
-        # Browser search should have been updated with "nid:502"
-        self.assertIn("nid:502", browser.executed_searches)
+        # Browser search should have been updated with comma-separated "nid:502,503"
+        self.assertIn("nid:502,503", browser.executed_searches)
         col.conn.close()
 
 
