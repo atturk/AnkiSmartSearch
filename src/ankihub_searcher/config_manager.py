@@ -26,6 +26,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "embed_base_url": "http://127.0.0.1:1234/v1",
     "embed_api_key": "",
     "embed_model": "",
+    "embed_query_instruction": "",
     "embed_language_strategy": "translate_to_en",
     "sensitivity": 0.55,
     "top_k_per_concept": 8,
@@ -75,6 +76,7 @@ class ConfigManager:
     embed_base_url: str = DEFAULT_CONFIG["embed_base_url"]
     embed_api_key: str = DEFAULT_CONFIG["embed_api_key"]
     embed_model: str = DEFAULT_CONFIG["embed_model"]
+    embed_query_instruction: str = str(DEFAULT_CONFIG.get("embed_query_instruction", ""))
     embed_language_strategy: str = DEFAULT_CONFIG["embed_language_strategy"]
 
     sensitivity: float = float(DEFAULT_CONFIG["sensitivity"])

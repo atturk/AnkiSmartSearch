@@ -295,6 +295,16 @@ class SmartSearchPipeline:
                 text = f"{c.claim_en} | {', '.join(c.keywords_en)}"
             query_texts.append(text)
 
+        # Resolve optional query instruction (e.g. for qwen3-embedding)
+        instruction = getattr(self.config, "embed_query_instruction", "")
+        if not instruction:
+            embed_model_name = (self.config.embed_model or "").lower()
+            if "qwen3-embedding" in embed_model_name:
+                instruction = "Instruct: Given a medical lecture concept, retrieve flashcards that test it\nQuery: "
+
+        if instruction:
+            query_texts = [f"{instruction}{t}" for t in query_texts]
+
         # Batch embed all concept queries at once
         concept_vectors = self.ai_client.get_embeddings(
             texts=query_texts,

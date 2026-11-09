@@ -14,6 +14,7 @@
   "embed_base_url": "http://127.0.0.1:1234/v1",
   "embed_api_key": "",
   "embed_model": "",
+  "embed_query_instruction": "",
   "embed_language_strategy": "translate_to_en",
   "sensitivity": 0.55,
   "top_k_per_concept": 8,

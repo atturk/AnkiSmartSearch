@@ -1121,6 +1121,47 @@ I should decompose this into atomic concepts.
 
         self.storage.search_fts = original_search_fts
 
+    def test_embed_query_instruction(self):
+        concept = ExtractedConcept(
+            topic_it="Inflammasoma",
+            claim_en="NLRP3 inflammasome activates caspase-1",
+            keywords_en=["NLRP3", "caspase-1"],
+            keywords_it=[],
+        )
+
+        # 1. Non-Qwen model with empty embed_query_instruction -> no prefix
+        cfg_plain = ConfigManager(embed_model="text-embedding-3-small", embed_query_instruction="")
+        mock_ai_plain = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai_plain.get_embeddings.return_value = [[1.0, 0.0]]
+        pipeline_plain = SmartSearchPipeline(cfg_plain, self.storage, mock_ai_plain)
+        pipeline_plain.retrieve_for_concepts([concept], candidate_nids=[], active_model_id="plain")
+
+        plain_query = mock_ai_plain.get_embeddings.call_args[1]["texts"][0]
+        self.assertEqual(plain_query, "NLRP3 inflammasome activates caspase-1 | NLRP3, caspase-1")
+        self.assertNotIn("Instruct:", plain_query)
+
+        # 2. Model containing 'qwen3-embedding' with empty embed_query_instruction -> auto-applies default instruction
+        cfg_qwen = ConfigManager(embed_model="Qwen/Qwen3-Embedding-8B", embed_query_instruction="")
+        mock_ai_qwen = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai_qwen.get_embeddings.return_value = [[1.0, 0.0]]
+        pipeline_qwen = SmartSearchPipeline(cfg_qwen, self.storage, mock_ai_qwen)
+        pipeline_qwen.retrieve_for_concepts([concept], candidate_nids=[], active_model_id="qwen")
+
+        qwen_query = mock_ai_qwen.get_embeddings.call_args[1]["texts"][0]
+        expected_prefix = "Instruct: Given a medical lecture concept, retrieve flashcards that test it\nQuery: "
+        self.assertTrue(qwen_query.startswith(expected_prefix))
+        self.assertIn("NLRP3 inflammasome activates caspase-1", qwen_query)
+
+        # 3. Explicit custom embed_query_instruction -> applies custom instruction
+        cfg_custom = ConfigManager(embed_model="any-model", embed_query_instruction="Custom Instruction:\n")
+        mock_ai_custom = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai_custom.get_embeddings.return_value = [[1.0, 0.0]]
+        pipeline_custom = SmartSearchPipeline(cfg_custom, self.storage, mock_ai_custom)
+        pipeline_custom.retrieve_for_concepts([concept], candidate_nids=[], active_model_id="custom")
+
+        custom_query = mock_ai_custom.get_embeddings.call_args[1]["texts"][0]
+        self.assertTrue(custom_query.startswith("Custom Instruction:\n"))
+
 
 if __name__ == "__main__":
     unittest.main()
