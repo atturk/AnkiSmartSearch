@@ -252,6 +252,14 @@ def execute_unit_deck_creation(
             else:
                 deck_name = f"{deck_name} - Smart Search {timestamp}"
             existing_did = col.decks.id_for_name(deck_name)
+        elif storage.is_filtered_deck_in_active_run(deck_name, existing_did):
+            # Do NOT reuse a filtered deck belonging to an active (non-rolled back) run
+            timestamp = time.strftime("%Y-%m-%d %H:%M")
+            candidate_new_name = f"{deck_name} {timestamp}"
+            if col.decks.id_for_name(candidate_new_name):
+                candidate_new_name = f"{deck_name} {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            deck_name = candidate_new_name
+            existing_did = col.decks.id_for_name(deck_name)
 
     if existing_did:
         filtered_did = existing_did
@@ -369,17 +377,14 @@ def rollback_run(
         placeholders = ",".join(str(c) for c in chunk)
 
         if keep_reviewed:
-            # Check reps in cards and revlog entries since run creation in a single batch query
+            # Check revlog entries since run creation in a single batch query (reps > 0 alone is ignored)
             run_time_ms = record.created_at * 1000
             rev_query = f"SELECT DISTINCT cid FROM revlog WHERE cid IN ({placeholders}) AND id >= {run_time_ms}"
             reviewed_in_revlog: Set[int] = {int(r_cid) for (r_cid,) in col.db.execute(rev_query)}
 
-            query = f"""
-                SELECT id, reps FROM cards
-                WHERE id IN ({placeholders})
-            """
-            for cid, reps in col.db.execute(query):
-                if reps > 0 or int(cid) in reviewed_in_revlog:
+            query = f"SELECT id FROM cards WHERE id IN ({placeholders})"
+            for (cid,) in col.db.execute(query):
+                if int(cid) in reviewed_in_revlog:
                     kept_count += 1
                     continue
 

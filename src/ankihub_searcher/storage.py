@@ -812,6 +812,22 @@ class SearchDatabase:
                 unit_error=unit_err or "",
             )
 
+    def is_filtered_deck_in_active_run(self, deck_name: str, filtered_did: Optional[int] = None) -> bool:
+        """Checks if deck_name or filtered_did belongs to an active (non-rolled-back) run."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            if filtered_did:
+                cur.execute(
+                    "SELECT 1 FROM run_history WHERE rolled_back = 0 AND (deck_name = ? OR filtered_did = ?)",
+                    (deck_name, filtered_did),
+                )
+            else:
+                cur.execute(
+                    "SELECT 1 FROM run_history WHERE rolled_back = 0 AND deck_name = ?",
+                    (deck_name,),
+                )
+            return cur.fetchone() is not None
+
     def mark_run_rolled_back(self, run_id: str) -> None:
         """Marks a run as rolled back."""
         with self._get_connection() as conn:

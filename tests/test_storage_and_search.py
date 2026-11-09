@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -385,8 +386,11 @@ I should decompose this into atomic concepts.
         col.sched.rebuild_filtered_deck.assert_called_with(created_did)
 
         # 3. Test Rollback with keep_reviewed=True
-        # Simulate that card 1001 was reviewed after the run (reps = 1)
-        col.conn.execute("UPDATE cards SET reps = 1 WHERE id = 1001")
+        # Simulate that card 1001 was reviewed after the run (entry in revlog with id >= created_at * 1000)
+        revlog_time = int(time.time() * 1000) + 5000
+        col.conn.execute("INSERT INTO revlog (id, cid) VALUES (?, 1001)", (revlog_time,))
+        # Card 2001 has reps=3 from old reviews, but NO revlog entry after this run
+        col.conn.execute("UPDATE cards SET reps = 3 WHERE id = 2001")
         col.conn.commit()
 
         # Update card queue state in DB: 1001 is unsuspended (queue=0), 2001 is unsuspended (queue=0), 1002 was already active
@@ -395,8 +399,8 @@ I should decompose this into atomic concepts.
 
         rollback_res = rollback_run(col, self.storage, run_res.run_id, keep_reviewed=True)
         self.assertTrue(rollback_res.deck_removed)
-        self.assertEqual(rollback_res.kept_reviewed_count, 1)  # Card 1001 was reviewed, kept active!
-        self.assertEqual(rollback_res.resuspended_count, 1)  # Card 2001 re-suspended
+        self.assertEqual(rollback_res.kept_reviewed_count, 1)  # Card 1001 was reviewed in revlog, kept active!
+        self.assertEqual(rollback_res.resuspended_count, 1)  # Card 2001 had reps=3 but no revlog, re-suspended!
 
         # Verify suspend was called only on card 2001, NEVER on card 1002 (active before) or 1001 (reviewed)
         col.sched.suspend_cards.assert_called_once_with([2001])
@@ -1519,6 +1523,50 @@ I should decompose this into atomic concepts.
         self.assertEqual(len(finished_rb), 1)
         self.assertIsInstance(finished_rb[0], RollbackResult)
         self.assertEqual(finished_rb[0].run_id, run_id)
+
+    def test_rollback_reviewed_criteria_and_active_deck_no_reuse(self):
+        col = MockAnkiCol()
+        # Seed 3 cards:
+        # 701: reps=5, but NO revlog entry -> must be re-suspended
+        # 702: reps=0, revlog entry id >= run_time -> kept active
+        # 703: reps=2, revlog entry id < run_time (old review months ago) -> must be re-suspended
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, reps) VALUES (701, 70, 100, 0, -1, 5)")
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, reps) VALUES (702, 70, 100, 0, -1, 0)")
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, reps) VALUES (703, 70, 100, 0, -1, 2)")
+        col.conn.commit()
+
+        config = ConfigManager(selected_decks=["AnKing Step Deck"])
+        unit1 = LectureUnit("Unit 1", "Active Deck Test", "Lecture body 1")
+        run1 = execute_unit_deck_creation(col, unit1, [70], config, self.storage)
+        self.assertEqual(run1.newly_unsuspended_count, 3)
+
+        # Insert revlog entries:
+        run_time_ms = int(time.time() * 1000)
+        # 702 reviewed NOW (after run creation)
+        col.conn.execute("INSERT INTO revlog (id, cid) VALUES (?, 702)", (run_time_ms + 2000,))
+        # 703 reviewed in the PAST (before run creation)
+        col.conn.execute("INSERT INTO revlog (id, cid) VALUES (?, 703)", (run_time_ms - 50000,))
+        col.conn.commit()
+
+        # Part 1: Verify active deck reuse prevention
+        # Run 2 tries to use the same deck name "Active Deck Test" while Run 1 is active
+        unit2 = LectureUnit("Unit 2", "Active Deck Test", "Lecture body 2")
+        run2 = execute_unit_deck_creation(col, unit2, [70], config, self.storage)
+        # Must have created a new filtered deck with timestamp suffix, NOT reusing run1.filtered_did!
+        self.assertNotEqual(run2.filtered_did, run1.filtered_did)
+        self.assertTrue("Active Deck Test " in run2.deck_name)
+
+        # Part 2: Verify rollback criteria
+        res = rollback_run(col, self.storage, run1.run_id, keep_reviewed=True)
+        self.assertTrue(res.deck_removed)
+        # Only card 702 kept (it has revlog >= created_at * 1000)
+        self.assertEqual(res.kept_reviewed_count, 1)
+        # Cards 701 and 703 re-suspended (reps > 0 alone is ignored; old revlog is ignored)
+        self.assertEqual(res.resuspended_count, 2)
+        col.sched.suspend_cards.assert_called_with([701, 703])
+
+        # Verify run2's deck is still in col.decks_dict!
+        self.assertIn(run2.filtered_did, col.decks_dict)
 
 
 if __name__ == "__main__":
