@@ -1740,7 +1740,8 @@ class SettingsDialog(QDialog):
             if self.col and candidates:
                 try:
                     cand_nids = [c.nid for c in candidates]
-                    cids_count = len(resolve_notes_to_cards(self.col, cand_nids))
+                    susp_cids, act_cids = resolve_notes_to_cards(self.col, cand_nids, self.config.selected_decks)
+                    cids_count = len(susp_cids) + len(act_cids)
                 except Exception:
                     cids_count = n_notes
 
