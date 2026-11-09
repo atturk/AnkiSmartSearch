@@ -4,6 +4,7 @@ Provides:
 1. clean_html_and_cloze: HTML, Cloze, and media cleaner for Anki note fields.
 2. clean_tags: Smart tag cleaner stripping AnKing / Mastering Radiology boilerplate.
 3. parse_markdown_units: Markdown batch parser with empty-header handling and breadcrumbs.
+4. normalize_inline_latex: Inline LaTeX cleaner converting math and Greek letters to Unicode.
 """
 
 from __future__ import annotations
@@ -369,3 +370,142 @@ def parse_markdown_units(
         )
 
     return units
+
+
+# Greek letter mappings for LaTeX normalization
+_LATEX_GREEK = {
+    # Lowercase
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "varepsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "vartheta": "θ",
+    "iota": "ι",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "omicron": "ο",
+    "pi": "π",
+    "varpi": "ϖ",
+    "rho": "ρ",
+    "varrho": "ϱ",
+    "sigma": "σ",
+    "varsigma": "ς",
+    "tau": "τ",
+    "upsilon": "υ",
+    "phi": "φ",
+    "varphi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    # Uppercase
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Xi": "Ξ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Upsilon": "Υ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+}
+
+# Common mathematical symbols in medical notes
+_LATEX_MATH_SYMBOLS = {
+    "pm": "±",
+    "mp": "∓",
+    "times": "×",
+    "div": "÷",
+    "leq": "≤",
+    "le": "≤",
+    "geq": "≥",
+    "ge": "≥",
+    "neq": "≠",
+    "ne": "≠",
+    "approx": "≈",
+    "sim": "∼",
+    "to": "→",
+    "rightarrow": "→",
+    "leftarrow": "←",
+    "leftrightarrow": "↔",
+    "Rightarrow": "⇒",
+    "Leftarrow": "⇐",
+    "Leftrightarrow": "⇔",
+    "uparrow": "↑",
+    "downarrow": "↓",
+    "infty": "∞",
+    "partial": "∂",
+    "nabla": "∇",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "circ": "°",
+    "degree": "°",
+}
+
+_ALL_LATEX_SYMBOLS = {**_LATEX_GREEK, **_LATEX_MATH_SYMBOLS}
+_RE_LATEX_WRAPPERS = re.compile(
+    r"\\(?:mathrm|mathbf|mathit|text|textbf|textit|textnormal|operatorname|bm|underline)\{([^{}]*)\}"
+)
+_RE_LATEX_FRAC = re.compile(r"\\frac\{([^{}]*)\}\{([^{}]*)\}")
+_RE_LATEX_SUB_SUP = re.compile(r"([_^])\{([^{}]+)\}")
+_RE_MATH_DELIMITERS = re.compile(r"(?<!\\)\${1,2}")
+_RE_PAREN_OPEN = re.compile(r"\\(?:[\(\[])\s*")
+_RE_PAREN_CLOSE = re.compile(r"\s*\\(?:[\)\]])")
+
+
+def normalize_inline_latex(raw_text: Optional[str]) -> str:
+    """Normalizes inline LaTeX in lecture text to clean Unicode representations.
+
+    Converts Greek letters (e.g., $\\beta$ -> β, $\\kappa$ -> κ, $\\alpha$ -> α),
+    unwraps formatting commands (e.g., \\mathrm{TGF}-\\beta -> TGF-β), removes
+    math delimiters ($...$, $$...$$, \\(...\\)), and converts common symbols.
+    """
+    if not raw_text:
+        return ""
+
+    text = raw_text
+
+    # 1. Iteratively unwrap LaTeX command wrappers (e.g. \mathrm{...}, \textbf{...})
+    for _ in range(5):
+        if not _RE_LATEX_WRAPPERS.search(text):
+            break
+        text = _RE_LATEX_WRAPPERS.sub(r"\1", text)
+
+    # 2. Convert fractions \frac{a}{b} -> a/b
+    for _ in range(5):
+        if not _RE_LATEX_FRAC.search(text):
+            break
+        text = _RE_LATEX_FRAC.sub(r"\1/\2", text)
+
+    # 3. Replace known Greek letters and math symbols
+    def _sym_repl(match: re.Match) -> str:
+        cmd = match.group(1)
+        trailer = match.group(2) or ""
+        sym = _ALL_LATEX_SYMBOLS.get(cmd)
+        if sym is not None:
+            if trailer == "{}":
+                return sym
+            return sym + trailer
+        return match.group(0)
+
+    text = re.sub(r"\\([a-zA-Z]+)(\{\})?", _sym_repl, text)
+
+    # 4. Unwrap braces in sub/superscripts: _{2} -> _2, ^{2} -> ^2
+    text = _RE_LATEX_SUB_SUP.sub(r"\1\2", text)
+
+    # 5. Remove math delimiters ($, $$, \(, \), \[, \])
+    text = _RE_MATH_DELIMITERS.sub("", text)
+    text = _RE_PAREN_OPEN.sub("", text)
+    text = _RE_PAREN_CLOSE.sub("", text)
+
+    return text

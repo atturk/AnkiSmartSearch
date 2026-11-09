@@ -9,12 +9,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+try:
+    import numpy as np  # type: ignore
+except ImportError:
+    np = None  # type: ignore
 
 from .ai_client import AIClientError, OpenAICompatibleClient
 from .config_manager import ConfigManager
-from .storage import SearchDatabase
-from .text_utils import LectureUnit
+from .storage import SearchDatabase, normalize_l2
+from .text_utils import LectureUnit, normalize_inline_latex
+
+
+class Stage1ExtractionError(AIClientError):
+    """Raised when Stage 1 concept extraction fails after retries."""
+
+    pass
 
 
 @dataclass
@@ -25,6 +36,7 @@ class ExtractedConcept:
     claim_en: str
     keywords_en: List[str]
     keywords_it: List[str] = field(default_factory=list)
+    quote_it: str = ""
 
 
 @dataclass
@@ -44,24 +56,30 @@ class ConceptCoverage:
     topic_it: str
     claim_en: str
     keywords_en: List[str] = field(default_factory=list)
+    keywords_it: List[str] = field(default_factory=list)
     matched_notes_count: int = 0
     matched_nids: List[int] = field(default_factory=list)
     best_score: float = 0.0
     best_nid: Optional[int] = None
     best_note_preview: str = ""
     status: str = "uncovered"  # "covered" | "partial" | "uncovered"
+    quote_it: str = ""
+    shared_with: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "topic_it": self.topic_it,
             "claim_en": self.claim_en,
             "keywords_en": list(self.keywords_en),
+            "keywords_it": list(self.keywords_it),
             "matched_notes_count": int(self.matched_notes_count),
             "matched_nids": list(self.matched_nids),
             "best_score": float(self.best_score),
             "best_nid": self.best_nid,
             "best_note_preview": self.best_note_preview,
             "status": self.status,
+            "quote_it": self.quote_it,
+            "shared_with": self.shared_with,
         }
 
     @classmethod
@@ -70,28 +88,42 @@ class ConceptCoverage:
             topic_it=str(data.get("topic_it", "")),
             claim_en=str(data.get("claim_en", "")),
             keywords_en=[str(x) for x in data.get("keywords_en", [])],
+            keywords_it=[str(x) for x in data.get("keywords_it", [])],
             matched_notes_count=int(data.get("matched_notes_count", 0)),
             matched_nids=[int(x) for x in data.get("matched_nids", [])],
             best_score=float(data.get("best_score", 0.0)),
             best_nid=int(data["best_nid"]) if data.get("best_nid") is not None else None,
             best_note_preview=str(data.get("best_note_preview", "")),
             status=str(data.get("status", "uncovered")),
+            quote_it=str(data.get("quote_it", "")),
+            shared_with=str(data.get("shared_with", "")),
         )
 
 
 SYSTEM_PROMPT_STAGE1 = """You are an elite medical professor, USMLE Step 1/Step 2 expert, and AnKing deck specialist.
-Your task is to decompose the following Italian lecture notes into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
+Your task is to decompose the following Italian lecture text into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
 
 CRITICAL INSTRUCTIONS:
-1. Deconstruct the lecture text into 3 to 12 atomic medical concepts.
-2. Resolve Italian medical terminology, historical acronyms, and eponyms into their standard USMLE English equivalents:
+1. Extract an atomic concept for EVERY distinct entity mentioned in the text:
+   - Every disease, syndrome, or pathology.
+   - Every molecular/cellular mechanism, pathway, or receptor.
+   - Every molecule, protein, cytokine, antibody, or biomarker.
+   - Every drug, pharmacological class, or therapeutic agent.
+   - Every clinical sign, symptom, or diagnostic finding.
+   - Every numerical criterion, cutoff, stage, or diagnostic threshold.
+2. STRICT RULES:
+   - NEVER merge distinct entities together into a single concept (e.g., do not combine two different drugs or two separate cytokines).
+   - Forbid generic concepts without a specific entity (e.g., avoid vague concepts like "general therapy" or "pathology overview").
+   - Ignore non-medical digressions entirely (costs, hospital administration, course organization, historical trivia, personal anecdotes).
+3. Resolve Italian medical terminology, historical acronyms, and eponyms into standard USMLE English equivalents:
    - e.g., "NALP3" -> "NLRP3 inflammasome"
    - e.g., "pirofosfato di calcio" -> "calcium pyrophosphate dihydrate (CPPD)", "pseudogout"
    - e.g., "acido urico" -> "uric acid", "monosodium urate", "gout"
    - e.g., "fattore di Hageman" -> "Factor XII", "Hageman factor"
    - e.g., "segno di Cullen" -> "Cullen sign", "acute pancreatitis"
-3. For each concept, provide:
-   - "topic_it": Short Italian topic summary.
+4. For each concept, provide:
+   - "quote_it": The exact Italian sentence or phrase from the lecture text from which this concept originates.
+   - "topic_it": Short Italian topic summary naming the specific entity.
    - "claim_en": 1-2 concise, fact-dense English sentences summarizing the mechanism, pathology, clinical signs, or radiology findings as tested on USMLE/AnKing cards.
    - "keywords_en": 4-10 precise English keywords, synonyms, eponyms, and acronyms.
    - "keywords_it": 3-6 original Italian terms from the lecture.
@@ -102,6 +134,7 @@ Respond strictly with a JSON object in this format:
 {
   "concepts": [
     {
+      "quote_it": "...",
       "topic_it": "...",
       "claim_en": "...",
       "keywords_en": ["...", "..."],
@@ -113,12 +146,128 @@ Respond strictly with a JSON object in this format:
 
 SYSTEM_PROMPT_STAGE3 = """You are an expert medical educator reviewing flashcards for a medical student's lecture.
 The student is studying the following lecture topic. Determine which candidate flashcards are genuinely relevant and essential to this lecture.
+For each candidate card, you are provided with its text and the excerpt/quote from the lecture that retrieved it.
 
 Respond strictly with a JSON object containing the list of relevant note IDs:
 {
   "relevant_nids": [12345, 67890]
 }
 """
+
+
+STAGE1_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "stage1_concepts",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "concepts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "quote_it": {"type": "string"},
+                        "topic_it": {"type": "string"},
+                        "claim_en": {"type": "string"},
+                        "keywords_en": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "keywords_it": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["quote_it", "topic_it", "claim_en", "keywords_en", "keywords_it"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["concepts"],
+        "additionalProperties": False,
+    },
+}
+
+
+def extract_first_sentence(text: str) -> str:
+    """Extracts the first sentence from a text block, stripping trailing punctuation."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    match = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)
+    first = match[0].strip() if match else cleaned
+    return first.rstrip(".!?").strip()
+
+
+def select_candidates_for_concept(
+    dense_scores: Dict[int, float],
+    fts_scores: Dict[int, float],
+    alpha: float,
+    min_threshold: float,
+    min_dense_floor: float,
+    rel_window: float,
+    max_notes_concept: int,
+    suspended_nids: Optional[Set[int]] = None,
+    include_active_cards: bool = False,
+) -> Tuple[List[Tuple[int, float]], Optional[int], float]:
+    """Selects top candidate notes for a single concept using score fusion and relative window cutoff.
+
+    Returns: (top_concept_candidates, best_nid, best_score)
+    """
+    concept_candidates: List[Tuple[int, float]] = []
+    all_candidate_nids = set(dense_scores.keys())
+
+    for nid in all_candidate_nids:
+        d_score = dense_scores.get(nid, 0.0)
+        if d_score < min_dense_floor:
+            continue
+
+        if alpha >= 1.0:
+            combined = d_score
+        else:
+            b_score = fts_scores.get(nid, 0.0)
+            combined = alpha * d_score + (1.0 - alpha) * b_score
+
+        if combined >= min_threshold:
+            concept_candidates.append((nid, combined))
+
+    concept_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    best_nid: Optional[int] = None
+    best_score: float = 0.0
+    if concept_candidates:
+        best_nid, best_score = concept_candidates[0][0], round(concept_candidates[0][1], 4)
+        rel_cutoff = max(min_threshold, best_score - rel_window)
+        surviving_candidates = [c for c in concept_candidates if c[1] >= rel_cutoff]
+    else:
+        surviving_candidates = []
+        if dense_scores:
+            top_d_nid = max(dense_scores.keys(), key=lambda k: dense_scores[k])
+            top_d_score = dense_scores[top_d_nid]
+            best_nid = top_d_nid
+            if alpha >= 1.0:
+                best_score = round(top_d_score, 4)
+            else:
+                best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
+
+    if suspended_nids is not None and not include_active_cards:
+        top_concept_candidates: List[Tuple[int, float]] = []
+        susp_kept = 0
+        active_kept = 0
+        for nid, score in surviving_candidates:
+            if nid in suspended_nids:
+                if susp_kept < max_notes_concept:
+                    top_concept_candidates.append((nid, score))
+                    susp_kept += 1
+            else:
+                if active_kept < max_notes_concept:
+                    top_concept_candidates.append((nid, score))
+                    active_kept += 1
+            if susp_kept >= max_notes_concept and active_kept >= max_notes_concept:
+                break
+    else:
+        top_concept_candidates = surviving_candidates[:max_notes_concept]
+
+    return top_concept_candidates, best_nid, best_score
 
 
 class SmartSearchPipeline:
@@ -134,40 +283,42 @@ class SmartSearchPipeline:
         self.storage = storage
         self.ai_client = ai_client
         self.last_concept_coverage: List[ConceptCoverage] = []
+        self.last_unit_error: str = ""
 
     # ---------------- Stage 1: Concept Extraction ----------------
 
     def extract_concepts(self, unit: LectureUnit) -> List[ExtractedConcept]:
         """Uses the Chat LLM to decompose an Italian lecture unit into atomic English concepts.
 
-        Provides a robust fallback if the LLM is unreachable or fails.
+        Tries up to 2 times on parsing/LLM failure. If both attempts fail, raises
+        Stage1ExtractionError without falling back to ASCII words.
         """
-        user_prompt = f"### Lecture Unit Title: {unit.unit_title}\n"
+        clean_title = normalize_inline_latex(unit.unit_title)
+        clean_body = normalize_inline_latex(unit.body_text)
+
+        user_prompt = f"### Lecture Unit Title: {clean_title}\n"
         if unit.breadcrumb:
-            user_prompt += f"### Context Hierarchy: {unit.breadcrumb}\n"
-        user_prompt += f"### Lecture Text:\n{unit.body_text}\n\n/no_think"
+            clean_breadcrumb = normalize_inline_latex(unit.breadcrumb)
+            user_prompt += f"### Context Hierarchy: {clean_breadcrumb}\n"
+        user_prompt += f"### Lecture Text:\n{clean_body}"
+
+        # /no_think only for Qwen models
+        if "qwen" in (self.config.chat_model or "").lower():
+            user_prompt += "\n\n/no_think"
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_STAGE1},
             {"role": "user", "content": user_prompt},
         ]
 
-        try:
-            res = self.ai_client.chat_completion_json(
-                messages=messages,
-                model=self.config.chat_model,
-                base_url=self.config.chat_base_url,
-                api_key=self.config.chat_api_key,
-                temperature=0.1,
-            )
-
+        def _parse_concepts(res_obj: Any) -> List[ExtractedConcept]:
             raw_concepts = []
-            if isinstance(res, dict) and "concepts" in res:
-                raw_concepts = res["concepts"]
-            elif isinstance(res, list):
-                raw_concepts = res
+            if isinstance(res_obj, dict) and "concepts" in res_obj:
+                raw_concepts = res_obj["concepts"]
+            elif isinstance(res_obj, list):
+                raw_concepts = res_obj
 
-            concepts: List[ExtractedConcept] = []
+            parsed_list: List[ExtractedConcept] = []
             for item in raw_concepts:
                 if not isinstance(item, dict):
                     continue
@@ -175,71 +326,141 @@ class SmartSearchPipeline:
                 claim_en = str(item.get("claim_en", "")).strip()
                 kws_en = [str(k).strip() for k in item.get("keywords_en", []) if str(k).strip()]
                 kws_it = [str(k).strip() for k in item.get("keywords_it", []) if str(k).strip()]
+                quote_it = str(item.get("quote_it", "")).strip()
 
                 if claim_en or kws_en or topic_it:
-                    concepts.append(
+                    parsed_list.append(
                         ExtractedConcept(
                             topic_it=topic_it or unit.unit_title,
                             claim_en=claim_en or topic_it,
                             keywords_en=kws_en or [unit.unit_title],
                             keywords_it=kws_it,
+                            quote_it=quote_it,
                         )
                     )
+            return parsed_list
 
-            if concepts:
-                return concepts
+        last_err: Optional[Exception] = None
+        max_tokens = getattr(self.config, "chat_max_tokens", 16384)
+        use_schema = bool(getattr(self.config, "chat_use_json_schema", False))
 
-        except Exception as e:
-            # Fallback will activate below
-            print(f"[SmartSearch] Notice: Stage 1 LLM extraction fallback used ({e})")
+        for attempt in range(2):
+            try:
+                schema_to_use = STAGE1_JSON_SCHEMA if use_schema else None
+                res = self.ai_client.chat_completion_json(
+                    messages=messages,
+                    model=self.config.chat_model,
+                    base_url=self.config.chat_base_url,
+                    api_key=self.config.chat_api_key,
+                    temperature=0.1,
+                    json_schema=schema_to_use,
+                    max_tokens=max_tokens,
+                )
 
-        # Fallback concept when LLM extraction fails or is offline
-        words = re.findall(r"\b[A-Za-z0-9_-]{3,}\b", unit.body_text)
-        sample_kws = words[:12] if words else [unit.unit_title]
-        return [
-            ExtractedConcept(
-                topic_it=unit.unit_title,
-                claim_en=unit.unit_title,
-                keywords_en=sample_kws,
-                keywords_it=sample_kws[:5],
-            )
-        ]
+                concepts = _parse_concepts(res)
+                if concepts:
+                    return concepts
+
+                # If parsed response contains 0 concepts and response_format was active,
+                # retry once without response_format before counting the attempt as failed.
+                if schema_to_use is not None:
+                    print(
+                        f"[SmartSearch] Notice: 0 concepts with response_format active in attempt {attempt + 1}, retrying once without response_format..."
+                    )
+                    res_no_schema = self.ai_client.chat_completion_json(
+                        messages=messages,
+                        model=self.config.chat_model,
+                        base_url=self.config.chat_base_url,
+                        api_key=self.config.chat_api_key,
+                        temperature=0.1,
+                        json_schema=None,
+                        max_tokens=max_tokens,
+                    )
+                    concepts_no_schema = _parse_concepts(res_no_schema)
+                    if concepts_no_schema:
+                        return concepts_no_schema
+
+                raise Stage1ExtractionError("LLM response did not contain any valid medical concepts.")
+
+            except Exception as e:
+                last_err = e
+                print(f"[SmartSearch] Notice: Stage 1 extraction attempt {attempt + 1} failed: {e}")
+
+        # Both attempts failed: do NOT fall back to arbitrary ASCII words
+        raise Stage1ExtractionError(
+            f"Stage 1 extraction failed after 2 attempts: {last_err}"
+        )
 
     # ---------------- Stage 2: Hybrid Retrieval ----------------
 
     def retrieve_for_concepts(
         self,
         concepts: List[ExtractedConcept],
-        candidate_nids: Optional[List[int]],
-        active_model_id: str,
+        candidate_nids: Optional[Union[List[int], Set[int]]] = None,
+        active_model_id: str = "",
         suspended_nids: Optional[Set[int]] = None,
+        *,
+        min_threshold: Optional[float] = None,
+        relative_score_window: Optional[float] = None,
+        max_notes_per_concept: Optional[int] = None,
+        max_cards_per_unit: Optional[int] = None,
+        hybrid_dense_weight: Optional[float] = None,
+        include_active_cards: Optional[bool] = None,
+        concept_vectors: Optional[List[List[float]]] = None,
     ) -> List[ScoredNote]:
         """Performs dense vector search + BM25 lexical search per concept and fuses results."""
         if not concepts:
             return []
 
+        # Allow flexible parameter swapping if candidate_nids was passed as active_model_id string
+        if isinstance(candidate_nids, str) and not active_model_id:
+            active_model_id = candidate_nids
+            candidate_nids = None
+
+        if not active_model_id:
+            active_model_id = self.config.get_active_model_id()
+
         # 1. Build query texts for embedding based on language strategy
         query_texts: List[str] = []
         for c in concepts:
+            kws = ", ".join(k.strip() for k in c.keywords_en if k.strip())
             if self.config.embed_language_strategy == "multilingual_direct":
-                text = f"{c.topic_it} | {c.claim_en} | {', '.join(c.keywords_en)}"
+                text = f"{c.topic_it} | {c.claim_en} | {kws}"
             else:  # translate_to_en (default)
-                text = f"{c.claim_en} | {', '.join(c.keywords_en)}"
+                first_sentence = extract_first_sentence(c.claim_en)
+                if first_sentence and kws:
+                    text = f"{first_sentence} | {kws}"
+                else:
+                    text = first_sentence or kws or c.claim_en
             query_texts.append(text)
 
-        # Batch embed all concept queries at once
-        concept_vectors = self.ai_client.get_embeddings(
-            texts=query_texts,
-            model=self.config.embed_model,
-            base_url=self.config.embed_base_url,
-            api_key=self.config.embed_api_key,
-        )
+        # Resolve optional query instruction (e.g. for qwen3-embedding)
+        instruction = getattr(self.config, "embed_query_instruction", "")
+        if not instruction:
+            embed_model_name = (self.config.embed_model or "").lower()
+            if "qwen3-embedding" in embed_model_name:
+                instruction = "Instruct: Given a medical lecture concept, retrieve flashcards that test it\nQuery: "
 
-        min_threshold = self.config.get_min_similarity_threshold()
+        if instruction:
+            query_texts = [f"{instruction}{t}" for t in query_texts]
+
+        # Batch embed all concept queries at once (unless already provided)
+        if concept_vectors is None:
+            concept_vectors = self.ai_client.get_embeddings(
+                texts=query_texts,
+                model=self.config.embed_model,
+                base_url=self.config.embed_base_url,
+                api_key=self.config.embed_api_key,
+            )
+
+        eff_threshold = min_threshold if min_threshold is not None else self.config.get_min_similarity_threshold()
         # Semantic floor: prevents purely lexical hits with 0 semantic relation
-        min_dense_floor = max(0.20, min_threshold - 0.18)
-        alpha = self.config.hybrid_dense_weight
-        effective_top_k = self.config.get_effective_top_k()
+        min_dense_floor = max(0.20, eff_threshold - 0.18)
+        alpha = hybrid_dense_weight if hybrid_dense_weight is not None else self.config.hybrid_dense_weight
+        rel_window = relative_score_window if relative_score_window is not None else getattr(self.config, "relative_score_window", 0.05)
+        max_notes_concept = max_notes_per_concept if max_notes_per_concept is not None else getattr(self.config, "max_notes_per_concept", 10)
+        max_cards_unit = max_cards_per_unit if max_cards_per_unit is not None else getattr(self.config, "max_cards_per_unit", 150)
+        eff_include_active = include_active_cards if include_active_cards is not None else self.config.include_active_cards_in_filtered_deck
 
         # Track results per note: nid -> {"scores": [float], "concepts": [str]}
         notes_agg: Dict[int, Dict[str, Any]] = {}
@@ -259,6 +480,8 @@ class SmartSearchPipeline:
                         topic_it=concept.topic_it,
                         claim_en=concept.claim_en,
                         keywords_en=list(concept.keywords_en),
+                        keywords_it=list(concept.keywords_it),
+                        quote_it=concept.quote_it,
                     )
                 )
                 continue
@@ -271,68 +494,38 @@ class SmartSearchPipeline:
             )
             dense_scores: Dict[int, float] = {nid: score for nid, score in dense_hits}
 
-            # B. Lexical FTS5 BM25
-            all_kws = concept.keywords_en + concept.keywords_it
-            fts_hits = self.storage.search_fts(
-                keywords=all_kws,
-                candidate_nids=candidate_nids,
-                limit=150,
+            # B. Lexical FTS5 BM25 (skipped completely when hybrid_dense_weight is 1.0)
+            fts_scores: Dict[int, float] = {}
+            if alpha < 1.0:
+                if getattr(self.config, "fts_use_italian_keywords", False):
+                    all_kws = concept.keywords_en + concept.keywords_it
+                else:
+                    all_kws = list(concept.keywords_en) if concept.keywords_en else list(concept.keywords_it)
+                fts_hits = self.storage.search_fts(
+                    keywords=all_kws,
+                    candidate_nids=candidate_nids,
+                    limit=150,
+                )
+                fts_scores = {nid: score for nid, score in fts_hits}
+
+            # C. Score Fusion & Candidate Selection
+            top_concept_candidates, best_nid, best_score = select_candidates_for_concept(
+                dense_scores=dense_scores,
+                fts_scores=fts_scores,
+                alpha=alpha,
+                min_threshold=eff_threshold,
+                min_dense_floor=min_dense_floor,
+                rel_window=rel_window,
+                max_notes_concept=max_notes_concept,
+                suspended_nids=suspended_nids,
+                include_active_cards=eff_include_active,
             )
-            fts_scores: Dict[int, float] = {nid: score for nid, score in fts_hits}
-
-            # C. Score Fusion for this concept
-            concept_candidates: List[Tuple[int, float]] = []
-            all_candidate_nids = set(dense_scores.keys())
-
-            for nid in all_candidate_nids:
-                d_score = dense_scores.get(nid, 0.0)
-                if d_score < min_dense_floor:
-                    continue
-
-                b_score = fts_scores.get(nid, 0.0)
-                # Combined linear fusion
-                combined = alpha * d_score + (1.0 - alpha) * b_score
-
-                if combined >= min_threshold:
-                    concept_candidates.append((nid, combined))
-
-            # Keep top-K for this concept.
-            # When include_active_cards_in_filtered_deck is False and suspended_nids is provided,
-            # already-active notes do NOT steal top-K slots from suspended notes!
-            concept_candidates.sort(key=lambda x: x[1], reverse=True)
-            if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
-                top_concept_candidates: List[Tuple[int, float]] = []
-                susp_kept = 0
-                active_kept = 0
-                for nid, score in concept_candidates:
-                    if nid in suspended_nids:
-                        if susp_kept < effective_top_k:
-                            top_concept_candidates.append((nid, score))
-                            susp_kept += 1
-                    else:
-                        if active_kept < effective_top_k:
-                            top_concept_candidates.append((nid, score))
-                            active_kept += 1
-                    if susp_kept >= effective_top_k and active_kept >= effective_top_k:
-                        break
-            else:
-                top_concept_candidates = concept_candidates[:effective_top_k]
-
-            # Record per-concept coverage metrics
-            best_nid: Optional[int] = None
-            best_score: float = 0.0
-            if concept_candidates:
-                best_nid, best_score = concept_candidates[0][0], round(concept_candidates[0][1], 4)
-            elif dense_hits:
-                top_d_nid, top_d_score = dense_hits[0]
-                best_nid = top_d_nid
-                best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
 
             matched_c_nids = [nid for nid, _ in top_concept_candidates]
             matched_cnt = len(matched_c_nids)
             if matched_cnt == 0:
                 c_status = "uncovered"
-            elif matched_cnt == 1 or best_score < (min_threshold + 0.06):
+            elif matched_cnt == 1 or best_score < (eff_threshold + 0.06):
                 c_status = "partial"
             else:
                 c_status = "covered"
@@ -342,11 +535,13 @@ class SmartSearchPipeline:
                     topic_it=concept.topic_it,
                     claim_en=concept.claim_en,
                     keywords_en=list(concept.keywords_en),
+                    keywords_it=list(concept.keywords_it),
                     matched_notes_count=matched_cnt,
                     matched_nids=matched_c_nids,
                     best_score=best_score,
                     best_nid=best_nid,
                     status=c_status,
+                    quote_it=concept.quote_it,
                 )
             )
 
@@ -398,14 +593,14 @@ class SmartSearchPipeline:
             )
 
         scored_notes.sort(key=lambda x: x.score, reverse=True)
-        if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
-            # Ensure suspended notes get up to max_cards_per_unit slots without being displaced by active notes
-            susp_notes = [sn for sn in scored_notes if sn.nid in suspended_nids][: self.config.max_cards_per_unit]
-            act_notes = [sn for sn in scored_notes if sn.nid not in suspended_nids][: self.config.max_cards_per_unit]
+        if suspended_nids is not None and not eff_include_active:
+            # Ensure suspended notes get up to max_cards_unit slots without being displaced by active notes
+            susp_notes = [sn for sn in scored_notes if sn.nid in suspended_nids][: max_cards_unit]
+            act_notes = [sn for sn in scored_notes if sn.nid not in suspended_nids][: max_cards_unit]
             combined_final = susp_notes + act_notes
             combined_final.sort(key=lambda x: x.score, reverse=True)
             return combined_final
-        return scored_notes[: self.config.max_cards_per_unit]
+        return scored_notes[: max_cards_unit]
 
     # ---------------- Stage 3: Optional LLM Verification ----------------
 
@@ -414,10 +609,41 @@ class SmartSearchPipeline:
         unit: LectureUnit,
         candidates: List[ScoredNote],
         batch_size: int = 25,
+        concepts: Optional[List[ExtractedConcept]] = None,
     ) -> List[ScoredNote]:
         """Passes candidate notes to the Chat LLM to confirm relevance and filter out false positives."""
         if not self.config.enable_llm_verification or not candidates:
             return candidates
+
+        quote_lookup: Dict[str, str] = {}
+        if concepts:
+            for conc in concepts:
+                if conc.quote_it:
+                    if conc.topic_it:
+                        quote_lookup[conc.topic_it] = conc.quote_it
+                    if conc.claim_en:
+                        quote_lookup[conc.claim_en[:40]] = conc.quote_it
+                        quote_lookup[conc.claim_en] = conc.quote_it
+        if self.last_concept_coverage:
+            for cov in self.last_concept_coverage:
+                if cov.quote_it:
+                    if cov.topic_it:
+                        quote_lookup[cov.topic_it] = cov.quote_it
+                    if cov.claim_en:
+                        quote_lookup[cov.claim_en[:40]] = cov.quote_it
+                        quote_lookup[cov.claim_en] = cov.quote_it
+
+        def _get_candidate_quotes(c: ScoredNote) -> str:
+            quotes = []
+            for mc in c.matched_concepts:
+                q = quote_lookup.get(mc)
+                if q and q not in quotes:
+                    quotes.append(q)
+            if self.last_concept_coverage:
+                for cov in self.last_concept_coverage:
+                    if c.nid in cov.matched_nids and cov.quote_it and cov.quote_it not in quotes:
+                        quotes.append(cov.quote_it)
+            return " | ".join(quotes)
 
         verified_nids: Set[int] = set()
 
@@ -430,16 +656,19 @@ class SmartSearchPipeline:
                         "nid": c.nid,
                         "text": c.clean_text_preview,
                         "matched_concepts": c.matched_concepts,
+                        "quote": _get_candidate_quotes(c),
                     }
                 )
 
             user_prompt = f"### Lecture Topic: {unit.unit_title}\n"
             if unit.breadcrumb:
                 user_prompt += f"### Hierarchy: {unit.breadcrumb}\n"
-            user_prompt += f"### Lecture Excerpt:\n{unit.body_text[:1200]}\n\n"
+            user_prompt += f"### Lecture Excerpt:\n{unit.body_text}\n\n"
             user_prompt += "### Candidate Flashcards:\n"
             for n in notes_payload:
                 user_prompt += f"- ID {n['nid']}: {n['text']}\n"
+                if n.get("quote"):
+                    user_prompt += f"  Matched quote: \"{n['quote']}\"\n"
 
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT_STAGE3},
@@ -452,18 +681,23 @@ class SmartSearchPipeline:
                     model=self.config.chat_model,
                     base_url=self.config.chat_base_url,
                     api_key=self.config.chat_api_key,
+                    max_tokens=getattr(self.config, "chat_max_tokens", 16384),
                 )
                 if isinstance(res, dict) and "relevant_nids" in res:
                     for nid in res["relevant_nids"]:
-                        verified_nids.add(int(nid))
+                        try:
+                            verified_nids.add(int(nid))
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    print(f"[SmartSearch] Notice: Stage 3 verification invalid response schema ({res}), keeping batch.")
+                    for c in chunk:
+                        verified_nids.add(c.nid)
             except Exception as e:
                 # If verification call fails, retain chunk rather than losing results
                 print(f"[SmartSearch] Notice: Stage 3 verification call error ({e}), keeping batch.")
                 for c in chunk:
                     verified_nids.add(c.nid)
-
-        if not verified_nids:
-            return candidates
 
         return [c for c in candidates if c.nid in verified_nids]
 
@@ -477,7 +711,17 @@ class SmartSearchPipeline:
         suspended_nids: Optional[Set[int]] = None,
     ) -> List[ScoredNote]:
         """Runs Stage 1, Stage 2, and optional Stage 3 search for a lecture unit."""
-        concepts = self.extract_concepts(unit)
+        self.last_unit_error = ""
+        self.last_concept_coverage = []
+        try:
+            concepts = self.extract_concepts(unit)
+        except Exception as e:
+            self.last_unit_error = str(e)
+            return []
+
+        if not concepts:
+            return []
+
         candidates = self.retrieve_for_concepts(
             concepts,
             candidate_nids,
@@ -485,7 +729,7 @@ class SmartSearchPipeline:
             suspended_nids=suspended_nids,
         )
         if self.config.enable_llm_verification:
-            candidates = self.verify_candidates(unit, candidates)
+            candidates = self.verify_candidates(unit, candidates, concepts=concepts)
             surviving_nids = {c.nid for c in candidates}
             min_threshold = self.config.get_min_similarity_threshold()
             for cov in self.last_concept_coverage:
@@ -498,3 +742,80 @@ class SmartSearchPipeline:
                 else:
                     cov.status = "covered"
         return candidates
+
+
+def find_similar_notes(
+    storage: SearchDatabase,
+    selected_nids: Sequence[int],
+    active_model_id: str,
+    candidate_nids: Optional[Union[Set[int], Sequence[int]]] = None,
+    min_score: float = 0.70,
+    max_notes: int = 20,
+) -> Tuple[List[Tuple[int, float]], List[int]]:
+    """Finds notes similar to the selected notes via vector cosine similarity.
+
+    1. Loads vectors for selected_nids from storage for active_model_id.
+    2. Identifies unindexed note IDs among selected_nids. If any exist, returns ([], missing_nids).
+    3. Computes the normalized mean vector across all selected notes.
+    4. Loads vectors for candidate notes (within candidate_nids if specified, or all indexed notes if None).
+    5. Excludes the selected notes themselves.
+    6. Filters candidate notes by score >= min_score, ordered descending, capped at max_notes.
+
+    Returns:
+        (matched_notes, missing_nids)
+        where matched_notes is a list of (nid, similarity_score).
+    """
+    if not selected_nids:
+        return [], []
+
+    sel_nids_list, sel_vecs, dim = storage.load_embeddings_for_notes(
+        list(selected_nids), active_model_id
+    )
+    indexed_set = set(sel_nids_list)
+    missing = [nid for nid in selected_nids if nid not in indexed_set]
+    if missing:
+        return [], missing
+
+    if not sel_nids_list:
+        return [], []
+
+    # Compute normalized mean vector
+    if np is not None and isinstance(sel_vecs, getattr(np, "ndarray", ())):
+        mean_arr = np.mean(sel_vecs, axis=0)
+        norm_mean = normalize_l2(mean_arr.tolist())
+    else:
+        if len(sel_vecs) == 1:
+            norm_mean = normalize_l2(sel_vecs[0])
+        else:
+            dim_len = len(sel_vecs[0])
+            sum_vec = [0.0] * dim_len
+            for v in sel_vecs:
+                for d in range(dim_len):
+                    sum_vec[d] += v[d]
+            norm_mean = normalize_l2(sum_vec)
+
+    # Candidate notes
+    cand_list: Optional[Sequence[int]] = None
+    if candidate_nids is not None:
+        cand_list = list(candidate_nids)
+        if len(cand_list) == 0:
+            return [], []
+
+    cand_nids_list, cand_vecs, _ = storage.load_embeddings_for_notes(
+        cand_list, active_model_id
+    )
+    if not cand_nids_list:
+        return [], []
+
+    similarities = storage.compute_similarities_from_loaded(
+        cand_nids_list, cand_vecs, norm_mean
+    )
+
+    sel_set = set(selected_nids)
+    matched = [
+        (nid, round(float(score), 4))
+        for nid, score in similarities
+        if nid not in sel_set and score >= min_score
+    ]
+    return matched[:max_notes], []
+

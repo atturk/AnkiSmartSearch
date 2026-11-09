@@ -25,6 +25,7 @@ try:
 
     HAS_NUMPY = True
 except ImportError:
+    np = None  # type: ignore
     HAS_NUMPY = False
 
 
@@ -44,6 +45,9 @@ class RunRecord:
     rolled_back: int = 0
     already_active_cids: List[int] = field(default_factory=list)
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
+    unit_error: str = ""
+    profile: str = ""
+    search_id: str = ""
 
 
 def normalize_l2(vec: Sequence[float]) -> List[float]:
@@ -63,6 +67,26 @@ def pack_vector(vec: Sequence[float]) -> bytes:
 def unpack_vector(blob: bytes, dim: int) -> List[float]:
     """Unpacks a little-endian float32 byte blob into a list of floats."""
     return list(struct.unpack(f"<{dim}f", blob))
+
+
+# Short list of English and Italian stopwords discarded during FTS lexical search
+_FTS_STOPWORDS = {
+    # English
+    "a", "an", "the", "and", "or", "but", "if", "of", "at", "by", "for", "with",
+    "about", "against", "between", "into", "through", "during", "before", "after",
+    "above", "below", "to", "from", "up", "down", "in", "out", "on", "off", "over",
+    "under", "again", "further", "then", "once", "here", "there", "when", "where",
+    "why", "how", "all", "any", "both", "each", "few", "more", "most", "other",
+    "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too",
+    "very", "can", "will", "just", "don", "should", "now", "are", "is", "was", "were",
+    # Italian
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "da", "con",
+    "su", "per", "tra", "fra", "ed", "del", "dello", "della", "dei", "degli",
+    "delle", "al", "allo", "alla", "ai", "agli", "alle", "dal", "dallo", "dalla",
+    "dai", "dagli", "dalle", "nel", "nello", "nella", "nei", "negli", "nelle",
+    "sul", "sullo", "sulla", "sui", "sugli", "sulle", "che", "non", "si", "ma",
+    "anche", "come", "piu", "sono", "sia", "era", "stato", "stata", "stati", "state",
+}
 
 
 class SearchDatabase:
@@ -179,11 +203,14 @@ class SearchDatabase:
                     newly_unsuspended_cids_json TEXT NOT NULL,
                     rolled_back INTEGER DEFAULT 0,
                     already_active_cids_json TEXT DEFAULT '[]',
-                    concept_coverage_json TEXT DEFAULT '[]'
+                    concept_coverage_json TEXT DEFAULT '[]',
+                    unit_error TEXT DEFAULT '',
+                    profile TEXT NOT NULL DEFAULT '',
+                    search_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
-            # Seamless schema migration for pre-0.1.1 / pre-0.3.0 databases
+            # Seamless schema migration for pre-0.1.1 / pre-0.3.0 / pre-0.4.0 databases
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(run_history)")
             existing_cols = {row["name"] for row in cur.fetchall()}
@@ -191,6 +218,12 @@ class SearchDatabase:
                 conn.execute("ALTER TABLE run_history ADD COLUMN already_active_cids_json TEXT DEFAULT '[]'")
             if "concept_coverage_json" not in existing_cols:
                 conn.execute("ALTER TABLE run_history ADD COLUMN concept_coverage_json TEXT DEFAULT '[]'")
+            if "unit_error" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN unit_error TEXT DEFAULT ''")
+            if "profile" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
+            if "search_id" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN search_id TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     # ---------------- Note Content & FTS Operations ----------------
@@ -374,7 +407,8 @@ class SearchDatabase:
                 rows = cur.fetchall()
             else:
                 if not nids:
-                    return [], [] if not HAS_NUMPY else np.empty((0, 0), dtype=np.float32), 0
+                    empty_res = [] if (not HAS_NUMPY or np is None) else np.empty((0, 0), dtype=np.float32)
+                    return [], empty_res, 0
                 if len(nids) <= 900:
                     placeholders = ",".join("?" * len(nids))
                     cur.execute(
@@ -392,12 +426,13 @@ class SearchDatabase:
                     rows = [r for r in cur.fetchall() if r["nid"] in candidate_set]
 
         if not rows:
-            return [], [] if not HAS_NUMPY else np.empty((0, 0), dtype=np.float32), 0
+            empty_res = [] if (not HAS_NUMPY or np is None) else np.empty((0, 0), dtype=np.float32)
+            return [], empty_res, 0
 
         nid_list: List[int] = []
         dim = rows[0]["dim"]
 
-        if HAS_NUMPY:
+        if HAS_NUMPY and np is not None:
             n_rows = len(rows)
             matrix = np.empty((n_rows, dim), dtype=np.float32)
             for idx, r in enumerate(rows):
@@ -423,14 +458,14 @@ class SearchDatabase:
             return []
 
         norm_q = normalize_l2(query_vec)
-        use_np = HAS_NUMPY and not force_pure_python
+        use_np = HAS_NUMPY and np is not None and not force_pure_python
 
-        if use_np and isinstance(vecs, np.ndarray):
+        if use_np and isinstance(vecs, getattr(np, "ndarray", ())):
             q_arr = np.array(norm_q, dtype=np.float32)
             scores = np.dot(vecs, q_arr)
             results = [(nid_list[i], float(scores[i])) for i in range(len(nid_list))]
         else:
-            if HAS_NUMPY and isinstance(vecs, np.ndarray):
+            if HAS_NUMPY and np is not None and isinstance(vecs, getattr(np, "ndarray", ())):
                 vec_list = [v.tolist() for v in vecs]
             else:
                 vec_list = vecs
@@ -582,56 +617,98 @@ class SearchDatabase:
         """Searches notes_fts using BM25 ranking.
 
         keywords: list of terms/phrases.
+        candidate_nids: optional collection of note IDs to filter within SQL.
         Returns list of (nid, normalized_bm25_score in [0, 1]).
         """
         if not keywords:
             return []
 
-        # Sanitize query tokens and support prefix/stem matching for singular/plural inflection
-        clean_terms = []
-        for kw in keywords:
-            # Keep letters, numbers, and hyphens/underscores
-            term = "".join(c if (c.isalnum() or c in "-_") else " " for c in kw).strip()
-            for sub in term.split():
-                sub_clean = sub.strip()
-                if len(sub_clean) >= 2:
-                    stem = re.sub(r"(?:ies|es|s)$", "", sub_clean.lower())
-                    if len(stem) >= 3:
-                        clean_terms.append(f"{stem}*")
-                    else:
-                        clean_terms.append(f"{sub_clean}*")
-
-        if not clean_terms:
+        if candidate_nids is not None and len(candidate_nids) == 0:
             return []
 
-        # Deduplicate terms
-        unique_terms = list(dict.fromkeys(clean_terms))
-        fts_query = " OR ".join(unique_terms)
+        # Sanitize query tokens:
+        # 1. Discard bareword tokens < 3 characters and stopwords (English + Italian).
+        # 2. Multi-word or hyphenated keywords -> phrase query ("il 1", "acute pancreatitis") in OR with significant individual tokens.
+        # 3. Ensure no barewords contain hyphens (which FTS5 parses as operators) or characters other than [a-zA-Z0-9_].
+        # 4. Escape internal double quotes in phrases.
+        query_parts: List[str] = []
+        seen_terms: Set[str] = set()
+
+        for kw in keywords:
+            if not kw or not kw.strip():
+                continue
+
+            # Split on whitespace, hyphens, and other punctuation
+            all_words = re.findall(r"[A-Za-z0-9_]+", kw)
+            if not all_words:
+                continue
+
+            # Multi-word or hyphenated phrase query in FTS5: preserves short alphanumeric parts like '1' inside the phrase
+            if len(all_words) > 1:
+                escaped_phrase = " ".join(all_words).replace('"', '""')
+                phrase_clause = f'"{escaped_phrase}"'
+                if phrase_clause not in seen_terms:
+                    seen_terms.add(phrase_clause)
+                    query_parts.append(phrase_clause)
+
+            # Individual bareword tokens: strictly letters, digits, underscores, len >= 3, not in stopwords
+            for w in all_words:
+                if len(w) >= 3 and w.lower() not in _FTS_STOPWORDS and re.match(r"^[A-Za-z0-9_]+$", w):
+                    stem = re.sub(r"(?:ies|es|s)$", "", w.lower())
+                    token = f"{stem}*" if len(stem) >= 3 else f"{w.lower()}*"
+                    if token not in seen_terms:
+                        seen_terms.add(token)
+                        query_parts.append(token)
+
+        if not query_parts:
+            return []
+
+        fts_query = " OR ".join(query_parts)
+        effective_limit = max(limit, 300)
 
         with self._get_connection() as conn:
             cur = conn.cursor()
-            # bm25() in FTS5 returns negative numbers where smaller (more negative) is better
             try:
-                cur.execute(
-                    "SELECT nid, bm25(notes_fts, 1.0, 1.5) as score FROM notes_fts WHERE notes_fts MATCH ? ORDER BY score ASC LIMIT 300",
-                    (fts_query,),
-                )
-                rows = cur.fetchall()
-            except sqlite3.OperationalError:
+                if candidate_nids is not None:
+                    # Filter candidates directly inside SQL using a temp table to avoid SQLite variable limits (up to 30k+ NIDs)
+                    conn.execute("CREATE TEMP TABLE temp_fts_cand (nid INTEGER PRIMARY KEY)")
+                    conn.executemany("INSERT OR IGNORE INTO temp_fts_cand (nid) VALUES (?)", ((int(n),) for n in candidate_nids))
+                    cur.execute(
+                        """
+                        SELECT f.nid, bm25(notes_fts, 1.0, 1.5) as score
+                        FROM notes_fts f
+                        JOIN temp_fts_cand c ON f.nid = c.nid
+                        WHERE notes_fts MATCH ?
+                        ORDER BY score ASC
+                        LIMIT ?
+                        """,
+                        (fts_query, effective_limit),
+                    )
+                    rows = cur.fetchall()
+                    conn.execute("DROP TABLE IF EXISTS temp_fts_cand")
+                else:
+                    cur.execute(
+                        """
+                        SELECT nid, bm25(notes_fts, 1.0, 1.5) as score
+                        FROM notes_fts
+                        WHERE notes_fts MATCH ?
+                        ORDER BY score ASC
+                        LIMIT ?
+                        """,
+                        (fts_query, effective_limit),
+                    )
+                    rows = cur.fetchall()
+            except sqlite3.OperationalError as e:
                 # Fallback if syntax error occurs
+                print(f"[SmartSearch] Notice: FTS5 query operational error: {e}")
                 return []
 
         if not rows:
             return []
 
-        candidate_set: Optional[Set[int]] = set(candidate_nids) if candidate_nids is not None else None
-
-        filtered = []
+        filtered: List[Tuple[int, float]] = []
         for r in rows:
-            nid = r["nid"]
-            if candidate_set is not None and nid not in candidate_set:
-                continue
-            # r["score"] is negative (e.g., -15.4)
+            nid = int(r["nid"])
             raw_bm = float(r["score"])
             # Invert to positive magnitude: higher is better
             abs_bm = max(0.0, -raw_bm)
@@ -660,14 +737,17 @@ class SearchDatabase:
                     run_id, created_at, deck_name, filtered_did, source_decks_json,
                     unit_title, unit_preview, total_matched_cids_json,
                     newly_unsuspended_cids_json, rolled_back, already_active_cids_json,
-                    concept_coverage_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    concept_coverage_json, unit_error, profile, search_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     deck_name=excluded.deck_name,
                     filtered_did=excluded.filtered_did,
                     rolled_back=excluded.rolled_back,
                     already_active_cids_json=excluded.already_active_cids_json,
-                    concept_coverage_json=excluded.concept_coverage_json
+                    concept_coverage_json=excluded.concept_coverage_json,
+                    unit_error=excluded.unit_error,
+                    profile=excluded.profile,
+                    search_id=excluded.search_id
                 """,
                 (
                     record.run_id,
@@ -682,20 +762,37 @@ class SearchDatabase:
                     record.rolled_back,
                     json.dumps(record.already_active_cids),
                     json.dumps(record.concept_coverage, ensure_ascii=False),
+                    record.unit_error,
+                    record.profile,
+                    record.search_id,
                 ),
             )
             conn.commit()
 
-    def get_runs(self) -> List[RunRecord]:
-        """Retrieves all past runs sorted by created_at DESC."""
+    def get_runs(self, profile: Optional[str] = None, limit: Optional[int] = None) -> List[RunRecord]:
+        """Retrieves past runs sorted by created_at DESC.
+
+        If profile is provided, returns runs matching that profile PLUS legacy runs with profile = ''.
+        """
         with self._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM run_history ORDER BY created_at DESC")
+            query = "SELECT * FROM run_history"
+            params: List[Any] = []
+            if profile is not None and profile != "":
+                query += " WHERE profile = ? OR profile = ''"
+                params.append(profile)
+            query += " ORDER BY created_at DESC"
+            if limit is not None and limit > 0:
+                query += f" LIMIT {int(limit)}"
+            cur.execute(query, params)
             records = []
             for row in cur.fetchall():
                 row_keys = row.keys()
                 active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
                 cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
+                unit_err = row["unit_error"] if "unit_error" in row_keys else ""
+                prof = row["profile"] if "profile" in row_keys else ""
+                s_id = row["search_id"] if "search_id" in row_keys else ""
                 records.append(
                     RunRecord(
                         run_id=row["run_id"],
@@ -710,9 +807,60 @@ class SearchDatabase:
                         rolled_back=row["rolled_back"],
                         already_active_cids=json.loads(active_json or "[]"),
                         concept_coverage=json.loads(cov_json or "[]"),
+                        unit_error=unit_err or "",
+                        profile=prof or "",
+                        search_id=s_id or "",
                     )
                 )
             return records
+
+    def get_runs_by_search_id(self, search_id: str) -> List[RunRecord]:
+        """Retrieves all run records belonging to a search batch by search_id."""
+        if not search_id:
+            return []
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM run_history WHERE search_id = ? ORDER BY created_at ASC", (search_id,))
+            records = []
+            for row in cur.fetchall():
+                row_keys = row.keys()
+                active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
+                cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
+                unit_err = row["unit_error"] if "unit_error" in row_keys else ""
+                prof = row["profile"] if "profile" in row_keys else ""
+                s_id = row["search_id"] if "search_id" in row_keys else ""
+                records.append(
+                    RunRecord(
+                        run_id=row["run_id"],
+                        created_at=row["created_at"],
+                        deck_name=row["deck_name"],
+                        filtered_did=row["filtered_did"],
+                        source_decks=json.loads(row["source_decks_json"]),
+                        unit_title=row["unit_title"],
+                        unit_preview=row["unit_preview"],
+                        total_matched_cids=json.loads(row["total_matched_cids_json"]),
+                        newly_unsuspended_cids=json.loads(row["newly_unsuspended_cids_json"]),
+                        rolled_back=row["rolled_back"],
+                        already_active_cids=json.loads(active_json or "[]"),
+                        concept_coverage=json.loads(cov_json or "[]"),
+                        unit_error=unit_err or "",
+                        profile=prof or "",
+                        search_id=s_id or "",
+                    )
+                )
+            return records
+
+    def get_latest_search_runs(self, profile: Optional[str] = None) -> List[RunRecord]:
+        """Retrieves all run records from the most recent search batch."""
+        all_runs = self.get_runs(profile=profile, limit=50)
+        if not all_runs:
+            return []
+        latest_run = all_runs[0]
+        if latest_run.search_id:
+            return self.get_runs_by_search_id(latest_run.search_id)
+        # Fallback for legacy runs without search_id: group runs created within 5 seconds
+        target_time = latest_run.created_at
+        return [r for r in all_runs if abs(r.created_at - target_time) <= 5]
 
     def get_run(self, run_id: str) -> Optional[RunRecord]:
         """Retrieves a single run record by run_id."""
@@ -725,6 +873,9 @@ class SearchDatabase:
             row_keys = row.keys()
             active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
             cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
+            unit_err = row["unit_error"] if "unit_error" in row_keys else ""
+            prof = row["profile"] if "profile" in row_keys else ""
+            s_id = row["search_id"] if "search_id" in row_keys else ""
             return RunRecord(
                 run_id=row["run_id"],
                 created_at=row["created_at"],
@@ -738,7 +889,26 @@ class SearchDatabase:
                 rolled_back=row["rolled_back"],
                 already_active_cids=json.loads(active_json or "[]"),
                 concept_coverage=json.loads(cov_json or "[]"),
+                unit_error=unit_err or "",
+                profile=prof or "",
+                search_id=s_id or "",
             )
+
+    def is_filtered_deck_in_active_run(self, deck_name: str, filtered_did: Optional[int] = None) -> bool:
+        """Checks if deck_name or filtered_did belongs to an active (non-rolled-back) run."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            if filtered_did:
+                cur.execute(
+                    "SELECT 1 FROM run_history WHERE rolled_back = 0 AND (deck_name = ? OR filtered_did = ?)",
+                    (deck_name, filtered_did),
+                )
+            else:
+                cur.execute(
+                    "SELECT 1 FROM run_history WHERE rolled_back = 0 AND deck_name = ?",
+                    (deck_name,),
+                )
+            return cur.fetchone() is not None
 
     def mark_run_rolled_back(self, run_id: str) -> None:
         """Marks a run as rolled back."""

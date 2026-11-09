@@ -31,6 +31,9 @@ class RunResult:
     already_active_count: int = 0
     already_active_cids: List[int] = field(default_factory=list)
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
+    unit_error: str = ""
+    unit_title: str = ""
+    search_id: str = ""
 
 
 @dataclass
@@ -132,11 +135,55 @@ def execute_unit_deck_creation(
     concept_coverage: Optional[List[Dict[str, Any]]] = None,
     parent_deck_prefix: Optional[str] = None,
     allowed_cids: Optional[Set[int]] = None,
+    unit_error: str = "",
+    profile: str = "",
+    search_id: str = "",
 ) -> RunResult:
     """Unsuspends matching cards and builds a clean Filtered Deck with cid: search query."""
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    if not profile:
+        try:
+            from aqt import mw
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                profile = str(mw.pm.name or "")
+        except Exception:
+            profile = ""
     coverage_list = list(concept_coverage) if concept_coverage else []
     target_deck_name = _format_target_deck_name(unit.deck_name, parent_deck_prefix)
+
+    if unit_error:
+        record = RunRecord(
+            run_id=run_id,
+            created_at=int(time.time()),
+            deck_name=target_deck_name,
+            filtered_did=0,
+            source_decks=[config.get_effective_search_query()] if hasattr(config, "get_effective_search_query") else list(config.selected_decks),
+            unit_title=unit.unit_title,
+            unit_preview=(unit.body_text[:150] + "...") if len(unit.body_text) > 150 else unit.body_text,
+            total_matched_cids=[],
+            newly_unsuspended_cids=[],
+            rolled_back=0,
+            already_active_cids=[],
+            concept_coverage=[],
+            unit_error=unit_error,
+            profile=profile,
+            search_id=search_id,
+        )
+        storage.save_run(record)
+        return RunResult(
+            run_id=run_id,
+            deck_name=target_deck_name,
+            filtered_did=0,
+            total_cards_count=0,
+            newly_unsuspended_count=0,
+            newly_unsuspended_cids=[],
+            already_active_count=0,
+            already_active_cids=[],
+            concept_coverage=[],
+            unit_error=unit_error,
+            unit_title=unit.unit_title,
+            search_id=search_id,
+        )
 
     if not matched_nids:
         return RunResult(
@@ -147,6 +194,9 @@ def execute_unit_deck_creation(
             newly_unsuspended_count=0,
             newly_unsuspended_cids=[],
             concept_coverage=coverage_list,
+            unit_error="",
+            unit_title=unit.unit_title,
+            search_id=search_id,
         )
 
     suspended_cids, active_cids = resolve_notes_to_cards(
@@ -179,6 +229,8 @@ def execute_unit_deck_creation(
                 rolled_back=0,
                 already_active_cids=active_cids,
                 concept_coverage=coverage_list,
+                profile=profile,
+                search_id=search_id,
             )
             storage.save_run(record)
         return RunResult(
@@ -191,6 +243,8 @@ def execute_unit_deck_creation(
             already_active_count=len(active_cids),
             already_active_cids=active_cids,
             concept_coverage=coverage_list,
+            unit_title=unit.unit_title,
+            search_id=search_id,
         )
 
     # 1. Unsuspend only cards that were suspended prior to this run
@@ -218,6 +272,14 @@ def execute_unit_deck_creation(
                 deck_name = f"{deck_name}::Smart Search {timestamp}"
             else:
                 deck_name = f"{deck_name} - Smart Search {timestamp}"
+            existing_did = col.decks.id_for_name(deck_name)
+        elif storage.is_filtered_deck_in_active_run(deck_name, existing_did):
+            # Do NOT reuse a filtered deck belonging to an active (non-rolled back) run
+            timestamp = time.strftime("%Y-%m-%d %H:%M")
+            candidate_new_name = f"{deck_name} {timestamp}"
+            if col.decks.id_for_name(candidate_new_name):
+                candidate_new_name = f"{deck_name} {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            deck_name = candidate_new_name
             existing_did = col.decks.id_for_name(deck_name)
 
     if existing_did:
@@ -262,6 +324,8 @@ def execute_unit_deck_creation(
         rolled_back=0,
         already_active_cids=active_cids,
         concept_coverage=coverage_list,
+        profile=profile,
+        search_id=search_id,
     )
     storage.save_run(record)
 
@@ -275,6 +339,8 @@ def execute_unit_deck_creation(
         already_active_count=len(active_cids),
         already_active_cids=active_cids,
         concept_coverage=coverage_list,
+        unit_title=unit.unit_title,
+        search_id=search_id,
     )
 
 
@@ -283,6 +349,7 @@ def rollback_run(
     storage: SearchDatabase,
     run_id: str,
     keep_reviewed: bool = True,
+    current_profile: str = "",
 ) -> RollbackResult:
     """Safely undoes a run:
 
@@ -297,6 +364,19 @@ def rollback_run(
             deck_removed=False,
             resuspended_count=0,
             kept_reviewed_count=0,
+        )
+
+    if not current_profile:
+        try:
+            from aqt import mw
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                current_profile = str(mw.pm.name or "")
+        except Exception:
+            current_profile = ""
+
+    if record.profile and current_profile and record.profile != current_profile:
+        raise ValueError(
+            f"Rollback rifiutato: il run appartiene al profilo '{record.profile}', mentre il profilo aperto è '{current_profile}'."
         )
 
     # 1. Empty and remove the Filtered Deck first (strictly verify dyn == 1!)
@@ -336,17 +416,14 @@ def rollback_run(
         placeholders = ",".join(str(c) for c in chunk)
 
         if keep_reviewed:
-            # Check reps in cards and revlog entries since run creation in a single batch query
+            # Check revlog entries since run creation in a single batch query (reps > 0 alone is ignored)
             run_time_ms = record.created_at * 1000
             rev_query = f"SELECT DISTINCT cid FROM revlog WHERE cid IN ({placeholders}) AND id >= {run_time_ms}"
             reviewed_in_revlog: Set[int] = {int(r_cid) for (r_cid,) in col.db.execute(rev_query)}
 
-            query = f"""
-                SELECT id, reps FROM cards
-                WHERE id IN ({placeholders})
-            """
-            for cid, reps in col.db.execute(query):
-                if reps > 0 or int(cid) in reviewed_in_revlog:
+            query = f"SELECT id FROM cards WHERE id IN ({placeholders})"
+            for (cid,) in col.db.execute(query):
+                if int(cid) in reviewed_in_revlog:
                     kept_count += 1
                     continue
 
@@ -372,26 +449,53 @@ def rollback_run(
     )
 
 
-def delete_filtered_deck_only(col: Any, storage: SearchDatabase, run_id: str) -> bool:
-    """Empties and removes the filtered deck without modifying card suspension states.
+def delete_filtered_deck_only_op(
+    col: Any,
+    storage: SearchDatabase,
+    run_id: str,
+) -> Tuple[bool, Any]:
+    """Empties and removes a filtered deck within a custom undo entry.
 
-    Handy shortcut for students who want to keep all unsuspended cards in their main decks.
+    Returns (deck_removed, op_changes).
     """
-    record = storage.get_run(run_id)
-    if not record or not record.filtered_did:
-        return False
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search")
+        except Exception:
+            undo_pos = None
 
-    if col.decks.have(record.filtered_did):
+    record = storage.get_run(run_id)
+    deck_removed = False
+    if record and record.filtered_did and col.decks.have(record.filtered_did):
         d_obj = col.decks.get(record.filtered_did)
         is_dyn = (
             d_obj.get("dyn", 1) == 1
             if isinstance(d_obj, dict)
             else getattr(d_obj, "dyn", 1) == 1
         )
-        if not is_dyn:
-            return False
-        col.sched.empty_filtered_deck(record.filtered_did)
-        col.decks.remove([record.filtered_did])
+        if is_dyn:
+            col.sched.empty_filtered_deck(record.filtered_did)
+            col.decks.remove([record.filtered_did])
+            deck_removed = True
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return deck_removed, changes
+
+
+def delete_filtered_deck_only(col: Any, storage: SearchDatabase, run_id: str) -> bool:
+    """Empties and removes the filtered deck without modifying card suspension states.
+
+    Handy shortcut for students who want to keep all unsuspended cards in their main decks.
+    """
+    success, changes = delete_filtered_deck_only_op(col, storage, run_id)
+    if success and changes is None:
         try:
             from aqt import mw  # type: ignore
 
@@ -399,6 +503,199 @@ def delete_filtered_deck_only(col: Any, storage: SearchDatabase, run_id: str) ->
                 mw.reset()
         except Exception:
             pass
-        return True
+    return success
 
-    return False
+
+def _get_op_changes(changes: Any) -> Any:
+    """Ensures an OpChanges object is returned for CollectionOp."""
+    if changes is not None:
+        return changes
+    try:
+        from anki.collection import OpChanges  # type: ignore
+
+        ch = OpChanges()
+        ch.deck = True
+        ch.card = True
+        return ch
+    except Exception:
+        pass
+    return None
+
+
+def assign_notes_to_best_units(units_search_data: List[Dict[str, Any]]) -> None:
+    """Assigns each note exclusively to the unit where it achieved the highest score.
+
+    For units that lose a note to another unit with a higher score, the note is removed
+    from their matched_nids, and their concept_coverage records 'shared_with': <winning_unit_title>.
+    """
+    if len(units_search_data) <= 1:
+        return
+
+    # 1. Find the highest score and winning unit index for each nid across all units
+    best_unit_idx_for_nid: Dict[int, int] = {}
+    best_score_for_nid: Dict[int, float] = {}
+
+    for u_idx, u_data in enumerate(units_search_data):
+        scores = u_data.get("note_scores", {})
+        for nid in u_data.get("matched_nids", []):
+            score = scores.get(nid, 0.0)
+            if nid not in best_unit_idx_for_nid or score > best_score_for_nid[nid]:
+                best_unit_idx_for_nid[nid] = u_idx
+                best_score_for_nid[nid] = score
+
+    # 2. Partition notes and record 'shared_with' on concept coverage
+    for u_idx, u_data in enumerate(units_search_data):
+        winning_nids: List[int] = []
+        lost_nids_to_unit: Dict[int, str] = {}  # nid -> winning_unit_title
+
+        for nid in u_data.get("matched_nids", []):
+            best_idx = best_unit_idx_for_nid.get(nid, u_idx)
+            if best_idx == u_idx:
+                winning_nids.append(nid)
+            else:
+                winning_unit_obj = units_search_data[best_idx].get("unit")
+                winning_title = getattr(winning_unit_obj, "unit_title", "") or f"Unità {best_idx + 1}"
+                lost_nids_to_unit[nid] = winning_title
+
+        u_data["matched_nids"] = winning_nids
+
+        if lost_nids_to_unit:
+            for cov in u_data.get("concept_coverage", []):
+                matched = cov.get("matched_nids", [])
+                lost_for_cov = [n for n in matched if n in lost_nids_to_unit]
+                if lost_for_cov:
+                    target_units = list(dict.fromkeys(lost_nids_to_unit[n] for n in lost_for_cov))
+                    cov["shared_with"] = ", ".join(target_units)
+
+
+def create_batch_filtered_decks_op(
+    col: Any,
+    units_data: List[Dict[str, Any]],
+    config: ConfigManager,
+    storage: SearchDatabase,
+    parent_deck_prefix: Optional[str] = None,
+    allowed_cids: Optional[Set[int]] = None,
+    profile: str = "",
+    search_id: str = "",
+) -> Tuple[List[RunResult], Any]:
+    """Applies deck creation and card unsuspension for multiple units in a single custom undo entry.
+
+    Returns (results, op_changes).
+    """
+    assign_notes_to_best_units(units_data)
+
+    if not profile:
+        try:
+            from aqt import mw
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                profile = str(mw.pm.name or "")
+        except Exception:
+            profile = ""
+
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search")
+        except Exception:
+            undo_pos = None
+
+    results: List[RunResult] = []
+    for item in units_data:
+        run_res = execute_unit_deck_creation(
+            col=col,
+            unit=item["unit"],
+            matched_nids=item["matched_nids"],
+            config=config,
+            storage=storage,
+            concept_coverage=item.get("concept_coverage"),
+            parent_deck_prefix=parent_deck_prefix,
+            allowed_cids=allowed_cids,
+            unit_error=item.get("unit_error", ""),
+            profile=item.get("profile") or profile,
+            search_id=item.get("search_id", search_id),
+        )
+        results.append(run_res)
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return results, changes
+
+
+def rollback_search_batch_op(
+    col: Any,
+    storage: SearchDatabase,
+    run_ids: Sequence[str],
+    keep_reviewed: bool = True,
+    current_profile: str = "",
+) -> Tuple[List[RollbackResult], Any]:
+    """Rolls back multiple runs in a single custom undo entry.
+
+    Returns (results, op_changes).
+    """
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search Rollback")
+        except Exception:
+            undo_pos = None
+
+    results: List[RollbackResult] = []
+    for rid in run_ids:
+        res = rollback_run(
+            col=col,
+            storage=storage,
+            run_id=rid,
+            keep_reviewed=keep_reviewed,
+            current_profile=current_profile,
+        )
+        results.append(res)
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return results, changes
+
+
+def rollback_run_op(
+    col: Any,
+    storage: SearchDatabase,
+    run_id: str,
+    keep_reviewed: bool = True,
+    current_profile: str = "",
+) -> Tuple[RollbackResult, Any]:
+    """Rolls back a run within a custom undo entry.
+
+    Returns (rollback_result, op_changes).
+    """
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search Rollback")
+        except Exception:
+            undo_pos = None
+
+    res = rollback_run(
+        col=col,
+        storage=storage,
+        run_id=run_id,
+        keep_reviewed=keep_reviewed,
+        current_profile=current_profile,
+    )
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return res, changes

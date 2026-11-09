@@ -21,7 +21,93 @@ _RE_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
 class AIClientError(Exception):
     """Base exception for AI client errors."""
 
-    pass
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+_LATEX_COMMANDS_BFNRT = {
+    # Greek letters
+    "beta",
+    "nu",
+    "rho",
+    "varrho",
+    "tau",
+    "theta",
+    "vartheta",
+    # Common math / layout commands
+    "frac",
+    "times",
+    "text",
+    "textbf",
+    "textit",
+    "textnormal",
+    "mathrm",
+    "mathbf",
+    "mathit",
+    "nabla",
+    "neq",
+    "ne",
+    "right",
+    "rightarrow",
+    "Rightarrow",
+    "top",
+    "to",
+    "bar",
+    "bm",
+    "bold",
+    "begin",
+    "bullet",
+    "forall",
+    "notin",
+    "neg",
+    "not",
+    "tilde",
+    "tan",
+}
+_RE_WORD_START = re.compile(r"^[a-zA-Z]+")
+
+
+def repair_json_escapes(raw_text: str) -> str:
+    """Repairs invalid JSON escape sequences by doubling backslashes.
+
+    Doubles backslashes not followed by '"/bfnrtu' or when followed by
+    letters forming known LaTeX commands (e.g. \\beta, \\frac, \\nu, \\rho,
+    \\tau, \\theta, \\times, etc.) to prevent invalid control characters.
+    """
+    res: List[str] = []
+    i = 0
+    n = len(raw_text)
+    valid_single = set("\"\\/bfnrt")
+    while i < n:
+        c = raw_text[i]
+        if c == "\\":
+            if i + 1 < n:
+                nxt = raw_text[i + 1]
+                # Check if this escape forms a known LaTeX command (e.g. \beta, \frac)
+                m = _RE_WORD_START.match(raw_text[i + 1 :])
+                if m and m.group(0).lower() in _LATEX_COMMANDS_BFNRT:
+                    res.append("\\\\")
+                    i += 1
+                    continue
+                if nxt in valid_single:
+                    res.append(c)
+                    res.append(nxt)
+                    i += 2
+                    continue
+                elif nxt == "u":
+                    # Valid if followed by exactly 4 hex digits
+                    if i + 5 < n and all(ch in "0123456789abcdefABCDEF" for ch in raw_text[i + 2 : i + 6]):
+                        res.append(raw_text[i : i + 6])
+                        i += 6
+                        continue
+            # Invalid escape or trailing backslash: double it
+            res.append("\\\\")
+            i += 1
+        else:
+            res.append(c)
+            i += 1
+    return "".join(res)
 
 
 class OpenAICompatibleClient:
@@ -78,7 +164,7 @@ class OpenAICompatibleClient:
                 err_body = e.read().decode("utf-8")
             except Exception:
                 pass
-            raise AIClientError(f"HTTP {e.code} ({e.reason}) at {url}: {err_body}") from e
+            raise AIClientError(f"HTTP {e.code} ({e.reason}) at {url}: {err_body}", status_code=e.code) from e
         except urllib.error.URLError as e:
             raise AIClientError(f"Connection failed to {url}: {e.reason}") from e
         except TimeoutError as e:
@@ -110,10 +196,37 @@ class OpenAICompatibleClient:
     def extract_clean_json(raw_text: str) -> Any:
         """Resiliently extracts a JSON object or array from LLM text output.
 
-        Handles <think> tags, markdown fences, and conversational prelude/postlude.
+        Handles <think> tags, markdown fences, conversational prelude/postlude,
+        and repairs invalid backslash escapes.
         """
         if not raw_text or not raw_text.strip():
             raise AIClientError("LLM returned empty text.")
+
+        def _has_control_chars(obj: Any) -> bool:
+            if isinstance(obj, str):
+                return "\x08" in obj or "\x0c" in obj
+            if isinstance(obj, dict):
+                return any(_has_control_chars(k) or _has_control_chars(v) for k, v in obj.items())
+            if isinstance(obj, list):
+                return any(_has_control_chars(item) for item in obj)
+            return False
+
+        def _try_parse(candidate_str: str) -> Optional[Any]:
+            try:
+                parsed = json.loads(candidate_str)
+                if _has_control_chars(parsed):
+                    repaired = repair_json_escapes(candidate_str)
+                    try:
+                        return json.loads(repaired)
+                    except json.JSONDecodeError:
+                        return parsed
+                return parsed
+            except json.JSONDecodeError:
+                try:
+                    repaired = repair_json_escapes(candidate_str)
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    return None
 
         text = raw_text.strip()
 
@@ -124,16 +237,15 @@ class OpenAICompatibleClient:
         fence_match = _RE_JSON_FENCE.search(text)
         if fence_match:
             candidate = fence_match.group(1).strip()
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                text = candidate  # Keep trying on the inside of the fence
+            parsed = _try_parse(candidate)
+            if parsed is not None:
+                return parsed
+            text = candidate  # Keep trying on the inside of the fence
 
         # 3. Direct attempt
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
+        parsed = _try_parse(text)
+        if parsed is not None:
+            return parsed
 
         # 4. Search for the outermost JSON object {...} or array [...]
         start_obj = text.find("{")
@@ -148,10 +260,9 @@ class OpenAICompatibleClient:
             candidates.append(text[start_arr : end_arr + 1])
 
         for cand in candidates:
-            try:
-                return json.loads(cand)
-            except json.JSONDecodeError:
-                continue
+            parsed = _try_parse(cand)
+            if parsed is not None:
+                return parsed
 
         snippet = (raw_text[:200] + "...") if len(raw_text) > 200 else raw_text
         raise AIClientError(f"Could not parse valid JSON from LLM output: {snippet}")
@@ -164,6 +275,8 @@ class OpenAICompatibleClient:
         api_key: str = "",
         temperature: float = 0.1,
         timeout: int = 240,
+        json_schema: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 16384,
     ) -> Any:
         """Calls POST /v1/chat/completions and returns parsed JSON content."""
         norm_url = self._normalize_base_url(base_url)
@@ -173,19 +286,67 @@ class OpenAICompatibleClient:
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": max_tokens,
         }
 
-        res = self._make_request(url, method="POST", data=payload, api_key=api_key, timeout=timeout)
+        if json_schema is not None:
+            if "type" in json_schema and "json_schema" in json_schema:
+                payload["response_format"] = json_schema
+            elif "schema" in json_schema:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": json_schema,
+                }
+            else:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response_schema",
+                        "schema": json_schema,
+                    },
+                }
+
+        if "response_format" in payload:
+            try:
+                res = self._make_request(url, method="POST", data=payload, api_key=api_key, timeout=timeout)
+            except AIClientError as e:
+                # If server returns 400 for response_format, retry once without response_format
+                if getattr(e, "status_code", None) == 400 or "HTTP 400" in str(e):
+                    payload_fallback = dict(payload)
+                    payload_fallback.pop("response_format", None)
+                    res = self._make_request(
+                        url, method="POST", data=payload_fallback, api_key=api_key, timeout=timeout
+                    )
+                else:
+                    raise
+        else:
+            res = self._make_request(url, method="POST", data=payload, api_key=api_key, timeout=timeout)
+
         choices = res.get("choices", [])
         if not choices:
             raise AIClientError("No choices returned in chat completion response.")
 
-        first_msg = choices[0].get("message", {})
+        first_choice = choices[0]
+        finish_reason = first_choice.get("finish_reason")
+        first_msg = first_choice.get("message", {})
         raw_content = first_msg.get("content", "") or ""
         if not raw_content.strip():
             # Fallback if a reasoning model placed JSON inside reasoning_content
             raw_content = first_msg.get("reasoning_content", "") or ""
-        return self.extract_clean_json(raw_content)
+
+        try:
+            parsed = self.extract_clean_json(raw_content)
+        except Exception as e:
+            if finish_reason == "length":
+                raise AIClientError(
+                    f"risposta troncata: aumentare chat_max_tokens (finish_reason: length, error: {e})"
+                ) from e
+            raise
+
+        if finish_reason == "length":
+            raise AIClientError("risposta troncata: aumentare chat_max_tokens")
+
+        return parsed
 
     def get_embeddings(
         self,

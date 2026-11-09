@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from ankihub_searcher.text_utils import (
     clean_html_and_cloze,
     clean_tags,
+    normalize_inline_latex,
     parse_markdown_units,
     LectureUnit,
 )
@@ -136,6 +137,34 @@ Content here.
         self.assertEqual(parse_markdown_units("   \n\n  "), [])
         # Only headers with no body
         self.assertEqual(parse_markdown_units("# Header 1\n## Header 2\n---"), [])
+
+    def test_normalize_inline_latex(self):
+        # Greek letter replacements
+        self.assertEqual(normalize_inline_latex(r"$\beta$"), "β")
+        self.assertEqual(normalize_inline_latex(r"$\kappa$"), "κ")
+        self.assertEqual(normalize_inline_latex(r"$\alpha$"), "α")
+        self.assertEqual(normalize_inline_latex(r"$\Delta P$"), "Δ P")
+
+        # Command wrappers and math formatting
+        self.assertEqual(normalize_inline_latex(r"$\mathrm{TGF}-\beta$"), "TGF-β")
+        self.assertEqual(normalize_inline_latex(r"\mathbf{IL}-1\beta"), "IL-1β")
+        self.assertEqual(normalize_inline_latex(r"$\text{recettori }\beta_2$"), "recettori β_2")
+
+        # Standalone LaTeX commands without dollars
+        self.assertEqual(normalize_inline_latex(r"\beta-bloccanti e \alpha-agonisti"), "β-bloccanti e α-agonisti")
+
+        # Math symbols & relations
+        self.assertEqual(normalize_inline_latex(r"$\ge 50$ mmHg"), "≥ 50 mmHg")
+        self.assertEqual(normalize_inline_latex(r"$\pm 5$"), "± 5")
+        self.assertEqual(normalize_inline_latex(r"$A \to B$"), "A → B")
+
+        # Fractions & parenthesized math
+        self.assertEqual(normalize_inline_latex(r"\( \frac{V}{R} \)"), "V/R")
+
+        # Empty / None handling
+        self.assertEqual(normalize_inline_latex(""), "")
+        self.assertEqual(normalize_inline_latex(None), "")
+        self.assertEqual(normalize_inline_latex("Plain text with no LaTeX"), "Plain text with no LaTeX")
 
 
 if __name__ == "__main__":
