@@ -11,13 +11,15 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "config_version": 4,
+    "config_version": 5,
     "selected_decks": ["AnKing Step Deck", "Mastering Radiology"],
     "search_query": '"deck:AnKing Step Deck"',
     "search_query_history": [
         '"deck:AnKing Step Deck"',
         '"deck:AnKing Step Deck" OR "deck:Mastering Radiology"',
     ],
+    "search_input_mode": "keyword",
+    "keyword_min_similarity": 0.52,
     "chat_provider": "lm_studio",
     "chat_base_url": "http://127.0.0.1:1234/v1",
     "chat_api_key": "",
@@ -73,6 +75,8 @@ class ConfigManager:
     search_query_history: List[str] = field(
         default_factory=lambda: list(DEFAULT_CONFIG["search_query_history"])
     )
+    search_input_mode: str = str(DEFAULT_CONFIG["search_input_mode"])
+    keyword_min_similarity: float = float(DEFAULT_CONFIG["keyword_min_similarity"])
     chat_provider: str = DEFAULT_CONFIG["chat_provider"]
     chat_base_url: str = DEFAULT_CONFIG["chat_base_url"]
     chat_api_key: str = DEFAULT_CONFIG["chat_api_key"]
@@ -181,18 +185,25 @@ class ConfigManager:
 
     @classmethod
     def migrate_dict(cls, data: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
-        """Migrates a raw config dict if config_version is missing or < 4.
+        """Migrates a raw config dict if config_version is missing or < 5.
 
-        If config_version is missing or < 4, overwrites with new defaults ONLY:
+        If config_version is missing or < 4, overwrites with v4 defaults:
         - sensitivity: 0.5
         - relative_score_window: 0.05
         - max_notes_per_concept: 10
         - max_cards_per_unit: 150
         - top_k_per_concept: removed if present
         and sets config_version: 4.
+
+        If config_version < 5:
+        - sets search_input_mode: "keyword"
+        - sets keyword_min_similarity: 0.52
+        and sets config_version: 5.
+
         All other user keys remain untouched.
         Returns (migrated_dict, was_migrated).
         """
+        was_migrated = False
         version = data.get("config_version")
         if version is None or int(version) < 4:
             data["sensitivity"] = 0.5
@@ -202,8 +213,18 @@ class ConfigManager:
             data["hybrid_dense_weight"] = 1.0
             data.pop("top_k_per_concept", None)
             data["config_version"] = 4
-            return data, True
-        return data, False
+            version = 4
+            was_migrated = True
+
+        if int(version) < 5:
+            if "search_input_mode" not in data:
+                data["search_input_mode"] = "keyword"
+            if "keyword_min_similarity" not in data:
+                data["keyword_min_similarity"] = 0.52
+            data["config_version"] = 5
+            was_migrated = True
+
+        return data, was_migrated
 
     def update(self, data: Dict[str, Any]) -> None:
         """Updates instance attributes from dictionary keys."""

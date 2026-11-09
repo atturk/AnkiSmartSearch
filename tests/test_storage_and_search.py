@@ -1000,7 +1000,7 @@ I should decompose this into atomic concepts.
         self.assertIsNone(cfg_legacy.top_k_per_concept)
         self.assertEqual(cfg_legacy.relative_score_window, 0.05)
         self.assertEqual(cfg_legacy.max_notes_per_concept, 10)
-        self.assertEqual(cfg_legacy.config_version, 4)
+        self.assertEqual(cfg_legacy.config_version, 5)
 
         model_id = config.get_active_model_id()
         # Seed 4 notes with different similarity levels:
@@ -1959,7 +1959,7 @@ I should decompose this into atomic concepts.
         self.assertEqual(cfg.max_notes_per_concept, 10)
         self.assertEqual(cfg.max_cards_per_unit, 150)
         self.assertEqual(cfg.hybrid_dense_weight, 1.0)
-        self.assertEqual(cfg.config_version, 4)
+        self.assertEqual(cfg.config_version, 5)
 
         # get_min_similarity_threshold: 0.70 - s * 0.20
         self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
@@ -1980,7 +1980,7 @@ I should decompose this into atomic concepts.
         }
         migrated, was_migrated = ConfigManager.migrate_dict(legacy_cfg)
         self.assertTrue(was_migrated)
-        self.assertEqual(migrated["config_version"], 4)
+        self.assertEqual(migrated["config_version"], 5)
         self.assertEqual(migrated["sensitivity"], 0.5)
         self.assertEqual(migrated["relative_score_window"], 0.05)
         self.assertEqual(migrated["max_notes_per_concept"], 10)
@@ -1992,17 +1992,17 @@ I should decompose this into atomic concepts.
         self.assertEqual(migrated["chat_model"], "gpt-custom")
         self.assertEqual(migrated["search_query"], '"deck:MyDeck"')
 
-        # Version 4 config is NOT re-migrated
-        v4_cfg = {
-            "config_version": 4,
+        # Version 5 config is NOT re-migrated
+        v5_cfg = {
+            "config_version": 5,
             "sensitivity": 0.65,
             "relative_score_window": 0.03,
             "max_notes_per_concept": 15,
         }
-        migrated_v4, was_migrated_v4 = ConfigManager.migrate_dict(v4_cfg)
-        self.assertFalse(was_migrated_v4)
-        self.assertEqual(migrated_v4["sensitivity"], 0.65)
-        self.assertEqual(migrated_v4["relative_score_window"], 0.03)
+        migrated_v5, was_migrated_v5 = ConfigManager.migrate_dict(v5_cfg)
+        self.assertFalse(was_migrated_v5)
+        self.assertEqual(migrated_v5["sensitivity"], 0.65)
+        self.assertEqual(migrated_v5["relative_score_window"], 0.03)
 
         # 3. Test extract_first_sentence
         self.assertEqual(
@@ -2089,7 +2089,7 @@ I should decompose this into atomic concepts.
             self.assertEqual(cfg.max_notes_per_concept, 10)
             self.assertEqual(cfg.max_cards_per_unit, 150)
             self.assertEqual(cfg.hybrid_dense_weight, 1.0)
-            self.assertEqual(cfg.config_version, 4)
+            self.assertEqual(cfg.config_version, 5)
             self.assertIsNone(cfg.top_k_per_concept)
 
             # Check that user custom settings remain preserved
@@ -2097,9 +2097,9 @@ I should decompose this into atomic concepts.
             self.assertEqual(cfg.search_query, '"deck:AnKing Step Deck" OR "deck:Custom"')
             self.assertEqual(cfg.embed_model, "text-embedding-3-small")
 
-            # Check that writeConfig was called and stored_in_anki was updated with config_version 4
+            # Check that writeConfig was called and stored_in_anki was updated with config_version 5
             mock_addon_mgr.writeConfig.assert_called_once()
-            self.assertEqual(stored_in_anki.get("config_version"), 4)
+            self.assertEqual(stored_in_anki.get("config_version"), 5)
             self.assertEqual(stored_in_anki.get("sensitivity"), 0.5)
             self.assertEqual(stored_in_anki.get("hybrid_dense_weight"), 1.0)
             self.assertNotIn("top_k_per_concept", stored_in_anki)
@@ -2109,7 +2109,7 @@ I should decompose this into atomic concepts.
             cfg2 = ConfigManager.load()
             self.assertEqual(cfg2.sensitivity, 0.5)
             self.assertEqual(cfg2.hybrid_dense_weight, 1.0)
-            self.assertEqual(cfg2.config_version, 4)
+            self.assertEqual(cfg2.config_version, 5)
             self.assertEqual(cfg2.chat_model, "mistral-nemo-it")
             mock_addon_mgr.writeConfig.assert_not_called()
 
@@ -3365,6 +3365,42 @@ print("__JSON_RESULT__" + json.dumps(output))
         # Progress messages must contain the keyword vector search phrasing
         self.assertTrue(any("Ricerca vettoriale di 1 keyword tra" in m for m in progress_msgs))
 
+        col.conn.close()
+
+    def test_config_version_5_migration_and_settings_dialog(self):
+        """Item 29: config v5 migration, keyword threshold in settings dialog and preview."""
+        from ankihub_searcher.config_manager import ConfigManager, DEFAULT_CONFIG
+        from ankihub_searcher.ui.main_dialog import SettingsDialog
+
+        self.assertEqual(DEFAULT_CONFIG["config_version"], 5)
+        self.assertEqual(DEFAULT_CONFIG["search_input_mode"], "keyword")
+        self.assertEqual(DEFAULT_CONFIG["keyword_min_similarity"], 0.52)
+
+        # 1. Migration from v4 dict
+        v4_dict = {
+            "config_version": 4,
+            "sensitivity": 0.35,
+            "search_query": "deck:Test",
+        }
+        migrated, was_migrated = ConfigManager.migrate_dict(v4_dict)
+        self.assertTrue(was_migrated)
+        self.assertEqual(migrated["config_version"], 5)
+        self.assertEqual(migrated["search_input_mode"], "keyword")
+        self.assertEqual(migrated["keyword_min_similarity"], 0.52)
+        self.assertEqual(migrated["sensitivity"], 0.35)
+        self.assertEqual(migrated["search_query"], "deck:Test")
+
+        # 2. Settings dialog loads and saves keyword threshold
+        col = MockAnkiCol()
+        cfg = ConfigManager()
+        cfg.keyword_min_similarity = 0.58
+        dlg = SettingsDialog(col=col, config=cfg)
+        self.assertAlmostEqual(dlg.spin_kw_thresh.value(), 0.58, places=2)
+
+        dlg.spin_kw_thresh.setValue(0.64)
+        with patch.object(cfg, "save"):
+            dlg._save_settings()
+        self.assertAlmostEqual(cfg.keyword_min_similarity, 0.64, places=2)
         col.conn.close()
 
 

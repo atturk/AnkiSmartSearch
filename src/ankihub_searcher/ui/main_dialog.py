@@ -91,7 +91,31 @@ except ImportError:
 
         class _HeadlessWidget(metaclass=_HeadlessMeta):
             def __init__(self, *args, **kwargs):
+                self._val = 0.0
+
+            def setValue(self, val):
+                self._val = val
+
+            def value(self):
+                return self._val if self._val is not None else 0.0
+
+            def isChecked(self):
+                return False
+
+            def setChecked(self, val):
                 pass
+
+            def text(self):
+                return ""
+
+            def setText(self, val):
+                pass
+
+            def currentText(self):
+                return ""
+
+            def currentData(self):
+                return ""
 
             def __getattr__(self, name):
                 return _HeadlessWidget()
@@ -1336,10 +1360,10 @@ class IndexDialog(QDialog):
 class SettingsDialog(QDialog):
     """Minimal dialog for configuring search sensitivity, AI endpoints, and note fields."""
 
-    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
+    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None, config: Optional[ConfigManager] = None):
         super().__init__(parent)
         self.col = col or (mw.col if mw else None)
-        self.config = ConfigManager.load()
+        self.config = config or ConfigManager.load()
         self.ai_client = OpenAICompatibleClient()
 
         self.setWindowTitle("Smart Search — Impostazioni")
@@ -1390,6 +1414,17 @@ class SettingsDialog(QDialog):
         thresh_row.addWidget(self.slider_thresh)
         thresh_row.addWidget(QLabel("Preciso"))
         select_layout.addLayout(thresh_row)
+
+        row_kw_thresh = QHBoxLayout()
+        row_kw_thresh.addWidget(QLabel("Soglia keyword:"))
+        self.spin_kw_thresh = QDoubleSpinBox()
+        self.spin_kw_thresh.setRange(0.30, 0.90)
+        self.spin_kw_thresh.setSingleStep(0.01)
+        self.spin_kw_thresh.setDecimals(2)
+        self.spin_kw_thresh.setValue(getattr(self.config, "keyword_min_similarity", 0.52))
+        row_kw_thresh.addWidget(self.spin_kw_thresh)
+        row_kw_thresh.addStretch()
+        select_layout.addLayout(row_kw_thresh)
 
         # max_notes_per_concept & relative_score_window
         row_params = QHBoxLayout()
@@ -1689,6 +1724,7 @@ class SettingsDialog(QDialog):
         current_thresh = self.config.get_min_similarity_threshold()
         self.slider_thresh.setValue(int(round(current_thresh * 100)))
         self.lbl_thresh_val.setText(f"{current_thresh:.2f}")
+        self.spin_kw_thresh.setValue(float(getattr(self.config, "keyword_min_similarity", 0.52)))
 
         self.spin_max_notes.setValue(getattr(self.config, "max_notes_per_concept", 10))
         self.spin_rel_window.setValue(getattr(self.config, "relative_score_window", 0.05))
@@ -1770,6 +1806,7 @@ class SettingsDialog(QDialog):
             return
 
         thresh = self.slider_thresh.value() / 100.0
+        kw_thresh = self.spin_kw_thresh.value()
         rel_window = self.spin_rel_window.value()
         max_notes_concept = self.spin_max_notes.value()
         max_cards_unit = self.spin_max_cards.value()
@@ -1797,6 +1834,7 @@ class SettingsDialog(QDialog):
                     keywords_en=c.get("keywords_en", []),
                     keywords_it=c.get("keywords_it", []),
                     quote_it=c.get("quote_it", ""),
+                    source=str(c.get("source", "llm")),
                 )
                 for c in run.concept_coverage
                 if c.get("claim_en") or c.get("topic_it")
@@ -1804,12 +1842,14 @@ class SettingsDialog(QDialog):
             if not concepts:
                 continue
 
+            eff_thresh = kw_thresh if any(c.source == "keyword" for c in concepts) else thresh
+
             try:
                 candidates = pipeline.retrieve_for_concepts(
                     concepts=concepts,
                     active_model_id=active_mid,
                     candidate_nids=candidate_nids,
-                    min_threshold=thresh,
+                    min_threshold=eff_thresh,
                     relative_score_window=rel_window,
                     max_notes_per_concept=max_notes_concept,
                     max_cards_per_unit=max_cards_unit,
@@ -1933,6 +1973,7 @@ class SettingsDialog(QDialog):
     def _save_settings(self) -> None:
         thresh = self.slider_thresh.value() / 100.0
         self.config.sensitivity = max(0.0, min(1.0, round((0.70 - thresh) / 0.20, 2)))
+        self.config.keyword_min_similarity = round(self.spin_kw_thresh.value(), 2)
         self.config.max_notes_per_concept = self.spin_max_notes.value()
         self.config.relative_score_window = round(self.spin_rel_window.value(), 4)
         self.config.max_cards_per_unit = self.spin_max_cards.value()
