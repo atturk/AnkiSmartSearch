@@ -1654,6 +1654,121 @@ I should decompose this into atomic concepts.
         self.assertIn("1001", deck_b["terms"][0][0])
         self.assertIn("1003", deck_b["terms"][0][0])
 
+    def test_profile_scoped_history_and_rollback(self):
+        col = MockAnkiCol()
+        card_id = 9901
+        note_id = 901
+        col.conn.execute(
+            "INSERT INTO cards (id, nid, did, odid, queue, type, reps) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (card_id, note_id, 1, 0, -1, 0, 0),
+        )
+        col.conn.execute(
+            "INSERT INTO notes (id, mid, mod, flds, tags) VALUES (?, ?, ?, ?, ?)",
+            (note_id, 1, 0, "Profile Note\x1fExtra", ""),
+        )
+        col.conn.commit()
+
+        # 1. Save runs across different profiles
+        rec_a = RunRecord(
+            run_id="run_prof_a",
+            created_at=int(time.time()) - 100,
+            deck_name="Smart Search - Prof A",
+            filtered_did=10001,
+            source_decks=["DeckA"],
+            unit_title="Unit Prof A",
+            unit_preview="...",
+            total_matched_cids=[card_id],
+            newly_unsuspended_cids=[card_id],
+            rolled_back=0,
+            profile="UserA",
+        )
+        rec_b = RunRecord(
+            run_id="run_prof_b",
+            created_at=int(time.time()) - 50,
+            deck_name="Smart Search - Prof B",
+            filtered_did=10002,
+            source_decks=["DeckB"],
+            unit_title="Unit Prof B",
+            unit_preview="...",
+            total_matched_cids=[card_id],
+            newly_unsuspended_cids=[],
+            rolled_back=0,
+            profile="UserB",
+        )
+        rec_legacy = RunRecord(
+            run_id="run_prof_legacy",
+            created_at=int(time.time()) - 10,
+            deck_name="Smart Search - Legacy",
+            filtered_did=10003,
+            source_decks=["DeckLegacy"],
+            unit_title="Unit Legacy",
+            unit_preview="...",
+            total_matched_cids=[],
+            newly_unsuspended_cids=[],
+            rolled_back=0,
+            profile="",
+        )
+        self.storage.save_run(rec_a)
+        self.storage.save_run(rec_b)
+        self.storage.save_run(rec_legacy)
+
+        # 2. Query runs with profile filtering
+        runs_a = self.storage.get_runs(profile="UserA")
+        run_ids_a = [r.run_id for r in runs_a]
+        self.assertIn("run_prof_a", run_ids_a)
+        self.assertIn("run_prof_legacy", run_ids_a)
+        self.assertNotIn("run_prof_b", run_ids_a)
+
+        runs_b = self.storage.get_runs(profile="UserB")
+        run_ids_b = [r.run_id for r in runs_b]
+        self.assertIn("run_prof_b", run_ids_b)
+        self.assertIn("run_prof_legacy", run_ids_b)
+        self.assertNotIn("run_prof_a", run_ids_b)
+
+        all_runs = self.storage.get_runs()
+        self.assertEqual(len(all_runs), 3)
+
+        # 3. Rollback refusal across profiles
+        with self.assertRaises(ValueError) as ctx:
+            rollback_run(
+                col=col,
+                storage=self.storage,
+                run_id="run_prof_a",
+                current_profile="UserB",
+            )
+        self.assertIn("Rollback rifiutato", str(ctx.exception))
+
+        # RollbackWorker also propagates error when profile mismatches
+        rb_worker_mismatch = RollbackWorker(
+            col=col,
+            storage=self.storage,
+            run_id="run_prof_a",
+            current_profile="UserB",
+        )
+        errors = []
+        rb_worker_mismatch.error_sig.connect(lambda err: errors.append(err))
+        rb_worker_mismatch.start()
+        rb_worker_mismatch.wait(timeout=5.0)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Rollback rifiutato", errors[0])
+
+        # 4. Rollback succeeds when profiles match or legacy
+        res_a = rollback_run(
+            col=col,
+            storage=self.storage,
+            run_id="run_prof_a",
+            current_profile="UserA",
+        )
+        self.assertEqual(res_a.run_id, "run_prof_a")
+
+        res_leg = rollback_run(
+            col=col,
+            storage=self.storage,
+            run_id="run_prof_legacy",
+            current_profile="UserA",
+        )
+        self.assertEqual(res_leg.run_id, "run_prof_legacy")
+
 
 if __name__ == "__main__":
     unittest.main()

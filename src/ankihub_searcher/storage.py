@@ -45,6 +45,7 @@ class RunRecord:
     already_active_cids: List[int] = field(default_factory=list)
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
     unit_error: str = ""
+    profile: str = ""
 
 
 def normalize_l2(vec: Sequence[float]) -> List[float]:
@@ -201,7 +202,8 @@ class SearchDatabase:
                     rolled_back INTEGER DEFAULT 0,
                     already_active_cids_json TEXT DEFAULT '[]',
                     concept_coverage_json TEXT DEFAULT '[]',
-                    unit_error TEXT DEFAULT ''
+                    unit_error TEXT DEFAULT '',
+                    profile TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -215,6 +217,8 @@ class SearchDatabase:
                 conn.execute("ALTER TABLE run_history ADD COLUMN concept_coverage_json TEXT DEFAULT '[]'")
             if "unit_error" not in existing_cols:
                 conn.execute("ALTER TABLE run_history ADD COLUMN unit_error TEXT DEFAULT ''")
+            if "profile" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     # ---------------- Note Content & FTS Operations ----------------
@@ -726,15 +730,16 @@ class SearchDatabase:
                     run_id, created_at, deck_name, filtered_did, source_decks_json,
                     unit_title, unit_preview, total_matched_cids_json,
                     newly_unsuspended_cids_json, rolled_back, already_active_cids_json,
-                    concept_coverage_json, unit_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    concept_coverage_json, unit_error, profile
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     deck_name=excluded.deck_name,
                     filtered_did=excluded.filtered_did,
                     rolled_back=excluded.rolled_back,
                     already_active_cids_json=excluded.already_active_cids_json,
                     concept_coverage_json=excluded.concept_coverage_json,
-                    unit_error=excluded.unit_error
+                    unit_error=excluded.unit_error,
+                    profile=excluded.profile
                 """,
                 (
                     record.run_id,
@@ -750,21 +755,32 @@ class SearchDatabase:
                     json.dumps(record.already_active_cids),
                     json.dumps(record.concept_coverage, ensure_ascii=False),
                     record.unit_error,
+                    record.profile,
                 ),
             )
             conn.commit()
 
-    def get_runs(self) -> List[RunRecord]:
-        """Retrieves all past runs sorted by created_at DESC."""
+    def get_runs(self, profile: Optional[str] = None) -> List[RunRecord]:
+        """Retrieves past runs sorted by created_at DESC.
+
+        If profile is provided, returns runs matching that profile PLUS legacy runs with profile = ''.
+        """
         with self._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM run_history ORDER BY created_at DESC")
+            if profile is not None and profile != "":
+                cur.execute(
+                    "SELECT * FROM run_history WHERE profile = ? OR profile = '' ORDER BY created_at DESC",
+                    (profile,),
+                )
+            else:
+                cur.execute("SELECT * FROM run_history ORDER BY created_at DESC")
             records = []
             for row in cur.fetchall():
                 row_keys = row.keys()
                 active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
                 cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
                 unit_err = row["unit_error"] if "unit_error" in row_keys else ""
+                prof = row["profile"] if "profile" in row_keys else ""
                 records.append(
                     RunRecord(
                         run_id=row["run_id"],
@@ -780,6 +796,7 @@ class SearchDatabase:
                         already_active_cids=json.loads(active_json or "[]"),
                         concept_coverage=json.loads(cov_json or "[]"),
                         unit_error=unit_err or "",
+                        profile=prof or "",
                     )
                 )
             return records
@@ -796,6 +813,7 @@ class SearchDatabase:
             active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
             cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
             unit_err = row["unit_error"] if "unit_error" in row_keys else ""
+            prof = row["profile"] if "profile" in row_keys else ""
             return RunRecord(
                 run_id=row["run_id"],
                 created_at=row["created_at"],
@@ -810,6 +828,7 @@ class SearchDatabase:
                 already_active_cids=json.loads(active_json or "[]"),
                 concept_coverage=json.loads(cov_json or "[]"),
                 unit_error=unit_err or "",
+                profile=prof or "",
             )
 
     def is_filtered_deck_in_active_run(self, deck_name: str, filtered_did: Optional[int] = None) -> bool:

@@ -169,6 +169,7 @@ class SearchBatchWorker(QThread):
         parent: Optional[Any] = None,
         precomputed_data: Optional[Dict[str, Any]] = None,
         main_thread_runner: Optional[Callable[[Callable[[], Any]], Any]] = None,
+        profile: str = "",
     ):
         super().__init__(parent)
         self.col = col
@@ -179,6 +180,7 @@ class SearchBatchWorker(QThread):
         self.base_deck_name = base_deck_name
         self.precomputed_data = precomputed_data
         self.main_thread_runner = main_thread_runner
+        self.profile = profile
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -329,6 +331,7 @@ class SearchBatchWorker(QThread):
                         storage=self.storage,
                         parent_deck_prefix=parent_deck_prefix,
                         allowed_cids=allowed_cids,
+                        profile=self.profile,
                     )
                     self.progress_sig.emit(total_units, total_units, "Completato con successo!")
                     self.finished_sig.emit(
@@ -367,6 +370,7 @@ class SearchBatchWorker(QThread):
                                 storage=self.storage,
                                 parent_deck_prefix=parent_deck_prefix,
                                 allowed_cids=allowed_cids,
+                                profile=self.profile,
                             )
                             op_results.extend(res)
                             return _get_op_changes(changes)
@@ -393,6 +397,7 @@ class SearchBatchWorker(QThread):
                             storage=self.storage,
                             parent_deck_prefix=parent_deck_prefix,
                             allowed_cids=allowed_cids,
+                            profile=self.profile,
                         )
                         self.progress_sig.emit(total_units, total_units, "Completato con successo!")
                         self.finished_sig.emit(
@@ -444,6 +449,7 @@ class RollbackWorker(QThread):
         keep_reviewed: bool = True,
         parent: Optional[Any] = None,
         main_thread_runner: Optional[Callable[[Callable[[], Any]], Any]] = None,
+        current_profile: str = "",
     ):
         super().__init__(parent)
         self.col = col
@@ -451,6 +457,7 @@ class RollbackWorker(QThread):
         self.run_id = run_id
         self.keep_reviewed = keep_reviewed
         self.main_thread_runner = main_thread_runner
+        self.current_profile = current_profile
 
     def run(self) -> None:
         try:
@@ -469,6 +476,7 @@ class RollbackWorker(QThread):
                         storage=self.storage,
                         run_id=self.run_id,
                         keep_reviewed=self.keep_reviewed,
+                        current_profile=self.current_profile,
                     )
                     self.finished_sig.emit(res)
                 except Exception as e:
@@ -498,6 +506,7 @@ class RollbackWorker(QThread):
                                 storage=self.storage,
                                 run_id=self.run_id,
                                 keep_reviewed=self.keep_reviewed,
+                                current_profile=self.current_profile,
                             )
                             rollback_holder.append(r)
                             return _get_op_changes(changes)
@@ -518,6 +527,7 @@ class RollbackWorker(QThread):
                             storage=self.storage,
                             run_id=self.run_id,
                             keep_reviewed=self.keep_reviewed,
+                            current_profile=self.current_profile,
                         )
                         self.finished_sig.emit(res)
                 except Exception as e:
@@ -533,6 +543,7 @@ class RollbackWorker(QThread):
                 storage=self.storage,
                 run_id=self.run_id,
                 keep_reviewed=self.keep_reviewed,
+                current_profile=self.current_profile,
             )
             self.finished_sig.emit(res)
         except Exception as e:

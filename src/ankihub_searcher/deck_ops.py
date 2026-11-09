@@ -134,6 +134,7 @@ def execute_unit_deck_creation(
     parent_deck_prefix: Optional[str] = None,
     allowed_cids: Optional[Set[int]] = None,
     unit_error: str = "",
+    profile: str = "",
 ) -> RunResult:
     """Unsuspends matching cards and builds a clean Filtered Deck with cid: search query."""
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -155,6 +156,7 @@ def execute_unit_deck_creation(
             already_active_cids=[],
             concept_coverage=[],
             unit_error=unit_error,
+            profile=profile,
         )
         storage.save_run(record)
         return RunResult(
@@ -212,6 +214,7 @@ def execute_unit_deck_creation(
                 rolled_back=0,
                 already_active_cids=active_cids,
                 concept_coverage=coverage_list,
+                profile=profile,
             )
             storage.save_run(record)
         return RunResult(
@@ -303,6 +306,7 @@ def execute_unit_deck_creation(
         rolled_back=0,
         already_active_cids=active_cids,
         concept_coverage=coverage_list,
+        profile=profile,
     )
     storage.save_run(record)
 
@@ -324,6 +328,7 @@ def rollback_run(
     storage: SearchDatabase,
     run_id: str,
     keep_reviewed: bool = True,
+    current_profile: str = "",
 ) -> RollbackResult:
     """Safely undoes a run:
 
@@ -338,6 +343,11 @@ def rollback_run(
             deck_removed=False,
             resuspended_count=0,
             kept_reviewed_count=0,
+        )
+
+    if record.profile and current_profile and record.profile != current_profile:
+        raise ValueError(
+            f"Rollback rifiutato: il run appartiene al profilo '{record.profile}', mentre il profilo aperto è '{current_profile}'."
         )
 
     # 1. Empty and remove the Filtered Deck first (strictly verify dyn == 1!)
@@ -536,6 +546,7 @@ def create_batch_filtered_decks_op(
     storage: SearchDatabase,
     parent_deck_prefix: Optional[str] = None,
     allowed_cids: Optional[Set[int]] = None,
+    profile: str = "",
 ) -> Tuple[List[RunResult], Any]:
     """Applies deck creation and card unsuspension for multiple units in a single custom undo entry.
 
@@ -562,6 +573,7 @@ def create_batch_filtered_decks_op(
             parent_deck_prefix=parent_deck_prefix,
             allowed_cids=allowed_cids,
             unit_error=item.get("unit_error", ""),
+            profile=item.get("profile", profile),
         )
         results.append(run_res)
 
@@ -580,6 +592,7 @@ def rollback_run_op(
     storage: SearchDatabase,
     run_id: str,
     keep_reviewed: bool = True,
+    current_profile: str = "",
 ) -> Tuple[RollbackResult, Any]:
     """Rolls back a run within a custom undo entry.
 
@@ -597,6 +610,7 @@ def rollback_run_op(
         storage=storage,
         run_id=run_id,
         keep_reviewed=keep_reviewed,
+        current_profile=current_profile,
     )
 
     changes = None

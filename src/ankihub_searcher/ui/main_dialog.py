@@ -93,6 +93,17 @@ from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 CURRENT_VERSION = "0.2.0"
 
 
+def _get_current_profile_name() -> str:
+    """Returns the current profile name from Anki if available, or empty string."""
+    try:
+        from aqt import mw
+        if mw and hasattr(mw, "pm") and hasattr(mw.pm, "name"):
+            return str(mw.pm.name or "")
+    except Exception:
+        pass
+    return ""
+
+
 # =====================================================================
 # 1. SEARCH DIALOG (Compact Main Window)
 # =====================================================================
@@ -459,6 +470,7 @@ class SearchDialog(QDialog):
             raw_text=raw_text,
             base_deck_name=self.txt_base_deck.text().strip(),
             precomputed_data=presearch_data,
+            profile=_get_current_profile_name(),
         )
         self.search_worker.progress_sig.connect(self._on_search_progress)
         self.search_worker.finished_sig.connect(self._on_search_finished)
@@ -591,6 +603,7 @@ class HistoryDialog(QDialog):
         self.col = col or (mw.col if mw else None)
         self.config = ConfigManager.load()
         self.storage = SearchDatabase()
+        self.current_profile = _get_current_profile_name()
 
         self.setWindowTitle("Smart Search — Cronologia")
         self.resize(720, 420)
@@ -654,7 +667,7 @@ class HistoryDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def _refresh_history(self) -> None:
-        runs = self.storage.get_runs()
+        runs = self.storage.get_runs(profile=self.current_profile)
         self.history_table.setRowCount(len(runs))
 
         for row_idx, r in enumerate(runs):
@@ -666,6 +679,9 @@ class HistoryDialog(QDialog):
                 status_str = "Annullata"
             else:
                 status_str = "Attiva"
+
+            if not r.profile:
+                status_str += " [⚠️ senza profilo]"
 
             cov_list = getattr(r, "concept_coverage", None) or []
             if cov_list:
@@ -688,6 +704,8 @@ class HistoryDialog(QDialog):
             item_status = QTableWidgetItem(status_str)
             if unit_err:
                 item_status.setToolTip(unit_err)
+            elif not r.profile:
+                item_status.setToolTip("Run salvata senza indicazione del profilo (versione precedente).")
             self.history_table.setItem(row_idx, 7, item_status)
 
     def _get_selected_run_id(self) -> Optional[str]:
@@ -712,6 +730,26 @@ class HistoryDialog(QDialog):
             QMessageBox.information(self, "Info", "Questa run è già stata annullata in precedenza.")
             return
 
+        if run_rec.profile and self.current_profile and run_rec.profile != self.current_profile:
+            QMessageBox.critical(
+                self,
+                "Rollback Rifiutato",
+                f"Impossibile annullare questa run: appartiene al profilo '{run_rec.profile}', "
+                f"mentre il profilo aperto è '{self.current_profile}'.",
+            )
+            return
+
+        if not run_rec.profile:
+            warn_reply = QMessageBox.warning(
+                self,
+                "Attenzione: Run Precedente",
+                "Questa run è stata salvata senza indicazione del profilo (versione precedente).\n\n"
+                "Vuoi procedere comunque con il rollback sul profilo aperto?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if warn_reply != QMessageBox.StandardButton.Yes:
+                return
+
         keep_rev = self.chk_keep_reviewed.isChecked()
         reply = QMessageBox.question(
             self,
@@ -730,6 +768,7 @@ class HistoryDialog(QDialog):
             storage=self.storage,
             run_id=run_id,
             keep_reviewed=keep_rev,
+            current_profile=self.current_profile,
         )
         self.rollback_worker.finished_sig.connect(self._on_rollback_finished)
         self.rollback_worker.error_sig.connect(self._on_rollback_error)
@@ -759,6 +798,15 @@ class HistoryDialog(QDialog):
 
         run_rec = self.storage.get_run(run_id)
         if not run_rec:
+            return
+
+        if run_rec.profile and self.current_profile and run_rec.profile != self.current_profile:
+            QMessageBox.critical(
+                self,
+                "Azione Rifiutata",
+                f"Impossibile modificare questa run: appartiene al profilo '{run_rec.profile}', "
+                f"mentre il profilo aperto è '{self.current_profile}'.",
+            )
             return
 
         reply = QMessageBox.question(
