@@ -29,7 +29,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "embed_language_strategy": "translate_to_en",
     "sensitivity": 0.55,
     "top_k_per_concept": 8,
-    "max_cards_per_unit": 80,
+    "relative_score_window": 0.08,
+    "max_notes_per_concept": 30,
+    "max_cards_per_unit": 150,
     "hybrid_dense_weight": 0.78,
     "enable_llm_verification": False,
     "include_active_cards_in_filtered_deck": False,
@@ -75,7 +77,9 @@ class ConfigManager:
     embed_language_strategy: str = DEFAULT_CONFIG["embed_language_strategy"]
 
     sensitivity: float = float(DEFAULT_CONFIG["sensitivity"])
-    top_k_per_concept: int = int(DEFAULT_CONFIG["top_k_per_concept"])
+    top_k_per_concept: int = int(DEFAULT_CONFIG.get("top_k_per_concept", 8))
+    relative_score_window: float = float(DEFAULT_CONFIG["relative_score_window"])
+    max_notes_per_concept: int = int(DEFAULT_CONFIG["max_notes_per_concept"])
     max_cards_per_unit: int = int(DEFAULT_CONFIG["max_cards_per_unit"])
     hybrid_dense_weight: float = float(DEFAULT_CONFIG["hybrid_dense_weight"])
     enable_llm_verification: bool = bool(DEFAULT_CONFIG["enable_llm_verification"])

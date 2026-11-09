@@ -307,7 +307,8 @@ class SmartSearchPipeline:
         # Semantic floor: prevents purely lexical hits with 0 semantic relation
         min_dense_floor = max(0.20, min_threshold - 0.18)
         alpha = self.config.hybrid_dense_weight
-        effective_top_k = self.config.get_effective_top_k()
+        rel_window = getattr(self.config, "relative_score_window", 0.08)
+        max_notes_concept = getattr(self.config, "max_notes_per_concept", 30)
 
         # Track results per note: nid -> {"scores": [float], "concepts": [str]}
         notes_agg: Dict[int, Dict[str, Any]] = {}
@@ -365,37 +366,42 @@ class SmartSearchPipeline:
                 if combined >= min_threshold:
                     concept_candidates.append((nid, combined))
 
-            # Keep top-K for this concept.
-            # When include_active_cards_in_filtered_deck is False and suspended_nids is provided,
-            # already-active notes do NOT steal top-K slots from suspended notes!
             concept_candidates.sort(key=lambda x: x[1], reverse=True)
-            if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
-                top_concept_candidates: List[Tuple[int, float]] = []
-                susp_kept = 0
-                active_kept = 0
-                for nid, score in concept_candidates:
-                    if nid in suspended_nids:
-                        if susp_kept < effective_top_k:
-                            top_concept_candidates.append((nid, score))
-                            susp_kept += 1
-                    else:
-                        if active_kept < effective_top_k:
-                            top_concept_candidates.append((nid, score))
-                            active_kept += 1
-                    if susp_kept >= effective_top_k and active_kept >= effective_top_k:
-                        break
-            else:
-                top_concept_candidates = concept_candidates[:effective_top_k]
 
-            # Record per-concept coverage metrics
+            # Record per-concept coverage metrics and apply relative score window cutoff
             best_nid: Optional[int] = None
             best_score: float = 0.0
             if concept_candidates:
                 best_nid, best_score = concept_candidates[0][0], round(concept_candidates[0][1], 4)
-            elif dense_hits:
-                top_d_nid, top_d_score = dense_hits[0]
-                best_nid = top_d_nid
-                best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
+                rel_cutoff = max(min_threshold, best_score - rel_window)
+                surviving_candidates = [c for c in concept_candidates if c[1] >= rel_cutoff]
+            else:
+                surviving_candidates = []
+                if dense_hits:
+                    top_d_nid, top_d_score = dense_hits[0]
+                    best_nid = top_d_nid
+                    best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
+
+            # Keep notes up to max_notes_per_concept for this concept.
+            # When include_active_cards_in_filtered_deck is False and suspended_nids is provided,
+            # already-active notes do NOT steal slots from suspended notes!
+            if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
+                top_concept_candidates: List[Tuple[int, float]] = []
+                susp_kept = 0
+                active_kept = 0
+                for nid, score in surviving_candidates:
+                    if nid in suspended_nids:
+                        if susp_kept < max_notes_concept:
+                            top_concept_candidates.append((nid, score))
+                            susp_kept += 1
+                    else:
+                        if active_kept < max_notes_concept:
+                            top_concept_candidates.append((nid, score))
+                            active_kept += 1
+                    if susp_kept >= max_notes_concept and active_kept >= max_notes_concept:
+                        break
+            else:
+                top_concept_candidates = surviving_candidates[:max_notes_concept]
 
             matched_c_nids = [nid for nid, _ in top_concept_candidates]
             matched_cnt = len(matched_c_nids)

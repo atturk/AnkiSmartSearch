@@ -582,7 +582,7 @@ I should decompose this into atomic concepts.
         self.storage.upsert_notes_content_batch(
             [
                 (801, 1, 100, "h801", "NLRP3 inflammasome activates IL-1beta in gout.", "Pathology"),
-                (802, 1, 100, "h802", "Monosodium urate crystals trigger NLRP3 inflammasome.", "Pathology"),
+                (802, 1, 100, "h802", "Monosodium urate crystals trigger NLRP3 inflammasome in gout.", "Pathology"),
             ]
         )
         self.storage.save_embeddings_batch(
@@ -938,6 +938,72 @@ I should decompose this into atomic concepts.
             "L'eparina attiva l'antitrombina III inibendo la trombina.",
         )
         col.conn.close()
+
+    def test_relative_score_window_selection(self):
+        # Test relative score window cutoff and max_notes_per_concept
+        config = ConfigManager(
+            sensitivity=0.55,  # threshold ~0.515
+            relative_score_window=0.08,
+            max_notes_per_concept=2,
+            max_cards_per_unit=150,
+        )
+        self.assertEqual(config.relative_score_window, 0.08)
+        self.assertEqual(config.max_notes_per_concept, 2)
+        self.assertEqual(config.max_cards_per_unit, 150)
+
+        # Migration check: legacy config with only top_k_per_concept
+        legacy_data = {"top_k_per_concept": 5}
+        cfg_legacy = ConfigManager()
+        cfg_legacy.update(legacy_data)
+        self.assertEqual(cfg_legacy.top_k_per_concept, 5)
+        self.assertEqual(cfg_legacy.relative_score_window, 0.08)
+        self.assertEqual(cfg_legacy.max_notes_per_concept, 30)
+
+        model_id = config.get_active_model_id()
+        # Seed 4 notes with different similarity levels:
+        # Note 701: score ~0.90 (best)
+        # Note 702: score ~0.85 (diff 0.05 <= 0.08: INCLUDED)
+        # Note 703: score ~0.84 (diff 0.06 <= 0.08: would be included by window, but max_notes_per_concept=2 drops it!)
+        # Note 704: score ~0.70 (diff 0.20 > 0.08: EXCLUDED by relative window even though > 0.515 threshold)
+        self.storage.upsert_notes_content_batch(
+            [
+                (701, 1, 100, "h701", "Beta-blocker card 1", "Pharm"),
+                (702, 1, 100, "h702", "Beta-blocker card 2", "Pharm"),
+                (703, 1, 100, "h703", "Beta-blocker card 3", "Pharm"),
+                (704, 1, 100, "h704", "Beta-blocker card 4", "Pharm"),
+            ]
+        )
+        self.storage.save_embeddings_batch(
+            [
+                (701, model_id, "h701", 2, [0.90, 0.4358]),
+                (702, model_id, "h702", 2, [0.85, 0.5267]),
+                (703, model_id, "h703", 2, [0.84, 0.5425]),
+                (704, model_id, "h704", 2, [0.70, 0.7141]),
+            ]
+        )
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [
+                {
+                    "quote_it": "Beta bloccanti",
+                    "topic_it": "Beta bloccanti",
+                    "claim_en": "Beta blockers mechanism",
+                    "keywords_en": ["beta-blocker"],
+                    "keywords_it": [],
+                }
+            ]
+        }
+        # Query vector aligned with [1.0, 0.0]
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        pipeline = SmartSearchPipeline(config, self.storage, mock_ai)
+        unit = LectureUnit("Beta", "Beta Deck", "Beta bloccanti")
+        scored = pipeline.search_unit(unit, candidate_nids=[701, 702, 703, 704], active_model_id=model_id)
+        scored_nids = [s.nid for s in scored]
+
+        # Best is 701, next within window is 702. 703 dropped by max_notes_per_concept=2. 704 dropped by relative window.
+        self.assertEqual(scored_nids, [701, 702])
 
 
 if __name__ == "__main__":
