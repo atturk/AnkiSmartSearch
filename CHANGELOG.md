@@ -2,6 +2,19 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.5.0] - 2026-11-09
+
+### Novità
+- **Modalità "Keyword" (lite senza LLM):** Nuova modalità di ricerca veloce senza chiamate al modello chat. Inserisci direttamente le parole chiave mediche da cercare, una per riga. Ogni keyword viene vettorizzata singolarmente con il modello di embedding e usata esattamente come un concetto estratto (stessa selezione: soglia minima, finestra punteggio relativo, max note/concetto, max carte/unità, assegnazione esclusiva tra unità, mazzi filtrati, cronologia e rollback).
+- **Pannello di ricerca con due schede ("Keyword" e "Testo"):** Il dialogo principale offre ora due schede: "Keyword" (predefinita all'avvio) e "Testo" (ricerca estesa con decomposizione tramite LLM). La scheda utilizzata viene ricordata all'avvio della ricerca successiva (`search_input_mode`).
+- **Parsing intelligente delle keyword:** Rimozione automatica dei marcatori di elenco (`-`, `*`, `+`, `•`, `1.`, `1)`), spazi, virgole e punti e virgola finali, deduplicazione case-insensitive con ordine e grafia originale preservati, e normalizzazione automatica dei simboli e caratteri greci LaTeX inline.
+- **Supporto multi-unità Markdown in modalità Keyword:** È possibile strutturare le keyword con intestazioni Markdown (`# Unità 1`, `## Sottounità 2`) per generare batch di mazzi filtrati separati per ciascuna sezione, scartando automaticamente le sezioni prive di keyword.
+- **Soglia keyword indipendente (default 0.52):** Nuova impostazione `keyword_min_similarity` (configurabile con `QDoubleSpinBox` 0.30–0.90 nella scheda "Ricerca" delle Impostazioni), separata dalla sensibilità della modalità Testo. L'anteprima sull'ultima ricerca adotta automaticamente la soglia keyword per ricerche eseguite tramite keyword. Migrazione automatica a `config_version = 5`.
+- **Riepilogo e copertura specifici:** Conteggio trasparente con etichetta "Copertura keyword" sia nel riepilogo finale che nella finestra dettagliata di copertura quando si cercano keyword.
+- **Correzioni a "Riprova più stretto":** Risolti bug su `self.profile` e `self.txt_deck_name`. "Riprova più stretto" mantiene ora la modalità della ricerca precedente (Keyword o Testo), calcola la soglia partendo da quella della modalità + 0.03 e preserva la sorgente `source` ("keyword" o "llm") dei concetti precomputati.
+
+---
+
 ## [0.4.0] - 2026-11-09
 
 ### Novità

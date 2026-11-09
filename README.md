@@ -8,7 +8,13 @@ Paste your Italian lecture unit (or an entire Markdown document with multiple un
 
 ## ✨ Key Features
 
-- **🔬 3-Stage Hybrid Medical Search:**
+- **⚡ Modalità "Keyword" (Lite, senza LLM):**
+  - Cerca rapidamente inserendo a mano una lista di keyword mediche, **una per riga**.
+  - **Zero token chat:** Ogni keyword viene vettorizzata da sola con il modello di embedding locale o remoto e cercata direttamente tra le note senza richiedere chiamate LLM di decomposizione.
+  - **Parsing flessibile:** Riconosce ed elimina automaticamente marcatori di elenco (`-`, `*`, `+`, `•`, `1.`, `1)`), spazi e punteggiatura finale; deduplica preservando la prima grafia; normalizza il LaTeX inline.
+  - **Multi-unità Markdown:** Usa le intestazioni Markdown (`# Unità 1`, `## Sezione 2`) sopra le keyword per generare mazzi filtrati distinti in un unico passaggio batch.
+  - 💡 *Consiglio:* Le keyword in **inglese** (es. `chylomicrons`, `LDL receptor`, `PCSK9 inhibitor`) ottengono punteggi di similarità più alti (top 0.60–0.74) rispetto all'italiano (0.45–0.57). Soglia keyword predefinita: `0.52`.
+- **🔬 3-Stage Hybrid Medical Search (Modalità "Testo"):**
   1. **Stage 1 — LLM Concept Decomposition:** Breaks down dense Italian paragraphs into atomic English USMLE claims & medical keywords (supports **LM Studio** locally and **OpenRouter** / OpenAI-compatible APIs remotely).
   2. **Stage 2 — Dense Embeddings + SQLite FTS5 BM25:** Combines vector cosine similarity with tokenized BM25 keyword ranking.
   3. **Stage 3 — Optional LLM Verification:** Reranks and filters candidate cards to remove false positives.
