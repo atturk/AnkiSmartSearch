@@ -31,6 +31,7 @@ from ankihub_searcher.search_pipeline import (
     SmartSearchPipeline,
     Stage1ExtractionError,
     extract_first_sentence,
+    select_candidates_for_concept,
 )
 from ankihub_searcher.storage import (
     RunRecord,
@@ -2132,6 +2133,133 @@ I should decompose this into atomic concepts.
             pipe2 = SmartSearchPipeline(cfg_hybrid, self.storage, mock_ai)
             pipe2.retrieve_for_concepts([concept], active_model_id="test-model", candidate_nids={101})
             mock_fts.assert_called_once()
+
+    def test_selection_function_refactor_and_preview_logic(self):
+        # 1. Pure function select_candidates_for_concept
+        dense_scores = {101: 0.85, 102: 0.82, 103: 0.70, 104: 0.55}
+        fts_scores = {}
+        # Tight window 0.05 -> cutoff is 0.80
+        candidates, best_nid, best_score = select_candidates_for_concept(
+            dense_scores=dense_scores,
+            fts_scores=fts_scores,
+            alpha=1.0,
+            min_threshold=0.60,
+            min_dense_floor=0.42,
+            rel_window=0.05,
+            max_notes_concept=10,
+        )
+        self.assertEqual(best_nid, 101)
+        self.assertEqual(best_score, 0.85)
+        self.assertEqual([c[0] for c in candidates], [101, 102])
+
+        # Wider window 0.20 -> cutoff is 0.65 -> 101, 102, 103 survive
+        candidates_wide, _, _ = select_candidates_for_concept(
+            dense_scores=dense_scores,
+            fts_scores=fts_scores,
+            alpha=1.0,
+            min_threshold=0.60,
+            min_dense_floor=0.42,
+            rel_window=0.20,
+            max_notes_concept=10,
+        )
+        self.assertEqual([c[0] for c in candidates_wide], [101, 102, 103])
+
+        # 2. Reusable retrieve_for_concepts with explicit parameters
+        mid = "model_test_preview"
+        self.storage.upsert_notes_content_batch(
+            [
+                (201, 1, 100, "h201", "Text about acute appendicitis signs.", "GI"),
+                (202, 1, 100, "h202", "Text about appendectomy surgical technique.", "Surgery"),
+            ]
+        )
+        self.storage.save_embeddings_batch(
+            [
+                (201, mid, "h201", 2, [1.0, 0.0]),
+                (202, mid, "h202", 2, [0.72, 0.69]),  # lower similarity (~0.72)
+            ]
+        )
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+        cfg = ConfigManager()  # default threshold 0.60
+        pipeline = SmartSearchPipeline(cfg, self.storage, mock_ai)
+
+        concept = ExtractedConcept(
+            topic_it="Appendicite acuta",
+            claim_en="Acute appendicitis clinical signs include McBurney point tenderness.",
+            keywords_en=["appendicitis", "McBurney point"],
+            keywords_it=["appendicite"],
+            quote_it="Appendicite acuta punto di McBurney.",
+        )
+
+        # Call with default config -> both 201 and 202 could pass if within window
+        # Call with strict explicit parameter min_threshold=0.80 -> only 201 should pass
+        res_strict = pipeline.retrieve_for_concepts(
+            concepts=[concept],
+            active_model_id=mid,
+            candidate_nids={201, 202},
+            min_threshold=0.80,
+        )
+        self.assertEqual([n.nid for n in res_strict], [201])
+
+        # 3. Test storage search_id and get_latest_search_runs
+        run1 = RunRecord(
+            run_id="run_batch1_u1",
+            created_at=1000,
+            deck_name="Deck 1",
+            filtered_did=10,
+            source_decks=["Test"],
+            unit_title="Unit 1",
+            unit_preview="...",
+            total_matched_cids=[1],
+            newly_unsuspended_cids=[1],
+            rolled_back=0,
+            concept_coverage=[concept.__dict__],
+            search_id="batch_alpha",
+        )
+        run2 = RunRecord(
+            run_id="run_batch1_u2",
+            created_at=1001,
+            deck_name="Deck 2",
+            filtered_did=20,
+            source_decks=["Test"],
+            unit_title="Unit 2",
+            unit_preview="...",
+            total_matched_cids=[2],
+            newly_unsuspended_cids=[2],
+            rolled_back=0,
+            concept_coverage=[concept.__dict__],
+            search_id="batch_alpha",
+        )
+        self.storage.save_run(run1)
+        self.storage.save_run(run2)
+
+        latest_runs = self.storage.get_latest_search_runs()
+        self.assertEqual(len(latest_runs), 2)
+        self.assertEqual({r.run_id for r in latest_runs}, {"run_batch1_u1", "run_batch1_u2"})
+
+        # 4. Test preview re-use without chat calls
+        saved_cov = latest_runs[0].concept_coverage
+        reconstructed_concepts = [
+            ExtractedConcept(
+                topic_it=c["topic_it"],
+                claim_en=c["claim_en"],
+                keywords_en=c["keywords_en"],
+                keywords_it=c.get("keywords_it", []),
+                quote_it=c.get("quote_it", ""),
+            )
+            for c in saved_cov
+        ]
+        preview_res = pipeline.retrieve_for_concepts(
+            concepts=reconstructed_concepts,
+            active_model_id=mid,
+            candidate_nids={201, 202},
+            min_threshold=0.60,
+            relative_score_window=0.05,
+        )
+        self.assertTrue(len(preview_res) >= 1)
+        mock_ai.chat_completion_json.assert_not_called()
+
 
 
 

@@ -46,6 +46,7 @@ class RunRecord:
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
     unit_error: str = ""
     profile: str = ""
+    search_id: str = ""
 
 
 def normalize_l2(vec: Sequence[float]) -> List[float]:
@@ -203,7 +204,8 @@ class SearchDatabase:
                     already_active_cids_json TEXT DEFAULT '[]',
                     concept_coverage_json TEXT DEFAULT '[]',
                     unit_error TEXT DEFAULT '',
-                    profile TEXT NOT NULL DEFAULT ''
+                    profile TEXT NOT NULL DEFAULT '',
+                    search_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -219,6 +221,8 @@ class SearchDatabase:
                 conn.execute("ALTER TABLE run_history ADD COLUMN unit_error TEXT DEFAULT ''")
             if "profile" not in existing_cols:
                 conn.execute("ALTER TABLE run_history ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
+            if "search_id" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN search_id TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     # ---------------- Note Content & FTS Operations ----------------
@@ -730,8 +734,8 @@ class SearchDatabase:
                     run_id, created_at, deck_name, filtered_did, source_decks_json,
                     unit_title, unit_preview, total_matched_cids_json,
                     newly_unsuspended_cids_json, rolled_back, already_active_cids_json,
-                    concept_coverage_json, unit_error, profile
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    concept_coverage_json, unit_error, profile, search_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     deck_name=excluded.deck_name,
                     filtered_did=excluded.filtered_did,
@@ -739,7 +743,8 @@ class SearchDatabase:
                     already_active_cids_json=excluded.already_active_cids_json,
                     concept_coverage_json=excluded.concept_coverage_json,
                     unit_error=excluded.unit_error,
-                    profile=excluded.profile
+                    profile=excluded.profile,
+                    search_id=excluded.search_id
                 """,
                 (
                     record.run_id,
@@ -756,24 +761,27 @@ class SearchDatabase:
                     json.dumps(record.concept_coverage, ensure_ascii=False),
                     record.unit_error,
                     record.profile,
+                    record.search_id,
                 ),
             )
             conn.commit()
 
-    def get_runs(self, profile: Optional[str] = None) -> List[RunRecord]:
+    def get_runs(self, profile: Optional[str] = None, limit: Optional[int] = None) -> List[RunRecord]:
         """Retrieves past runs sorted by created_at DESC.
 
         If profile is provided, returns runs matching that profile PLUS legacy runs with profile = ''.
         """
         with self._get_connection() as conn:
             cur = conn.cursor()
+            query = "SELECT * FROM run_history"
+            params: List[Any] = []
             if profile is not None and profile != "":
-                cur.execute(
-                    "SELECT * FROM run_history WHERE profile = ? OR profile = '' ORDER BY created_at DESC",
-                    (profile,),
-                )
-            else:
-                cur.execute("SELECT * FROM run_history ORDER BY created_at DESC")
+                query += " WHERE profile = ? OR profile = ''"
+                params.append(profile)
+            query += " ORDER BY created_at DESC"
+            if limit is not None and limit > 0:
+                query += f" LIMIT {int(limit)}"
+            cur.execute(query, params)
             records = []
             for row in cur.fetchall():
                 row_keys = row.keys()
@@ -781,6 +789,7 @@ class SearchDatabase:
                 cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
                 unit_err = row["unit_error"] if "unit_error" in row_keys else ""
                 prof = row["profile"] if "profile" in row_keys else ""
+                s_id = row["search_id"] if "search_id" in row_keys else ""
                 records.append(
                     RunRecord(
                         run_id=row["run_id"],
@@ -797,9 +806,58 @@ class SearchDatabase:
                         concept_coverage=json.loads(cov_json or "[]"),
                         unit_error=unit_err or "",
                         profile=prof or "",
+                        search_id=s_id or "",
                     )
                 )
             return records
+
+    def get_runs_by_search_id(self, search_id: str) -> List[RunRecord]:
+        """Retrieves all run records belonging to a search batch by search_id."""
+        if not search_id:
+            return []
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM run_history WHERE search_id = ? ORDER BY created_at ASC", (search_id,))
+            records = []
+            for row in cur.fetchall():
+                row_keys = row.keys()
+                active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
+                cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
+                unit_err = row["unit_error"] if "unit_error" in row_keys else ""
+                prof = row["profile"] if "profile" in row_keys else ""
+                s_id = row["search_id"] if "search_id" in row_keys else ""
+                records.append(
+                    RunRecord(
+                        run_id=row["run_id"],
+                        created_at=row["created_at"],
+                        deck_name=row["deck_name"],
+                        filtered_did=row["filtered_did"],
+                        source_decks=json.loads(row["source_decks_json"]),
+                        unit_title=row["unit_title"],
+                        unit_preview=row["unit_preview"],
+                        total_matched_cids=json.loads(row["total_matched_cids_json"]),
+                        newly_unsuspended_cids=json.loads(row["newly_unsuspended_cids_json"]),
+                        rolled_back=row["rolled_back"],
+                        already_active_cids=json.loads(active_json or "[]"),
+                        concept_coverage=json.loads(cov_json or "[]"),
+                        unit_error=unit_err or "",
+                        profile=prof or "",
+                        search_id=s_id or "",
+                    )
+                )
+            return records
+
+    def get_latest_search_runs(self, profile: Optional[str] = None) -> List[RunRecord]:
+        """Retrieves all run records from the most recent search batch."""
+        all_runs = self.get_runs(profile=profile, limit=50)
+        if not all_runs:
+            return []
+        latest_run = all_runs[0]
+        if latest_run.search_id:
+            return self.get_runs_by_search_id(latest_run.search_id)
+        # Fallback for legacy runs without search_id: group runs created within 5 seconds
+        target_time = latest_run.created_at
+        return [r for r in all_runs if abs(r.created_at - target_time) <= 5]
 
     def get_run(self, run_id: str) -> Optional[RunRecord]:
         """Retrieves a single run record by run_id."""
@@ -814,6 +872,7 @@ class SearchDatabase:
             cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
             unit_err = row["unit_error"] if "unit_error" in row_keys else ""
             prof = row["profile"] if "profile" in row_keys else ""
+            s_id = row["search_id"] if "search_id" in row_keys else ""
             return RunRecord(
                 run_id=row["run_id"],
                 created_at=row["created_at"],
@@ -829,6 +888,7 @@ class SearchDatabase:
                 concept_coverage=json.loads(cov_json or "[]"),
                 unit_error=unit_err or "",
                 profile=prof or "",
+                search_id=s_id or "",
             )
 
     def is_filtered_deck_in_active_run(self, deck_name: str, filtered_did: Optional[int] = None) -> bool:

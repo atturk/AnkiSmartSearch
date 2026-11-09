@@ -23,6 +23,7 @@ try:
         QCheckBox,
         QComboBox,
         QDialog,
+        QDoubleSpinBox,
         QFileDialog,
         QGroupBox,
         QHBoxLayout,
@@ -36,6 +37,7 @@ try:
         QProgressBar,
         QPushButton,
         QSlider,
+        QSpinBox,
         QTableWidget,
         QTableWidgetItem,
         QTimer,
@@ -53,6 +55,7 @@ except ImportError:
             QCheckBox,
             QComboBox,
             QDialog,
+            QDoubleSpinBox,
             QFileDialog,
             QGroupBox,
             QHBoxLayout,
@@ -66,6 +69,7 @@ except ImportError:
             QProgressBar,
             QPushButton,
             QSlider,
+            QSpinBox,
             QTableWidget,
             QTableWidgetItem,
             QTreeWidget,
@@ -95,6 +99,7 @@ except ImportError:
         QCheckBox = _HeadlessWidget  # type: ignore
         QComboBox = _HeadlessWidget  # type: ignore
         QDialog = _HeadlessWidget  # type: ignore
+        QDoubleSpinBox = _HeadlessWidget  # type: ignore
         QFileDialog = _HeadlessWidget  # type: ignore
         QGroupBox = _HeadlessWidget  # type: ignore
         QHBoxLayout = _HeadlessWidget  # type: ignore
@@ -108,6 +113,7 @@ except ImportError:
         QProgressBar = _HeadlessWidget  # type: ignore
         QPushButton = _HeadlessWidget  # type: ignore
         QSlider = _HeadlessWidget  # type: ignore
+        QSpinBox = _HeadlessWidget  # type: ignore
         QTableWidget = _HeadlessWidget  # type: ignore
         QTableWidgetItem = _HeadlessWidget  # type: ignore
         QTreeWidget = _HeadlessWidget  # type: ignore
@@ -121,8 +127,9 @@ except ImportError:
 
 from ..ai_client import OpenAICompatibleClient
 from ..config_manager import ConfigManager
-from ..deck_ops import _get_op_changes, delete_filtered_deck_only, delete_filtered_deck_only_op
+from ..deck_ops import _get_op_changes, delete_filtered_deck_only, delete_filtered_deck_only_op, resolve_notes_to_cards
 from ..indexer import DeckIndexer, collect_presearch_data
+from ..search_pipeline import ExtractedConcept, SmartSearchPipeline
 from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
@@ -1203,31 +1210,77 @@ class SettingsDialog(QDialog):
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
 
-        # 1. Parametri di Ricerca
-        search_group = QGroupBox("Parametri di Ricerca")
-        search_layout = QVBoxLayout(search_group)
+        # 1. Selezione carte
+        select_group = QGroupBox("Selezione carte")
+        select_layout = QVBoxLayout(select_group)
 
-        # Sensitivity slider
-        sens_row = QHBoxLayout()
-        sens_row.addWidget(QLabel("Sensibilità ricerca:"))
-        self.slider_sens = QSlider(Qt.Orientation.Horizontal)
-        self.slider_sens.setRange(10, 95)
-        self.slider_sens.setValue(int(self.config.sensitivity * 100))
-        self.slider_sens.valueChanged.connect(self._on_sens_slider_changed)
-        sens_row.addWidget(self.slider_sens)
+        # Slider soglia: "Ampio" ↔ "Preciso", con valore effettivo
+        thresh_header = QHBoxLayout()
+        thresh_header.addWidget(QLabel("Soglia minima di similarità:"))
+        self.lbl_thresh_val = QLabel("0.60")
+        thresh_header.addStretch()
+        thresh_header.addWidget(self.lbl_thresh_val)
+        select_layout.addLayout(thresh_header)
 
-        thresh = round(0.70 - self.config.sensitivity * 0.20, 2)
-        self.lbl_sens_val = QLabel(f"{int(self.config.sensitivity * 100)}% (soglia ~{thresh:.2f})")
-        sens_row.addWidget(self.lbl_sens_val)
-        search_layout.addLayout(sens_row)
+        thresh_row = QHBoxLayout()
+        thresh_row.addWidget(QLabel("Ampio"))
+        self.slider_thresh = QSlider(Qt.Orientation.Horizontal)
+        self.slider_thresh.setRange(50, 70)
+        self.slider_thresh.setValue(60)
+        self.slider_thresh.valueChanged.connect(self._on_thresh_slider_changed)
+        thresh_row.addWidget(self.slider_thresh)
+        thresh_row.addWidget(QLabel("Preciso"))
+        select_layout.addLayout(thresh_row)
 
+        # max_notes_per_concept & relative_score_window
+        row_params = QHBoxLayout()
+        row_params.addWidget(QLabel("Max note per concetto:"))
+        self.spin_max_notes = QSpinBox()
+        self.spin_max_notes.setRange(1, 50)
+        self.spin_max_notes.setValue(getattr(self.config, "max_notes_per_concept", 10))
+        row_params.addWidget(self.spin_max_notes)
+
+        row_params.addSpacing(15)
+        row_params.addWidget(QLabel("Finestra punteggio relativo:"))
+        self.spin_rel_window = QDoubleSpinBox()
+        self.spin_rel_window.setRange(0.01, 0.30)
+        self.spin_rel_window.setSingleStep(0.01)
+        self.spin_rel_window.setDecimals(2)
+        self.spin_rel_window.setValue(getattr(self.config, "relative_score_window", 0.05))
+        row_params.addWidget(self.spin_rel_window)
+        select_layout.addLayout(row_params)
+
+        # max_cards_per_unit & fts sì/no
+        row_params2 = QHBoxLayout()
+        row_params2.addWidget(QLabel("Max carte per unità:"))
+        self.spin_max_cards = QSpinBox()
+        self.spin_max_cards.setRange(10, 500)
+        self.spin_max_cards.setSingleStep(10)
+        self.spin_max_cards.setValue(getattr(self.config, "max_cards_per_unit", 150))
+        row_params2.addWidget(self.spin_max_cards)
+
+        row_params2.addSpacing(15)
+        self.chk_fts = QCheckBox("Includi ricerca lessicale FTS5")
+        self.chk_fts.setChecked(self.config.hybrid_dense_weight < 1.0)
+        row_params2.addWidget(self.chk_fts)
+        select_layout.addLayout(row_params2)
+
+        # Anteprima sull'ultima ricerca
+        row_preview = QHBoxLayout()
+        self.btn_preview = QPushButton("Anteprima sull'ultima ricerca")
+        self.btn_preview.clicked.connect(self._on_preview_last_search)
+        row_preview.addWidget(self.btn_preview)
+        row_preview.addStretch()
+        select_layout.addLayout(row_preview)
+
+        # Additional search options
         self.chk_llm_verify = QCheckBox("Verifica finale dei risultati con LLM (più accurato, più lento)")
         self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
-        search_layout.addWidget(self.chk_llm_verify)
+        select_layout.addWidget(self.chk_llm_verify)
 
         self.chk_include_active = QCheckBox("Inserisci nel mazzo filtrato anche le carte già attive in studio")
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
-        search_layout.addWidget(self.chk_include_active)
+        select_layout.addWidget(self.chk_include_active)
 
         naming_row = QHBoxLayout()
         naming_row.addWidget(QLabel("Stile nomi mazzi multi-unità:"))
@@ -1235,9 +1288,9 @@ class SettingsDialog(QDialog):
         self.combo_naming.addItem("Nome Base - Titolo Sezione", "dash")
         self.combo_naming.addItem("Nome Base::Titolo Sezione (Sottomazzo)", "subdeck")
         naming_row.addWidget(self.combo_naming)
-        search_layout.addLayout(naming_row)
+        select_layout.addLayout(naming_row)
 
-        layout.addWidget(search_group)
+        layout.addWidget(select_group)
 
         # 2. Modello Chat (LLM)
         chat_group = QGroupBox("Modello Chat (Decomposizione Concettuale)")
@@ -1373,9 +1426,15 @@ class SettingsDialog(QDialog):
         self._populate_note_models()
 
     def _load_config_to_ui(self) -> None:
-        self.slider_sens.setValue(int(self.config.sensitivity * 100))
-        thresh = round(0.70 - self.config.sensitivity * 0.20, 2)
-        self.lbl_sens_val.setText(f"{int(self.config.sensitivity * 100)}% (soglia ~{thresh:.2f})")
+        current_thresh = self.config.get_min_similarity_threshold()
+        self.slider_thresh.setValue(int(round(current_thresh * 100)))
+        self.lbl_thresh_val.setText(f"{current_thresh:.2f}")
+
+        self.spin_max_notes.setValue(getattr(self.config, "max_notes_per_concept", 10))
+        self.spin_rel_window.setValue(getattr(self.config, "relative_score_window", 0.05))
+        self.spin_max_cards.setValue(getattr(self.config, "max_cards_per_unit", 150))
+        self.chk_fts.setChecked(self.config.hybrid_dense_weight < 1.0)
+
         self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
 
@@ -1411,9 +1470,109 @@ class SettingsDialog(QDialog):
         if idx_strat != -1:
             self.combo_strategy.setCurrentIndex(idx_strat)
 
-    def _on_sens_slider_changed(self, val: int) -> None:
-        thresh = round(0.70 - (val / 100.0) * 0.20, 2)
-        self.lbl_sens_val.setText(f"{val}% (soglia ~{thresh:.2f})")
+    def _on_thresh_slider_changed(self, val: int) -> None:
+        thresh = val / 100.0
+        self.lbl_thresh_val.setText(f"{thresh:.2f}")
+
+    def _on_preview_last_search(self) -> None:
+        storage = SearchDatabase()
+        profile = ""
+        try:
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                profile = mw.pm.name or ""
+        except Exception:
+            profile = ""
+
+        latest_runs = storage.get_latest_search_runs(profile=profile)
+        valid_runs = [r for r in latest_runs if r.concept_coverage and not r.unit_error]
+        if not valid_runs:
+            QMessageBox.information(
+                self,
+                "Anteprima Ricerca",
+                "Nessuna ricerca precedente con concetti estratti trovata nel profilo corrente.",
+            )
+            return
+
+        thresh = self.slider_thresh.value() / 100.0
+        rel_window = self.spin_rel_window.value()
+        max_notes_concept = self.spin_max_notes.value()
+        max_cards_unit = self.spin_max_cards.value()
+        alpha = 0.78 if self.chk_fts.isChecked() else 1.0
+
+        active_mid = self.config.get_active_model_id()
+        pipeline = SmartSearchPipeline(self.config, storage, self.ai_client)
+
+        candidate_nids = None
+        if self.col and hasattr(self.col, "find_notes"):
+            try:
+                candidate_nids = set(self.col.find_notes(self.config.get_effective_search_query()))
+            except Exception:
+                candidate_nids = None
+
+        unit_summaries = []
+        total_notes = 0
+        total_cards = 0
+
+        for run in valid_runs:
+            concepts = [
+                ExtractedConcept(
+                    topic_it=c.get("topic_it", ""),
+                    claim_en=c.get("claim_en", ""),
+                    keywords_en=c.get("keywords_en", []),
+                    keywords_it=c.get("keywords_it", []),
+                    quote_it=c.get("quote_it", ""),
+                )
+                for c in run.concept_coverage
+                if c.get("claim_en") or c.get("topic_it")
+            ]
+            if not concepts:
+                continue
+
+            try:
+                candidates = pipeline.retrieve_for_concepts(
+                    concepts=concepts,
+                    active_model_id=active_mid,
+                    candidate_nids=candidate_nids,
+                    min_threshold=thresh,
+                    relative_score_window=rel_window,
+                    max_notes_per_concept=max_notes_concept,
+                    max_cards_per_unit=max_cards_unit,
+                    hybrid_dense_weight=alpha,
+                )
+            except Exception as e:
+                unit_summaries.append(f"• {run.unit_title}: Errore calcolo ({e})")
+                continue
+
+            n_notes = len(candidates)
+            cids_count = n_notes
+            if self.col and candidates:
+                try:
+                    cand_nids = [c.nid for c in candidates]
+                    cids_count = len(resolve_notes_to_cards(self.col, cand_nids))
+                except Exception:
+                    cids_count = n_notes
+
+            cov_items = pipeline.last_concept_coverage
+            cov_full = sum(1 for cov in cov_items if cov.status == "covered")
+            cov_tot = len(cov_items)
+            pct = int(round((cov_full / cov_tot) * 100)) if cov_tot > 0 else 0
+
+            unit_summaries.append(
+                f"• {run.unit_title}:\n"
+                f"   Note: {n_notes} ({cids_count} carte) — Copertura: {cov_full}/{cov_tot} ({pct}%)"
+            )
+            total_notes += n_notes
+            total_cards += cids_count
+
+        msg = (
+            f"Parametri anteprima:\n"
+            f"Soglia: {thresh:.2f} | Finestra: {rel_window:.2f} | Max note/concetto: {max_notes_concept}\n"
+            f"Max carte/unità: {max_cards_unit} | FTS: {'Attivo (0.78)' if alpha < 1.0 else 'Solo denso (1.0)'}\n\n"
+            + "\n\n".join(unit_summaries)
+            + f"\n\nTotale stimato: {total_notes} note ({total_cards} carte)"
+        )
+
+        QMessageBox.information(self, "Anteprima Risultati", msg)
 
     def _on_chat_preset_changed(self, idx: int) -> None:
         if idx == 0:
@@ -1495,7 +1654,13 @@ class SettingsDialog(QDialog):
             self.list_fields.addItem(item)
 
     def _save_settings(self) -> None:
-        self.config.sensitivity = round(self.slider_sens.value() / 100.0, 2)
+        thresh = self.slider_thresh.value() / 100.0
+        self.config.sensitivity = max(0.0, min(1.0, round((0.70 - thresh) / 0.20, 2)))
+        self.config.max_notes_per_concept = self.spin_max_notes.value()
+        self.config.relative_score_window = round(self.spin_rel_window.value(), 4)
+        self.config.max_cards_per_unit = self.spin_max_cards.value()
+        self.config.hybrid_dense_weight = 0.78 if self.chk_fts.isChecked() else 1.0
+
         self.config.enable_llm_verification = self.chk_llm_verify.isChecked()
         self.config.include_active_cards_in_filtered_deck = self.chk_include_active.isChecked()
         self.config.batch_deck_naming_style = self.combo_naming.currentData() or "dash"

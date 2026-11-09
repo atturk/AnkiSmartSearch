@@ -51,6 +51,7 @@ class ConceptCoverage:
     topic_it: str
     claim_en: str
     keywords_en: List[str] = field(default_factory=list)
+    keywords_it: List[str] = field(default_factory=list)
     matched_notes_count: int = 0
     matched_nids: List[int] = field(default_factory=list)
     best_score: float = 0.0
@@ -65,6 +66,7 @@ class ConceptCoverage:
             "topic_it": self.topic_it,
             "claim_en": self.claim_en,
             "keywords_en": list(self.keywords_en),
+            "keywords_it": list(self.keywords_it),
             "matched_notes_count": int(self.matched_notes_count),
             "matched_nids": list(self.matched_nids),
             "best_score": float(self.best_score),
@@ -81,6 +83,7 @@ class ConceptCoverage:
             topic_it=str(data.get("topic_it", "")),
             claim_en=str(data.get("claim_en", "")),
             keywords_en=[str(x) for x in data.get("keywords_en", [])],
+            keywords_it=[str(x) for x in data.get("keywords_it", [])],
             matched_notes_count=int(data.get("matched_notes_count", 0)),
             matched_nids=[int(x) for x in data.get("matched_nids", [])],
             best_score=float(data.get("best_score", 0.0)),
@@ -88,6 +91,7 @@ class ConceptCoverage:
             best_note_preview=str(data.get("best_note_preview", "")),
             status=str(data.get("status", "uncovered")),
             quote_it=str(data.get("quote_it", "")),
+            shared_with=str(data.get("shared_with", "")),
         )
 
 
@@ -187,6 +191,78 @@ def extract_first_sentence(text: str) -> str:
     match = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)
     first = match[0].strip() if match else cleaned
     return first.rstrip(".!?").strip()
+
+
+def select_candidates_for_concept(
+    dense_scores: Dict[int, float],
+    fts_scores: Dict[int, float],
+    alpha: float,
+    min_threshold: float,
+    min_dense_floor: float,
+    rel_window: float,
+    max_notes_concept: int,
+    suspended_nids: Optional[Set[int]] = None,
+    include_active_cards: bool = False,
+) -> Tuple[List[Tuple[int, float]], Optional[int], float]:
+    """Selects top candidate notes for a single concept using score fusion and relative window cutoff.
+
+    Returns: (top_concept_candidates, best_nid, best_score)
+    """
+    concept_candidates: List[Tuple[int, float]] = []
+    all_candidate_nids = set(dense_scores.keys())
+
+    for nid in all_candidate_nids:
+        d_score = dense_scores.get(nid, 0.0)
+        if d_score < min_dense_floor:
+            continue
+
+        if alpha >= 1.0:
+            combined = d_score
+        else:
+            b_score = fts_scores.get(nid, 0.0)
+            combined = alpha * d_score + (1.0 - alpha) * b_score
+
+        if combined >= min_threshold:
+            concept_candidates.append((nid, combined))
+
+    concept_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    best_nid: Optional[int] = None
+    best_score: float = 0.0
+    if concept_candidates:
+        best_nid, best_score = concept_candidates[0][0], round(concept_candidates[0][1], 4)
+        rel_cutoff = max(min_threshold, best_score - rel_window)
+        surviving_candidates = [c for c in concept_candidates if c[1] >= rel_cutoff]
+    else:
+        surviving_candidates = []
+        if dense_scores:
+            top_d_nid = max(dense_scores.keys(), key=lambda k: dense_scores[k])
+            top_d_score = dense_scores[top_d_nid]
+            best_nid = top_d_nid
+            if alpha >= 1.0:
+                best_score = round(top_d_score, 4)
+            else:
+                best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
+
+    if suspended_nids is not None and not include_active_cards:
+        top_concept_candidates: List[Tuple[int, float]] = []
+        susp_kept = 0
+        active_kept = 0
+        for nid, score in surviving_candidates:
+            if nid in suspended_nids:
+                if susp_kept < max_notes_concept:
+                    top_concept_candidates.append((nid, score))
+                    susp_kept += 1
+            else:
+                if active_kept < max_notes_concept:
+                    top_concept_candidates.append((nid, score))
+                    active_kept += 1
+            if susp_kept >= max_notes_concept and active_kept >= max_notes_concept:
+                break
+    else:
+        top_concept_candidates = surviving_candidates[:max_notes_concept]
+
+    return top_concept_candidates, best_nid, best_score
 
 
 class SmartSearchPipeline:
@@ -315,13 +391,29 @@ class SmartSearchPipeline:
     def retrieve_for_concepts(
         self,
         concepts: List[ExtractedConcept],
-        candidate_nids: Optional[List[int]],
-        active_model_id: str,
+        candidate_nids: Optional[Union[List[int], Set[int]]] = None,
+        active_model_id: str = "",
         suspended_nids: Optional[Set[int]] = None,
+        *,
+        min_threshold: Optional[float] = None,
+        relative_score_window: Optional[float] = None,
+        max_notes_per_concept: Optional[int] = None,
+        max_cards_per_unit: Optional[int] = None,
+        hybrid_dense_weight: Optional[float] = None,
+        include_active_cards: Optional[bool] = None,
+        concept_vectors: Optional[List[List[float]]] = None,
     ) -> List[ScoredNote]:
         """Performs dense vector search + BM25 lexical search per concept and fuses results."""
         if not concepts:
             return []
+
+        # Allow flexible parameter swapping if candidate_nids was passed as active_model_id string
+        if isinstance(candidate_nids, str) and not active_model_id:
+            active_model_id = candidate_nids
+            candidate_nids = None
+
+        if not active_model_id:
+            active_model_id = self.config.get_active_model_id()
 
         # 1. Build query texts for embedding based on language strategy
         query_texts: List[str] = []
@@ -347,20 +439,23 @@ class SmartSearchPipeline:
         if instruction:
             query_texts = [f"{instruction}{t}" for t in query_texts]
 
-        # Batch embed all concept queries at once
-        concept_vectors = self.ai_client.get_embeddings(
-            texts=query_texts,
-            model=self.config.embed_model,
-            base_url=self.config.embed_base_url,
-            api_key=self.config.embed_api_key,
-        )
+        # Batch embed all concept queries at once (unless already provided)
+        if concept_vectors is None:
+            concept_vectors = self.ai_client.get_embeddings(
+                texts=query_texts,
+                model=self.config.embed_model,
+                base_url=self.config.embed_base_url,
+                api_key=self.config.embed_api_key,
+            )
 
-        min_threshold = self.config.get_min_similarity_threshold()
+        eff_threshold = min_threshold if min_threshold is not None else self.config.get_min_similarity_threshold()
         # Semantic floor: prevents purely lexical hits with 0 semantic relation
-        min_dense_floor = max(0.20, min_threshold - 0.18)
-        alpha = self.config.hybrid_dense_weight
-        rel_window = getattr(self.config, "relative_score_window", 0.05)
-        max_notes_concept = getattr(self.config, "max_notes_per_concept", 10)
+        min_dense_floor = max(0.20, eff_threshold - 0.18)
+        alpha = hybrid_dense_weight if hybrid_dense_weight is not None else self.config.hybrid_dense_weight
+        rel_window = relative_score_window if relative_score_window is not None else getattr(self.config, "relative_score_window", 0.05)
+        max_notes_concept = max_notes_per_concept if max_notes_per_concept is not None else getattr(self.config, "max_notes_per_concept", 10)
+        max_cards_unit = max_cards_per_unit if max_cards_per_unit is not None else getattr(self.config, "max_cards_per_unit", 150)
+        eff_include_active = include_active_cards if include_active_cards is not None else self.config.include_active_cards_in_filtered_deck
 
         # Track results per note: nid -> {"scores": [float], "concepts": [str]}
         notes_agg: Dict[int, Dict[str, Any]] = {}
@@ -380,6 +475,7 @@ class SmartSearchPipeline:
                         topic_it=concept.topic_it,
                         claim_en=concept.claim_en,
                         keywords_en=list(concept.keywords_en),
+                        keywords_it=list(concept.keywords_it),
                         quote_it=concept.quote_it,
                     )
                 )
@@ -407,70 +503,24 @@ class SmartSearchPipeline:
                 )
                 fts_scores = {nid: score for nid, score in fts_hits}
 
-            # C. Score Fusion for this concept
-            concept_candidates: List[Tuple[int, float]] = []
-            all_candidate_nids = set(dense_scores.keys())
-
-            for nid in all_candidate_nids:
-                d_score = dense_scores.get(nid, 0.0)
-                if d_score < min_dense_floor:
-                    continue
-
-                if alpha >= 1.0:
-                    combined = d_score
-                else:
-                    b_score = fts_scores.get(nid, 0.0)
-                    # Combined linear fusion
-                    combined = alpha * d_score + (1.0 - alpha) * b_score
-
-                if combined >= min_threshold:
-                    concept_candidates.append((nid, combined))
-
-            concept_candidates.sort(key=lambda x: x[1], reverse=True)
-
-            # Record per-concept coverage metrics and apply relative score window cutoff
-            best_nid: Optional[int] = None
-            best_score: float = 0.0
-            if concept_candidates:
-                best_nid, best_score = concept_candidates[0][0], round(concept_candidates[0][1], 4)
-                rel_cutoff = max(min_threshold, best_score - rel_window)
-                surviving_candidates = [c for c in concept_candidates if c[1] >= rel_cutoff]
-            else:
-                surviving_candidates = []
-                if dense_hits:
-                    top_d_nid, top_d_score = dense_hits[0]
-                    best_nid = top_d_nid
-                    if alpha >= 1.0:
-                        best_score = round(top_d_score, 4)
-                    else:
-                        best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
-
-            # Keep notes up to max_notes_per_concept for this concept.
-            # When include_active_cards_in_filtered_deck is False and suspended_nids is provided,
-            # already-active notes do NOT steal slots from suspended notes!
-            if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
-                top_concept_candidates: List[Tuple[int, float]] = []
-                susp_kept = 0
-                active_kept = 0
-                for nid, score in surviving_candidates:
-                    if nid in suspended_nids:
-                        if susp_kept < max_notes_concept:
-                            top_concept_candidates.append((nid, score))
-                            susp_kept += 1
-                    else:
-                        if active_kept < max_notes_concept:
-                            top_concept_candidates.append((nid, score))
-                            active_kept += 1
-                    if susp_kept >= max_notes_concept and active_kept >= max_notes_concept:
-                        break
-            else:
-                top_concept_candidates = surviving_candidates[:max_notes_concept]
+            # C. Score Fusion & Candidate Selection
+            top_concept_candidates, best_nid, best_score = select_candidates_for_concept(
+                dense_scores=dense_scores,
+                fts_scores=fts_scores,
+                alpha=alpha,
+                min_threshold=eff_threshold,
+                min_dense_floor=min_dense_floor,
+                rel_window=rel_window,
+                max_notes_concept=max_notes_concept,
+                suspended_nids=suspended_nids,
+                include_active_cards=eff_include_active,
+            )
 
             matched_c_nids = [nid for nid, _ in top_concept_candidates]
             matched_cnt = len(matched_c_nids)
             if matched_cnt == 0:
                 c_status = "uncovered"
-            elif matched_cnt == 1 or best_score < (min_threshold + 0.06):
+            elif matched_cnt == 1 or best_score < (eff_threshold + 0.06):
                 c_status = "partial"
             else:
                 c_status = "covered"
@@ -480,6 +530,7 @@ class SmartSearchPipeline:
                     topic_it=concept.topic_it,
                     claim_en=concept.claim_en,
                     keywords_en=list(concept.keywords_en),
+                    keywords_it=list(concept.keywords_it),
                     matched_notes_count=matched_cnt,
                     matched_nids=matched_c_nids,
                     best_score=best_score,
@@ -537,14 +588,14 @@ class SmartSearchPipeline:
             )
 
         scored_notes.sort(key=lambda x: x.score, reverse=True)
-        if suspended_nids is not None and not self.config.include_active_cards_in_filtered_deck:
-            # Ensure suspended notes get up to max_cards_per_unit slots without being displaced by active notes
-            susp_notes = [sn for sn in scored_notes if sn.nid in suspended_nids][: self.config.max_cards_per_unit]
-            act_notes = [sn for sn in scored_notes if sn.nid not in suspended_nids][: self.config.max_cards_per_unit]
+        if suspended_nids is not None and not eff_include_active:
+            # Ensure suspended notes get up to max_cards_unit slots without being displaced by active notes
+            susp_notes = [sn for sn in scored_notes if sn.nid in suspended_nids][: max_cards_unit]
+            act_notes = [sn for sn in scored_notes if sn.nid not in suspended_nids][: max_cards_unit]
             combined_final = susp_notes + act_notes
             combined_final.sort(key=lambda x: x.score, reverse=True)
             return combined_final
-        return scored_notes[: self.config.max_cards_per_unit]
+        return scored_notes[: max_cards_unit]
 
     # ---------------- Stage 3: Optional LLM Verification ----------------
 

@@ -35,6 +35,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_notes_per_concept": 10,
     "max_cards_per_unit": 150,
     "hybrid_dense_weight": 1.0,
+    "similar_scope": "query",
+    "similar_custom_query": "",
+    "similar_min_score": 0.70,
+    "similar_max_notes": 20,
     "fts_use_italian_keywords": False,
     "enable_llm_verification": False,
     "include_active_cards_in_filtered_deck": False,
@@ -88,6 +92,10 @@ class ConfigManager:
     max_cards_per_unit: int = int(DEFAULT_CONFIG["max_cards_per_unit"])
     top_k_per_concept: Optional[int] = None
     hybrid_dense_weight: float = float(DEFAULT_CONFIG["hybrid_dense_weight"])
+    similar_scope: str = str(DEFAULT_CONFIG["similar_scope"])
+    similar_custom_query: str = str(DEFAULT_CONFIG["similar_custom_query"])
+    similar_min_score: float = float(DEFAULT_CONFIG["similar_min_score"])
+    similar_max_notes: int = int(DEFAULT_CONFIG["similar_max_notes"])
     fts_use_italian_keywords: bool = bool(DEFAULT_CONFIG.get("fts_use_italian_keywords", False))
     enable_llm_verification: bool = bool(DEFAULT_CONFIG["enable_llm_verification"])
     include_active_cards_in_filtered_deck: bool = bool(DEFAULT_CONFIG["include_active_cards_in_filtered_deck"])
