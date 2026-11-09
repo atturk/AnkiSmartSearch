@@ -129,6 +129,10 @@ class ConfigManager:
         clamped = max(0.0, min(1.0, float(self.sensitivity)))
         return round(0.70 - clamped * 0.20, 4)
 
+    def get_keyword_min_similarity_threshold(self) -> float:
+        """Returns the minimum similarity threshold for keyword mode."""
+        return float(getattr(self, "keyword_min_similarity", 0.52))
+
     def get_effective_top_k(self) -> int:
         """Returns the number of top candidate notes to keep per concept."""
         if self.top_k_per_concept is not None:

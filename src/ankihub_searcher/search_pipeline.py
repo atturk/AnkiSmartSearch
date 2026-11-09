@@ -37,6 +37,28 @@ class ExtractedConcept:
     keywords_en: List[str]
     keywords_it: List[str] = field(default_factory=list)
     quote_it: str = ""
+    source: str = "llm"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "topic_it": self.topic_it,
+            "claim_en": self.claim_en,
+            "keywords_en": list(self.keywords_en),
+            "keywords_it": list(self.keywords_it),
+            "quote_it": self.quote_it,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExtractedConcept":
+        return cls(
+            topic_it=str(data.get("topic_it", "")),
+            claim_en=str(data.get("claim_en", "")),
+            keywords_en=[str(x) for x in data.get("keywords_en", [])],
+            keywords_it=[str(x) for x in data.get("keywords_it", [])],
+            quote_it=str(data.get("quote_it", "")),
+            source=str(data.get("source", "llm")),
+        )
 
 
 @dataclass
@@ -65,6 +87,7 @@ class ConceptCoverage:
     status: str = "uncovered"  # "covered" | "partial" | "uncovered"
     quote_it: str = ""
     shared_with: str = ""
+    source: str = "llm"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -80,6 +103,7 @@ class ConceptCoverage:
             "status": self.status,
             "quote_it": self.quote_it,
             "shared_with": self.shared_with,
+            "source": self.source,
         }
 
     @classmethod
@@ -97,6 +121,7 @@ class ConceptCoverage:
             status=str(data.get("status", "uncovered")),
             quote_it=str(data.get("quote_it", "")),
             shared_with=str(data.get("shared_with", "")),
+            source=str(data.get("source", "llm")),
         )
 
 
@@ -196,6 +221,26 @@ def extract_first_sentence(text: str) -> str:
     match = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)
     first = match[0].strip() if match else cleaned
     return first.rstrip(".!?").strip()
+
+
+def concepts_from_keywords(keywords: Sequence[str]) -> List[ExtractedConcept]:
+    """Converts a sequence of keyword strings into ExtractedConcept instances."""
+    concepts: List[ExtractedConcept] = []
+    for kw in keywords:
+        cleaned = kw.strip()
+        if not cleaned:
+            continue
+        concepts.append(
+            ExtractedConcept(
+                topic_it=cleaned,
+                claim_en=cleaned,
+                keywords_en=[cleaned],
+                keywords_it=[cleaned],
+                quote_it=cleaned,
+                source="keyword",
+            )
+        )
+    return concepts
 
 
 def select_candidates_for_concept(
@@ -423,10 +468,13 @@ class SmartSearchPipeline:
         # 1. Build query texts for embedding based on language strategy
         query_texts: List[str] = []
         for c in concepts:
-            kws = ", ".join(k.strip() for k in c.keywords_en if k.strip())
-            if self.config.embed_language_strategy == "multilingual_direct":
+            if getattr(c, "source", "llm") == "keyword":
+                text = c.topic_it or c.claim_en
+            elif self.config.embed_language_strategy == "multilingual_direct":
+                kws = ", ".join(k.strip() for k in c.keywords_en if k.strip())
                 text = f"{c.topic_it} | {c.claim_en} | {kws}"
             else:  # translate_to_en (default)
+                kws = ", ".join(k.strip() for k in c.keywords_en if k.strip())
                 first_sentence = extract_first_sentence(c.claim_en)
                 if first_sentence and kws:
                     text = f"{first_sentence} | {kws}"
@@ -482,6 +530,7 @@ class SmartSearchPipeline:
                         keywords_en=list(concept.keywords_en),
                         keywords_it=list(concept.keywords_it),
                         quote_it=concept.quote_it,
+                        source=getattr(concept, "source", "llm"),
                     )
                 )
                 continue
@@ -542,6 +591,7 @@ class SmartSearchPipeline:
                     best_nid=best_nid,
                     status=c_status,
                     quote_it=concept.quote_it,
+                    source=getattr(concept, "source", "llm"),
                 )
             )
 

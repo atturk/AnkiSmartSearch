@@ -3214,10 +3214,80 @@ print("__JSON_RESULT__" + json.dumps(output))
 
         col.conn.close()
 
+    def test_extracted_concept_and_coverage_source_and_serialization(self):
+        from ankihub_searcher.search_pipeline import ExtractedConcept, ConceptCoverage, concepts_from_keywords
 
+        # 1. Defaults to source="llm"
+        ec = ExtractedConcept(
+            topic_it="Topic",
+            claim_en="Claim",
+            keywords_en=["kw1"],
+            keywords_it=["kw2"],
+            quote_it="Quote",
+        )
+        self.assertEqual(ec.source, "llm")
+        d = ec.to_dict()
+        self.assertEqual(d["source"], "llm")
 
+        # from_dict with and without source
+        ec2 = ExtractedConcept.from_dict({"topic_it": "T", "claim_en": "C"})
+        self.assertEqual(ec2.source, "llm")
+        ec3 = ExtractedConcept.from_dict({"topic_it": "T", "claim_en": "C", "source": "keyword"})
+        self.assertEqual(ec3.source, "keyword")
 
+        # ConceptCoverage
+        cov = ConceptCoverage(topic_it="T", claim_en="C")
+        self.assertEqual(cov.source, "llm")
+        cov_d = cov.to_dict()
+        self.assertEqual(cov_d["source"], "llm")
+        cov_from = ConceptCoverage.from_dict({"topic_it": "T", "claim_en": "C", "source": "keyword"})
+        self.assertEqual(cov_from.source, "keyword")
 
+        # 2. concepts_from_keywords
+        kws = ["ApoB48", "  Recettore LDL  ", ""]
+        extracted = concepts_from_keywords(kws)
+        self.assertEqual(len(extracted), 2)
+        self.assertEqual(extracted[0].topic_it, "ApoB48")
+        self.assertEqual(extracted[0].claim_en, "ApoB48")
+        self.assertEqual(extracted[0].quote_it, "ApoB48")
+        self.assertEqual(extracted[0].keywords_en, ["ApoB48"])
+        self.assertEqual(extracted[0].keywords_it, ["ApoB48"])
+        self.assertEqual(extracted[0].source, "keyword")
+
+        self.assertEqual(extracted[1].topic_it, "Recettore LDL")
+        self.assertEqual(extracted[1].source, "keyword")
+
+    def test_retrieve_for_concepts_keyword_source_query_text(self):
+        from ankihub_searcher.search_pipeline import ExtractedConcept, concepts_from_keywords
+
+        embedded_queries = []
+
+        class MockEmbeddingAIClient:
+            def get_embeddings(self, texts, model=None, base_url=None, api_key=None):
+                embedded_queries.extend(texts)
+                return [[1.0, 0.0] for _ in texts]
+
+        cfg = ConfigManager()
+        cfg.embed_language_strategy = "translate_to_en"
+        cfg.embed_query_instruction = "Query: "
+
+        pipeline = SmartSearchPipeline(
+            config=cfg,
+            storage=self.storage,
+            ai_client=MockEmbeddingAIClient(),
+        )
+
+        kw_concepts = concepts_from_keywords(["ApoB48"])
+        # Should embed "Query: ApoB48", ignoring translate_to_en formatting
+        pipeline.retrieve_for_concepts(kw_concepts, candidate_nids=[100])
+        self.assertIn("Query: ApoB48", embedded_queries)
+        self.assertEqual(pipeline.last_concept_coverage[0].source, "keyword")
+
+    def test_config_keyword_threshold(self):
+        cfg = ConfigManager()
+        self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.52)
+        cfg.keyword_min_similarity = 0.58
+        self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.58)
 
 
 if __name__ == "__main__":
