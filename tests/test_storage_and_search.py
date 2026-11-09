@@ -2612,7 +2612,8 @@ I should decompose this into atomic concepts.
             on_browser_will_show_context_menu,
             on_browser_did_fetch_columns,
             on_browser_did_fetch_row,
-            SimilarNotesDialog,
+            on_browser_will_search,
+            on_browser_did_search,
         )
 
         ctx_menu = MockMenu("Context")
@@ -2649,14 +2650,88 @@ I should decompose this into atomic concepts.
             on_browser_did_fetch_row(999, True, row_unrelated, ["smart_search_similarity"])
             self.assertEqual(row_unrelated.cells[0].text, "")
 
-        # 7. Test non-modal panel instantiation (Item 20c)
-        panel = SimilarNotesDialog(
-            browser=browser,
-            matched=[(502, 0.95), (503, 0.92)],
-            min_score=0.65,
-            note_previews={502: "Line 1 of note 502\nLine 2", 503: "Line 1 of note 503"},
+        # 7. Test browser_will_search and browser_did_search ordering (Commit 24)
+        import ankihub_searcher.browser_menu as bm_mod
+        bm_mod._last_similar_query = "nid:501,502,503"
+        bm_mod._last_similar_scores = {501: 0.70, 502: 0.95, 503: 0.80}
+        bm_mod._similar_custom_order_active = True
+
+        class FakeSearchContext:
+            def __init__(self, search_str, ids, order="default", browser=None):
+                self.search = search_str
+                self.ids = list(ids)
+                self.order = order
+                self.browser = browser
+
+        # 7A. Notes mode test
+        class FakeNotesBrowser:
+            def __init__(self):
+                self.table = type("Table", (), {"is_notes_mode": lambda *args, **kwargs: True})()
+
+        ctx_notes = FakeSearchContext(
+            search_str="nid:501,502,503",
+            ids=[501, 503, 502],
+            order="creation_date",
+            browser=FakeNotesBrowser(),
         )
-        self.assertEqual(panel.matched, [(502, 0.95), (503, 0.92)])
+        on_browser_will_search(ctx_notes)
+        self.assertFalse(ctx_notes.order)
+
+        on_browser_did_search(ctx_notes)
+        # Expected order: 502 (0.95) -> 503 (0.80) -> 501 (0.70)
+        self.assertEqual(ctx_notes.ids, [502, 503, 501])
+        self.assertFalse(ctx_notes.order)
+
+        # 7B. Cards mode test with multiple cards per note and SQL mapping
+        # Add card records to col database:
+        # Card 2001 -> Note 501 (score 0.70)
+        # Card 2002 -> Note 502 (score 0.95)
+        # Card 2003 -> Note 503 (score 0.80)
+        # Card 2004 -> Note 502 (score 0.95)
+        col.conn.execute("INSERT OR REPLACE INTO cards (id, nid, did) VALUES (2001, 501, 100)")
+        col.conn.execute("INSERT OR REPLACE INTO cards (id, nid, did) VALUES (2002, 502, 100)")
+        col.conn.execute("INSERT OR REPLACE INTO cards (id, nid, did) VALUES (2003, 503, 100)")
+        col.conn.execute("INSERT OR REPLACE INTO cards (id, nid, did) VALUES (2004, 502, 100)")
+        col.conn.commit()
+
+        bm_mod._similar_custom_order_active = True
+        class FakeCardsBrowser:
+            def __init__(self, col):
+                self.col = col
+                self.table = type("Table", (), {"is_notes_mode": lambda *args, **kwargs: False})()
+
+        ctx_cards = FakeSearchContext(
+            search_str="nid:501,502,503",
+            ids=[2001, 2003, 2002, 2004],
+            order="due_date",
+            browser=FakeCardsBrowser(col),
+        )
+        on_browser_will_search(ctx_cards)
+        self.assertFalse(ctx_cards.order)
+
+        on_browser_did_search(ctx_cards)
+        # Expected order: note 502 cards (2002, 2004, preserving order) -> note 503 (2003) -> note 501 (2001)
+        self.assertEqual(ctx_cards.ids, [2002, 2004, 2003, 2001])
+        self.assertFalse(ctx_cards.order)
+
+        # 7C. Requirement 4: User subsequently clicks another column header
+        # _similar_custom_order_active was consumed and is now False
+        self.assertFalse(bm_mod._similar_custom_order_active)
+        ctx_user_reorder = FakeSearchContext(
+            search_str="nid:501,502,503",
+            ids=[2001, 2002, 2003, 2004],
+            order="column_due_asc",
+            browser=FakeCardsBrowser(col),
+        )
+        on_browser_will_search(ctx_user_reorder)
+        # Does NOT reset context.order
+        self.assertEqual(ctx_user_reorder.order, "column_due_asc")
+
+        on_browser_did_search(ctx_user_reorder)
+        # Does NOT alter user's custom sort order
+        self.assertEqual(ctx_user_reorder.ids, [2001, 2002, 2003, 2004])
+        self.assertEqual(ctx_user_reorder.order, "column_due_asc")
+
         col.conn.close()
 
     def test_workers_and_deck_ops_profile_fallback_with_fake_mw(self):

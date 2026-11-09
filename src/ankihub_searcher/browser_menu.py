@@ -54,6 +54,8 @@ from .storage import SearchDatabase
 
 # Global caches for the similarity column in Anki Browser
 _last_similar_scores: Dict[int, float] = {}
+_last_similar_query: str = ""
+_similar_custom_order_active: bool = False
 _cid_to_nid_cache: Dict[int, int] = {}
 
 
@@ -163,90 +165,125 @@ def select_note_in_browser(browser: Any, nid: int) -> None:
         set_browser_search(browser, f"nid:{nid}")
 
 
-class SimilarNotesDialog(QDialog):
-    """Small non-modal panel displaying ranked similar notes.
-
-    Double-clicking an item selects the corresponding note in the Anki Browser.
-    """
-
-    def __init__(
-        self,
-        browser: Any,
-        matched: List[Tuple[int, float]],
-        min_score: float,
-        note_previews: Dict[int, str],
-        parent: Optional[Any] = None,
-    ):
-        if QDialog is not object:
-            super().__init__(parent or browser)
-        self.browser = browser
-        self.matched = matched
-        self.min_score = min_score
-        self.note_previews = note_previews
-
-        if hasattr(self, "setWindowTitle"):
-            self.setWindowTitle("Carte simili")
-            self.resize(540, 360)
-            if Qt is not None and hasattr(Qt, "WindowModality"):
-                self.setWindowModality(Qt.WindowModality.NonModal)
-            self._init_ui()
-
-    def _init_ui(self) -> None:
-        if QVBoxLayout is None or QTableWidget is None:
-            return
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(6)
-
-        lbl_info = QLabel(
-            f"Trovate {len(self.matched)} note simili (soglia minima: {self.min_score:.2f}).\n"
-            "Doppio clic su una riga per selezionare la nota nel Browser:"
-        )
-        layout.addWidget(lbl_info)
-
-        self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Similarità", "Prima riga della nota"])
-        if hasattr(self.table, "horizontalHeader") and self.table.horizontalHeader():
-            try:
-                self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-                self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            except Exception:
-                pass
+def is_notes_mode(browser: Any) -> bool:
+    """Checks whether the Anki browser is currently in Notes mode instead of Cards mode."""
+    if not browser:
+        return False
+    if hasattr(browser, "table") and hasattr(browser.table, "is_notes_mode"):
         try:
-            self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+            return bool(browser.table.is_notes_mode())
         except Exception:
             pass
-        self.table.setRowCount(len(self.matched))
+    if hasattr(browser, "is_notes_mode"):
+        try:
+            return bool(browser.is_notes_mode())
+        except Exception:
+            pass
+    return False
 
-        for row_idx, (nid, score) in enumerate(self.matched):
-            preview_text = self.note_previews.get(nid, "")
-            lines = [l.strip() for l in preview_text.splitlines() if l.strip()]
-            first_line = lines[0] if lines else f"Nota {nid}"
 
-            item_score = QTableWidgetItem(f"{score:.2f}")
-            if hasattr(item_score, "setTextAlignment") and Qt is not None:
-                item_score.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if hasattr(item_score, "setData") and Qt is not None:
-                item_score.setData(Qt.ItemDataRole.UserRole, nid)
+def get_cids_to_nids(col: Any, cids: Sequence[int]) -> Dict[int, int]:
+    """Retrieves mapping from card ID to note ID for a list of card IDs using SQL."""
+    cid_to_nid: Dict[int, int] = {}
+    if not cids:
+        return cid_to_nid
 
-            item_text = QTableWidgetItem(first_line)
-            if hasattr(item_text, "setData") and Qt is not None:
-                item_text.setData(Qt.ItemDataRole.UserRole, nid)
+    missing = [cid for cid in cids if cid not in _cid_to_nid_cache]
+    if missing and col and hasattr(col, "db"):
+        try:
+            for i in range(0, len(missing), 900):
+                chunk = tuple(missing[i : i + 900])
+                if len(chunk) == 1:
+                    q = f"SELECT id, nid FROM cards WHERE id = {chunk[0]}"
+                else:
+                    q = f"SELECT id, nid FROM cards WHERE id IN {chunk}"
+                if hasattr(col.db, "all"):
+                    rows = col.db.all(q)
+                else:
+                    rows = col.db.execute(q).fetchall()
+                for row in rows:
+                    _cid_to_nid_cache[row[0]] = row[1]
+        except Exception as e:
+            print(f"[SmartSearch] Error querying card nids: {e}")
 
-            self.table.setItem(row_idx, 0, item_score)
-            self.table.setItem(row_idx, 1, item_text)
+    for cid in cids:
+        if cid in _cid_to_nid_cache:
+            cid_to_nid[cid] = _cid_to_nid_cache[cid]
+        elif col and hasattr(col, "get_card"):
+            try:
+                card = col.get_card(cid)
+                if card:
+                    _cid_to_nid_cache[cid] = card.nid
+                    cid_to_nid[cid] = card.nid
+            except Exception:
+                pass
+    return cid_to_nid
 
-        if hasattr(self.table, "itemDoubleClicked"):
-            self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
-        layout.addWidget(self.table)
 
-    def _on_item_double_clicked(self, item: Any) -> None:
-        if Qt is not None and hasattr(item, "data"):
-            nid = item.data(Qt.ItemDataRole.UserRole)
-            if nid:
-                select_note_in_browser(self.browser, int(nid))
+def on_browser_will_search(context: Any) -> None:
+    """Disables backend ordering when the search query was triggered by find_similar_notes."""
+    global _similar_custom_order_active
+    if not _similar_custom_order_active or not _last_similar_query:
+        return
+    search_str = getattr(context, "search", "")
+    if search_str == _last_similar_query:
+        try:
+            context.order = False
+        except Exception:
+            pass
+
+
+def on_browser_did_search(context: Any) -> None:
+    """Sorts browser search results in descending order of similarity score.
+
+    Applies only when context.search exactly matches the last similarity query
+    and similarity ordering is currently active. If the user subsequently sorts
+    by another column, this hook does not interfere.
+    """
+    global _similar_custom_order_active
+    if not _similar_custom_order_active or not _last_similar_query:
+        return
+    search_str = getattr(context, "search", "")
+    if search_str != _last_similar_query:
+        return
+
+    # Deactivate so subsequent user column sorts are not overridden
+    _similar_custom_order_active = False
+
+    ids = getattr(context, "ids", None)
+    if not ids:
+        return
+
+    try:
+        context.order = False
+    except Exception:
+        pass
+
+    browser = getattr(context, "browser", None)
+    if is_notes_mode(browser):
+        # Notes mode: context.ids contains note IDs
+        indexed = list(enumerate(ids))
+        indexed.sort(
+            key=lambda pair: (
+                _last_similar_scores.get(pair[1], -1.0),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        context.ids = [nid for _, nid in indexed]
+    else:
+        # Cards mode: context.ids contains card IDs
+        col = getattr(browser, "col", None) or (mw.col if mw else None)
+        cid_to_nid = get_cids_to_nids(col, ids)
+        indexed = list(enumerate(ids))
+        indexed.sort(
+            key=lambda pair: (
+                _last_similar_scores.get(cid_to_nid.get(pair[1], -1), -1.0),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        context.ids = [cid for _, cid in indexed]
 
 
 def on_find_similar_cards_clicked(browser: Any) -> None:
@@ -330,6 +367,8 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
             )
             return
 
+        global _last_similar_query, _similar_custom_order_active
+
         # Update similarity column caches
         _last_similar_scores.clear()
         _last_similar_scores.update({nid: score for nid, score in matched})
@@ -342,13 +381,20 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
                     q = f"SELECT id, nid FROM cards WHERE nid = {nids_tuple[0]}"
                 else:
                     q = f"SELECT id, nid FROM cards WHERE nid IN {nids_tuple}"
-                for cid, nid in col.db.execute(q):
-                    _cid_to_nid_cache[cid] = nid
+                if hasattr(col.db, "all"):
+                    rows = col.db.all(q)
+                else:
+                    rows = col.db.execute(q).fetchall()
+                for row in rows:
+                    _cid_to_nid_cache[row[0]] = row[1]
             except Exception:
                 pass
 
         nids_csv = ",".join(str(nid) for nid, _ in matched)
-        set_browser_search(browser, f"nid:{nids_csv}")
+        _last_similar_query = f"nid:{nids_csv}"
+        _similar_custom_order_active = True
+
+        set_browser_search(browser, _last_similar_query)
         show_browser_tooltip(browser, f"Trovate {len(matched)} note simili")
 
         # Redraw browser table cells to refresh similarity column
@@ -357,24 +403,6 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
                 browser.table.redraw_cells()
             except Exception:
                 pass
-
-        # Show non-modal panel "Carte simili"
-        try:
-            panel = SimilarNotesDialog(
-                browser=browser,
-                matched=matched,
-                min_score=min_score,
-                note_previews=note_previews,
-            )
-            if hasattr(panel, "show"):
-                panel.show()
-                if hasattr(panel, "raise_"):
-                    panel.raise_()
-                if hasattr(panel, "activateWindow"):
-                    panel.activateWindow()
-            setattr(browser, "_smart_search_similar_panel", panel)
-        except Exception as e:
-            print(f"[SmartSearch] Error presenting SimilarNotesDialog: {e}")
 
     # In Anki: use QueryOp with background thread and progress spinner
     if QueryOp is not None:
@@ -660,5 +688,9 @@ def setup_browser_menu() -> None:
             gui_hooks.browser_did_fetch_columns.append(on_browser_did_fetch_columns)
         if hasattr(gui_hooks, "browser_did_fetch_row"):
             gui_hooks.browser_did_fetch_row.append(on_browser_did_fetch_row)
+        if hasattr(gui_hooks, "browser_will_search"):
+            gui_hooks.browser_will_search.append(on_browser_will_search)
+        if hasattr(gui_hooks, "browser_did_search"):
+            gui_hooks.browser_did_search.append(on_browser_did_search)
     except Exception as e:
         print(f"[SmartSearch] Error registering browser menu hooks: {e}")
