@@ -3289,6 +3289,84 @@ print("__JSON_RESULT__" + json.dumps(output))
         cfg.keyword_min_similarity = 0.58
         self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.58)
 
+    def test_search_batch_worker_keyword_mode(self):
+        """Item 28: keyword mode worker bypasses LLM, vectorizes keywords, creates decks."""
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        mid = "model_kw_test"
+        self.storage.save_embeddings_batch([
+            (8001, mid, "h8001", 2, [1.0, 0.0]),
+            (8002, mid, "h8002", 2, [0.0, 1.0]),
+        ])
+
+        cfg = ConfigManager.load()
+        cfg.embed_model = mid
+        cfg.enable_llm_verification = True  # Must be ignored in keyword mode
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.side_effect = lambda texts, **kwargs: [[1.0, 0.0] for _ in texts]
+
+        # 1. Test empty keyword input emits error
+        worker_empty = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="   \n# Solo intestazione senza kw\n",
+            base_deck_name="KwDeck",
+            input_mode="keyword",
+        )
+        errors = []
+        worker_empty.error_sig.connect(lambda msg: errors.append(msg))
+        worker_empty.run()
+        self.assertEqual(errors, ["Nessuna keyword trovata."])
+
+        # 2. Test 2 markdown units with keywords
+        raw_text = "# Unita Uno\n- ApoB48\n\n# Unita Due\n- Recettore LDL\n"
+        progress_msgs = []
+        finished_payloads = []
+
+        def fake_main_runner(task):
+            task()
+
+        precomputed_data = {
+            "candidate_nids": {8001, 8002},
+            "suspended_nids": {8001, 8002},
+            "allowed_cids": {8001, 8002},
+            "parent_deck_prefix": None,
+            "precomputed_notes_data": None,
+        }
+
+        worker = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text=raw_text,
+            base_deck_name="KwBatchDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=fake_main_runner,
+            input_mode="keyword",
+        )
+        worker.progress_sig.connect(lambda cur, tot, msg: progress_msgs.append(msg))
+        worker.finished_sig.connect(lambda res: finished_payloads.append(res))
+
+        worker.run()
+
+        # chat_completion_json must NEVER be called
+        mock_ai.chat_completion_json.assert_not_called()
+
+        # Finished with 2 units processed
+        self.assertEqual(len(finished_payloads), 1)
+        self.assertEqual(finished_payloads[0]["units_processed"], 2)
+        self.assertEqual(len(finished_payloads[0]["results"]), 2)
+
+        # Progress messages must contain the keyword vector search phrasing
+        self.assertTrue(any("Ricerca vettoriale di 1 keyword tra" in m for m in progress_msgs))
+
+        col.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

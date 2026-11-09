@@ -72,9 +72,9 @@ from ..deck_ops import (
     rollback_run_op,
 )
 from ..indexer import DeckIndexer, collect_presearch_data
-from ..search_pipeline import SmartSearchPipeline
+from ..search_pipeline import SmartSearchPipeline, concepts_from_keywords
 from ..storage import SearchDatabase
-from ..text_utils import parse_markdown_units
+from ..text_utils import parse_markdown_units, parse_keyword_units
 
 
 class IndexWorker(QThread):
@@ -174,6 +174,7 @@ class SearchBatchWorker(QThread):
         precomputed_data: Optional[Dict[str, Any]] = None,
         main_thread_runner: Optional[Callable[[Callable[[], Any]], Any]] = None,
         profile: str = "",
+        input_mode: str = "text",
     ):
         super().__init__(parent)
         self.col = col
@@ -184,6 +185,7 @@ class SearchBatchWorker(QThread):
         self.base_deck_name = base_deck_name
         self.precomputed_data = precomputed_data
         self.main_thread_runner = main_thread_runner
+        self.input_mode = input_mode
         if not profile:
             try:
                 from aqt import mw
@@ -200,14 +202,24 @@ class SearchBatchWorker(QThread):
     def run(self) -> None:
         try:
             # 1. Parse markdown units
-            units = parse_markdown_units(
-                raw_text=self.raw_text,
-                base_deck_name=self.base_deck_name,
-                naming_style=self.config.batch_deck_naming_style,
-            )
-            if not units:
-                self.error_sig.emit("Nessun testo o unità valida trovata nel testo inserito.")
-                return
+            if self.input_mode == "keyword":
+                units = parse_keyword_units(
+                    raw_text=self.raw_text,
+                    base_deck_name=self.base_deck_name,
+                    naming_style=self.config.batch_deck_naming_style,
+                )
+                if not units:
+                    self.error_sig.emit("Nessuna keyword trovata.")
+                    return
+            else:
+                units = parse_markdown_units(
+                    raw_text=self.raw_text,
+                    base_deck_name=self.base_deck_name,
+                    naming_style=self.config.batch_deck_naming_style,
+                )
+                if not units:
+                    self.error_sig.emit("Nessun testo o unità valida trovata nel testo inserito.")
+                    return
 
             total_units = len(units)
             total_steps = total_units * 100
@@ -295,6 +307,9 @@ class SearchBatchWorker(QThread):
                     concepts = precomputed[unit.unit_title]
                     emit_prog(unit_base + 70, f"{prefix}Riutilizzo di {len(concepts)} concetti: {unit.unit_title}")
                     unit_error = ""
+                elif self.input_mode == "keyword":
+                    concepts = concepts_from_keywords(unit.keywords)
+                    unit_error = ""
                 else:
                     # Sotto-passo 1: Invio richiesta (10%)
                     emit_prog(unit_base + 10, f"{prefix}Invio richiesta a {model_name} ({host})…")
@@ -340,18 +355,28 @@ class SearchBatchWorker(QThread):
                         except Exception:
                             num_notes = 0
 
-                    emit_prog(unit_base + 75, f"{prefix}Ricerca vettoriale tra {num_notes} note…")
+                    if self.input_mode == "keyword":
+                        emit_prog(unit_base + 75, f"{prefix}Ricerca vettoriale di {len(concepts)} keyword tra {num_notes} note…")
+                    else:
+                        emit_prog(unit_base + 75, f"{prefix}Ricerca vettoriale tra {num_notes} note…")
+
+                    if getattr(self, "override_min_threshold", None) is not None:
+                        eff_min_threshold = self.override_min_threshold
+                    elif self.input_mode == "keyword":
+                        eff_min_threshold = self.config.get_keyword_min_similarity_threshold()
+                    else:
+                        eff_min_threshold = None
 
                     scored_notes = pipeline.retrieve_for_concepts(
                         concepts=concepts,
                         candidate_nids=candidate_nids,
                         active_model_id=active_model_id,
                         suspended_nids=suspended_nids,
-                        min_threshold=getattr(self, "override_min_threshold", None),
+                        min_threshold=eff_min_threshold,
                         max_notes_per_concept=getattr(self, "override_max_notes_per_concept", None),
                     )
 
-                    if self.config.enable_llm_verification:
+                    if self.input_mode != "keyword" and self.config.enable_llm_verification:
                         scored_notes = pipeline.verify_candidates(unit, scored_notes, concepts=concepts)
                         surviving_nids = {c.nid for c in scored_notes}
                         min_threshold = self.config.get_min_similarity_threshold()
