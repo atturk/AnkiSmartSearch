@@ -491,6 +491,12 @@ class SearchDialog(QDialog):
                 f"{uncovered_claims} scoperti"
             )
 
+        err_units = [r for r in results if getattr(r, "unit_error", "")]
+        err_section = ""
+        if err_units:
+            err_lines = [f"• {r.unit_title}: {r.unit_error}" for r in err_units]
+            err_section = "\n\n⚠️ Errori Stage 1:\n" + "\n".join(err_lines)
+
         # 1. Reset Anki window so created filtered decks are immediately visible
         try:
             from aqt import mw
@@ -512,6 +518,7 @@ class SearchDialog(QDialog):
                 f"Nessuna nuova carta da riattivare.\n\n"
                 f"Carte correlate già attive in studio: {total_already_active}"
                 f"{cov_line}"
+                f"{err_section}"
             )
         else:
             msg_box.setText(
@@ -520,6 +527,7 @@ class SearchDialog(QDialog):
                 f"Carte correlate già attive: {total_already_active}\n"
                 f"Carte totali nel mazzo filtrato: {total_added}"
                 f"{cov_line}"
+                f"{err_section}"
             )
 
         msg_box.addButton(QMessageBox.StandardButton.Ok)
@@ -644,7 +652,13 @@ class HistoryDialog(QDialog):
 
         for row_idx, r in enumerate(runs):
             t_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.created_at))
-            status_str = "Annullata" if r.rolled_back else "Attiva"
+            unit_err = getattr(r, "unit_error", "")
+            if unit_err:
+                status_str = f"Errore: {unit_err}"
+            elif r.rolled_back:
+                status_str = "Annullata"
+            else:
+                status_str = "Attiva"
 
             cov_list = getattr(r, "concept_coverage", None) or []
             if cov_list:
@@ -664,7 +678,10 @@ class HistoryDialog(QDialog):
             self.history_table.setItem(row_idx, 4, QTableWidgetItem(str(len(r.newly_unsuspended_cids))))
             self.history_table.setItem(row_idx, 5, QTableWidgetItem(str(len(r.already_active_cids))))
             self.history_table.setItem(row_idx, 6, QTableWidgetItem(cov_str))
-            self.history_table.setItem(row_idx, 7, QTableWidgetItem(status_str))
+            item_status = QTableWidgetItem(status_str)
+            if unit_err:
+                item_status.setToolTip(unit_err)
+            self.history_table.setItem(row_idx, 7, item_status)
 
     def _get_selected_run_id(self) -> Optional[str]:
         selected_rows = self.history_table.selectedItems()

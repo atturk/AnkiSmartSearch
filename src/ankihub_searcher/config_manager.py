@@ -21,6 +21,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "chat_base_url": "http://127.0.0.1:1234/v1",
     "chat_api_key": "",
     "chat_model": "",
+    "chat_max_tokens": 4096,
     "embed_provider": "lm_studio",
     "embed_base_url": "http://127.0.0.1:1234/v1",
     "embed_api_key": "",
@@ -65,6 +66,7 @@ class ConfigManager:
     chat_base_url: str = DEFAULT_CONFIG["chat_base_url"]
     chat_api_key: str = DEFAULT_CONFIG["chat_api_key"]
     chat_model: str = DEFAULT_CONFIG["chat_model"]
+    chat_max_tokens: int = int(DEFAULT_CONFIG["chat_max_tokens"])
 
     embed_provider: str = DEFAULT_CONFIG["embed_provider"]
     embed_base_url: str = DEFAULT_CONFIG["embed_base_url"]

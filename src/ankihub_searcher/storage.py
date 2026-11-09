@@ -44,6 +44,7 @@ class RunRecord:
     rolled_back: int = 0
     already_active_cids: List[int] = field(default_factory=list)
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
+    unit_error: str = ""
 
 
 def normalize_l2(vec: Sequence[float]) -> List[float]:
@@ -179,11 +180,12 @@ class SearchDatabase:
                     newly_unsuspended_cids_json TEXT NOT NULL,
                     rolled_back INTEGER DEFAULT 0,
                     already_active_cids_json TEXT DEFAULT '[]',
-                    concept_coverage_json TEXT DEFAULT '[]'
+                    concept_coverage_json TEXT DEFAULT '[]',
+                    unit_error TEXT DEFAULT ''
                 )
                 """
             )
-            # Seamless schema migration for pre-0.1.1 / pre-0.3.0 databases
+            # Seamless schema migration for pre-0.1.1 / pre-0.3.0 / pre-0.4.0 databases
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(run_history)")
             existing_cols = {row["name"] for row in cur.fetchall()}
@@ -191,6 +193,8 @@ class SearchDatabase:
                 conn.execute("ALTER TABLE run_history ADD COLUMN already_active_cids_json TEXT DEFAULT '[]'")
             if "concept_coverage_json" not in existing_cols:
                 conn.execute("ALTER TABLE run_history ADD COLUMN concept_coverage_json TEXT DEFAULT '[]'")
+            if "unit_error" not in existing_cols:
+                conn.execute("ALTER TABLE run_history ADD COLUMN unit_error TEXT DEFAULT ''")
             conn.commit()
 
     # ---------------- Note Content & FTS Operations ----------------
@@ -660,14 +664,15 @@ class SearchDatabase:
                     run_id, created_at, deck_name, filtered_did, source_decks_json,
                     unit_title, unit_preview, total_matched_cids_json,
                     newly_unsuspended_cids_json, rolled_back, already_active_cids_json,
-                    concept_coverage_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    concept_coverage_json, unit_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     deck_name=excluded.deck_name,
                     filtered_did=excluded.filtered_did,
                     rolled_back=excluded.rolled_back,
                     already_active_cids_json=excluded.already_active_cids_json,
-                    concept_coverage_json=excluded.concept_coverage_json
+                    concept_coverage_json=excluded.concept_coverage_json,
+                    unit_error=excluded.unit_error
                 """,
                 (
                     record.run_id,
@@ -682,6 +687,7 @@ class SearchDatabase:
                     record.rolled_back,
                     json.dumps(record.already_active_cids),
                     json.dumps(record.concept_coverage, ensure_ascii=False),
+                    record.unit_error,
                 ),
             )
             conn.commit()
@@ -696,6 +702,7 @@ class SearchDatabase:
                 row_keys = row.keys()
                 active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
                 cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
+                unit_err = row["unit_error"] if "unit_error" in row_keys else ""
                 records.append(
                     RunRecord(
                         run_id=row["run_id"],
@@ -710,6 +717,7 @@ class SearchDatabase:
                         rolled_back=row["rolled_back"],
                         already_active_cids=json.loads(active_json or "[]"),
                         concept_coverage=json.loads(cov_json or "[]"),
+                        unit_error=unit_err or "",
                     )
                 )
             return records
@@ -725,6 +733,7 @@ class SearchDatabase:
             row_keys = row.keys()
             active_json = row["already_active_cids_json"] if "already_active_cids_json" in row_keys else "[]"
             cov_json = row["concept_coverage_json"] if "concept_coverage_json" in row_keys else "[]"
+            unit_err = row["unit_error"] if "unit_error" in row_keys else ""
             return RunRecord(
                 run_id=row["run_id"],
                 created_at=row["created_at"],
@@ -738,6 +747,7 @@ class SearchDatabase:
                 rolled_back=row["rolled_back"],
                 already_active_cids=json.loads(active_json or "[]"),
                 concept_coverage=json.loads(cov_json or "[]"),
+                unit_error=unit_err or "",
             )
 
     def mark_run_rolled_back(self, run_id: str) -> None:

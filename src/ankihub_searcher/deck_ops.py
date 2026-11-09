@@ -31,6 +31,7 @@ class RunResult:
     already_active_count: int = 0
     already_active_cids: List[int] = field(default_factory=list)
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
+    unit_error: str = ""
 
 
 @dataclass
@@ -132,11 +133,42 @@ def execute_unit_deck_creation(
     concept_coverage: Optional[List[Dict[str, Any]]] = None,
     parent_deck_prefix: Optional[str] = None,
     allowed_cids: Optional[Set[int]] = None,
+    unit_error: str = "",
 ) -> RunResult:
     """Unsuspends matching cards and builds a clean Filtered Deck with cid: search query."""
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     coverage_list = list(concept_coverage) if concept_coverage else []
     target_deck_name = _format_target_deck_name(unit.deck_name, parent_deck_prefix)
+
+    if unit_error:
+        record = RunRecord(
+            run_id=run_id,
+            created_at=int(time.time()),
+            deck_name=target_deck_name,
+            filtered_did=0,
+            source_decks=[config.get_effective_search_query()] if hasattr(config, "get_effective_search_query") else list(config.selected_decks),
+            unit_title=unit.unit_title,
+            unit_preview=(unit.body_text[:150] + "...") if len(unit.body_text) > 150 else unit.body_text,
+            total_matched_cids=[],
+            newly_unsuspended_cids=[],
+            rolled_back=0,
+            already_active_cids=[],
+            concept_coverage=[],
+            unit_error=unit_error,
+        )
+        storage.save_run(record)
+        return RunResult(
+            run_id=run_id,
+            deck_name=target_deck_name,
+            filtered_did=0,
+            total_cards_count=0,
+            newly_unsuspended_count=0,
+            newly_unsuspended_cids=[],
+            already_active_count=0,
+            already_active_cids=[],
+            concept_coverage=[],
+            unit_error=unit_error,
+        )
 
     if not matched_nids:
         return RunResult(
@@ -147,6 +179,7 @@ def execute_unit_deck_creation(
             newly_unsuspended_count=0,
             newly_unsuspended_cids=[],
             concept_coverage=coverage_list,
+            unit_error="",
         )
 
     suspended_cids, active_cids = resolve_notes_to_cards(

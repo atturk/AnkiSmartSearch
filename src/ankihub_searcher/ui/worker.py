@@ -189,6 +189,7 @@ class SearchBatchWorker(QThread):
                     active_model_id=active_model_id,
                     suspended_nids=suspended_nids,
                 )
+                unit_error = getattr(pipeline, "last_unit_error", "")
 
                 matched_nids = [sn.nid for sn in scored_notes]
 
@@ -209,6 +210,7 @@ class SearchBatchWorker(QThread):
                     concept_coverage=cov_dicts,
                     parent_deck_prefix=parent_deck_prefix,
                     allowed_cids=allowed_cids if allowed_cids else None,
+                    unit_error=unit_error,
                 )
                 results.append(run_res)
 

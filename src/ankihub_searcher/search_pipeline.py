@@ -14,7 +14,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .ai_client import AIClientError, OpenAICompatibleClient
 from .config_manager import ConfigManager
 from .storage import SearchDatabase
-from .text_utils import LectureUnit
+from .text_utils import LectureUnit, normalize_inline_latex
+
+
+class Stage1ExtractionError(AIClientError):
+    """Raised when Stage 1 concept extraction fails after retries."""
+
+    pass
 
 
 @dataclass
@@ -121,6 +127,38 @@ Respond strictly with a JSON object containing the list of relevant note IDs:
 """
 
 
+STAGE1_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "stage1_concepts",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "concepts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "topic_it": {"type": "string"},
+                        "claim_en": {"type": "string"},
+                        "keywords_en": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "keywords_it": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["topic_it", "claim_en", "keywords_en", "keywords_it"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["concepts"],
+        "additionalProperties": False,
+    },
+}
+
+
 class SmartSearchPipeline:
     """Executes the multi-stage hybrid search pipeline."""
 
@@ -134,76 +172,87 @@ class SmartSearchPipeline:
         self.storage = storage
         self.ai_client = ai_client
         self.last_concept_coverage: List[ConceptCoverage] = []
+        self.last_unit_error: str = ""
 
     # ---------------- Stage 1: Concept Extraction ----------------
 
     def extract_concepts(self, unit: LectureUnit) -> List[ExtractedConcept]:
         """Uses the Chat LLM to decompose an Italian lecture unit into atomic English concepts.
 
-        Provides a robust fallback if the LLM is unreachable or fails.
+        Tries up to 2 times on parsing/LLM failure. If both attempts fail, raises
+        Stage1ExtractionError without falling back to ASCII words.
         """
-        user_prompt = f"### Lecture Unit Title: {unit.unit_title}\n"
+        clean_title = normalize_inline_latex(unit.unit_title)
+        clean_body = normalize_inline_latex(unit.body_text)
+
+        user_prompt = f"### Lecture Unit Title: {clean_title}\n"
         if unit.breadcrumb:
-            user_prompt += f"### Context Hierarchy: {unit.breadcrumb}\n"
-        user_prompt += f"### Lecture Text:\n{unit.body_text}\n\n/no_think"
+            clean_breadcrumb = normalize_inline_latex(unit.breadcrumb)
+            user_prompt += f"### Context Hierarchy: {clean_breadcrumb}\n"
+        user_prompt += f"### Lecture Text:\n{clean_body}"
+
+        # /no_think only for Qwen models
+        if "qwen" in (self.config.chat_model or "").lower():
+            user_prompt += "\n\n/no_think"
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_STAGE1},
             {"role": "user", "content": user_prompt},
         ]
 
-        try:
-            res = self.ai_client.chat_completion_json(
-                messages=messages,
-                model=self.config.chat_model,
-                base_url=self.config.chat_base_url,
-                api_key=self.config.chat_api_key,
-                temperature=0.1,
-            )
+        last_err: Optional[Exception] = None
+        max_tokens = getattr(self.config, "chat_max_tokens", 4096)
 
-            raw_concepts = []
-            if isinstance(res, dict) and "concepts" in res:
-                raw_concepts = res["concepts"]
-            elif isinstance(res, list):
-                raw_concepts = res
+        for attempt in range(2):
+            try:
+                res = self.ai_client.chat_completion_json(
+                    messages=messages,
+                    model=self.config.chat_model,
+                    base_url=self.config.chat_base_url,
+                    api_key=self.config.chat_api_key,
+                    temperature=0.1,
+                    json_schema=STAGE1_JSON_SCHEMA,
+                    max_tokens=max_tokens,
+                )
 
-            concepts: List[ExtractedConcept] = []
-            for item in raw_concepts:
-                if not isinstance(item, dict):
-                    continue
-                topic_it = str(item.get("topic_it", "")).strip()
-                claim_en = str(item.get("claim_en", "")).strip()
-                kws_en = [str(k).strip() for k in item.get("keywords_en", []) if str(k).strip()]
-                kws_it = [str(k).strip() for k in item.get("keywords_it", []) if str(k).strip()]
+                raw_concepts = []
+                if isinstance(res, dict) and "concepts" in res:
+                    raw_concepts = res["concepts"]
+                elif isinstance(res, list):
+                    raw_concepts = res
 
-                if claim_en or kws_en or topic_it:
-                    concepts.append(
-                        ExtractedConcept(
-                            topic_it=topic_it or unit.unit_title,
-                            claim_en=claim_en or topic_it,
-                            keywords_en=kws_en or [unit.unit_title],
-                            keywords_it=kws_it,
+                concepts: List[ExtractedConcept] = []
+                for item in raw_concepts:
+                    if not isinstance(item, dict):
+                        continue
+                    topic_it = str(item.get("topic_it", "")).strip()
+                    claim_en = str(item.get("claim_en", "")).strip()
+                    kws_en = [str(k).strip() for k in item.get("keywords_en", []) if str(k).strip()]
+                    kws_it = [str(k).strip() for k in item.get("keywords_it", []) if str(k).strip()]
+
+                    if claim_en or kws_en or topic_it:
+                        concepts.append(
+                            ExtractedConcept(
+                                topic_it=topic_it or unit.unit_title,
+                                claim_en=claim_en or topic_it,
+                                keywords_en=kws_en or [unit.unit_title],
+                                keywords_it=kws_it,
+                            )
                         )
-                    )
 
-            if concepts:
-                return concepts
+                if concepts:
+                    return concepts
 
-        except Exception as e:
-            # Fallback will activate below
-            print(f"[SmartSearch] Notice: Stage 1 LLM extraction fallback used ({e})")
+                raise Stage1ExtractionError("LLM response did not contain any valid medical concepts.")
 
-        # Fallback concept when LLM extraction fails or is offline
-        words = re.findall(r"\b[A-Za-z0-9_-]{3,}\b", unit.body_text)
-        sample_kws = words[:12] if words else [unit.unit_title]
-        return [
-            ExtractedConcept(
-                topic_it=unit.unit_title,
-                claim_en=unit.unit_title,
-                keywords_en=sample_kws,
-                keywords_it=sample_kws[:5],
-            )
-        ]
+            except Exception as e:
+                last_err = e
+                print(f"[SmartSearch] Notice: Stage 1 extraction attempt {attempt + 1} failed: {e}")
+
+        # Both attempts failed: do NOT fall back to arbitrary ASCII words
+        raise Stage1ExtractionError(
+            f"Stage 1 extraction failed after 2 attempts: {last_err}"
+        )
 
     # ---------------- Stage 2: Hybrid Retrieval ----------------
 
@@ -477,7 +526,17 @@ class SmartSearchPipeline:
         suspended_nids: Optional[Set[int]] = None,
     ) -> List[ScoredNote]:
         """Runs Stage 1, Stage 2, and optional Stage 3 search for a lecture unit."""
-        concepts = self.extract_concepts(unit)
+        self.last_unit_error = ""
+        self.last_concept_coverage = []
+        try:
+            concepts = self.extract_concepts(unit)
+        except Exception as e:
+            self.last_unit_error = str(e)
+            return []
+
+        if not concepts:
+            return []
+
         candidates = self.retrieve_for_concepts(
             concepts,
             candidate_nids,

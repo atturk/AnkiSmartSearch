@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from ankihub_searcher.ai_client import OpenAICompatibleClient
+from ankihub_searcher.ai_client import AIClientError, OpenAICompatibleClient, repair_json_escapes
 from ankihub_searcher.config_manager import ConfigManager
 from ankihub_searcher.deck_ops import (
     execute_unit_deck_creation,
@@ -19,6 +19,7 @@ from ankihub_searcher.search_pipeline import (
     ExtractedConcept,
     ScoredNote,
     SmartSearchPipeline,
+    Stage1ExtractionError,
 )
 from ankihub_searcher.storage import (
     RunRecord,
@@ -639,6 +640,205 @@ I should decompose this into atomic concepts.
         self.assertIsNotNone(saved_run)
         self.assertEqual(len(saved_run.concept_coverage), 2)
         self.assertEqual(saved_run.concept_coverage[1]["status"], "uncovered")
+        col.conn.close()
+
+    def test_ai_client_invalid_escapes_repair(self):
+        # 1. Test repair_json_escapes
+        raw_invalid = r'{"claim": "Receptors \kappa and \alpha-2 agonists with \mathrm{TGF}-\beta"}'
+        repaired = repair_json_escapes(raw_invalid)
+        # repair should double backslashes for \k, \a, \m
+        import json
+        parsed = json.loads(repaired)
+        self.assertIn(r"\kappa", parsed["claim"])
+        self.assertIn(r"\alpha-2", parsed["claim"])
+
+        # 2. Test extract_clean_json handles invalid escapes directly
+        llm_output = (
+            "Ecco i concetti richiesti:\n```json\n"
+            r'{"concepts": [{"topic_it": "Recettori \beta", "claim_en": "Targets \kappa and \alpha receptors"}]}'
+            "\n```"
+        )
+        extracted = OpenAICompatibleClient.extract_clean_json(llm_output)
+        self.assertEqual(len(extracted["concepts"]), 1)
+        self.assertIn(r"\kappa", extracted["concepts"][0]["claim_en"])
+
+        # 3. Test that valid escapes are preserved
+        valid_json = r'{"text": "Line 1\nLine 2\tTabbed \"quote\" \\ slash \u0041"}'
+        parsed_valid = OpenAICompatibleClient.extract_clean_json(valid_json)
+        self.assertEqual(parsed_valid["text"], 'Line 1\nLine 2\tTabbed "quote" \\ slash A')
+
+    def test_chat_completion_json_schema_and_400_fallback(self):
+        client = OpenAICompatibleClient()
+
+        # 1. Normal call with schema: verify payload
+        calls = []
+
+        def mock_request(url, method="GET", data=None, api_key="", timeout=None):
+            calls.append(data)
+            return {
+                "choices": [
+                    {"message": {"content": '{"result": "ok"}'}}
+                ]
+            }
+
+        client._make_request = mock_request
+
+        schema = {"type": "object", "properties": {"result": {"type": "string"}}}
+        res = client.chat_completion_json(
+            messages=[{"role": "user", "content": "hello"}],
+            model="test-model",
+            base_url="http://localhost:1234/v1",
+            json_schema=schema,
+            max_tokens=2048,
+        )
+        self.assertEqual(res, {"result": "ok"})
+        self.assertEqual(len(calls), 1)
+        self.assertIn("response_format", calls[0])
+        self.assertEqual(calls[0]["max_tokens"], 2048)
+
+        # 2. 400 error fallback: server rejects response_format
+        calls.clear()
+        attempt_count = 0
+
+        def mock_request_400(url, method="GET", data=None, api_key="", timeout=None):
+            nonlocal attempt_count
+            attempt_count += 1
+            calls.append(data)
+            if "response_format" in data:
+                raise AIClientError("HTTP 400 (Bad Request): response_format unsupported", status_code=400)
+            return {
+                "choices": [
+                    {"message": {"content": '{"result": "fallback_ok"}'}}
+                ]
+            }
+
+        client._make_request = mock_request_400
+        res2 = client.chat_completion_json(
+            messages=[{"role": "user", "content": "hello"}],
+            model="test-model",
+            base_url="http://localhost:1234/v1",
+            json_schema=schema,
+        )
+        self.assertEqual(res2, {"result": "fallback_ok"})
+        self.assertEqual(attempt_count, 2)
+        # First call had response_format, second call did not
+        self.assertIn("response_format", calls[0])
+        self.assertNotIn("response_format", calls[1])
+
+    def test_stage1_no_think_and_latex_normalization(self):
+        config_qwen = ConfigManager(chat_model="qwen-2.5-7b-instruct")
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [{"topic_it": "Topic", "claim_en": "Claim", "keywords_en": ["k1"], "keywords_it": []}]
+        }
+        pipeline_qwen = SmartSearchPipeline(config_qwen, self.storage, mock_ai)
+        unit = LectureUnit(
+            unit_title=r"Recettori $\beta_2$",
+            deck_name="Test Deck",
+            body_text=r"I farmaci $\beta$-bloccanti agiscono sui recettori $\alpha$ e $\kappa$ con $\Delta P \ge 50$.",
+            breadcrumb=r"Farmacologia > $\beta$",
+        )
+
+        pipeline_qwen.extract_concepts(unit)
+
+        # Verify call to chat_completion_json
+        call_args = mock_ai.chat_completion_json.call_args[1]
+        user_prompt = call_args["messages"][1]["content"]
+
+        # 1. LaTeX should be normalized in user prompt
+        self.assertIn("Recettori β_2", user_prompt)
+        self.assertIn("β-bloccanti", user_prompt)
+        self.assertIn("recettori α e κ", user_prompt)
+        self.assertIn("Δ P ≥ 50", user_prompt)
+        self.assertNotIn(r"$\beta$", user_prompt)
+        self.assertNotIn(r"$\alpha$", user_prompt)
+
+        # 2. Qwen model must have /no_think
+        self.assertTrue(user_prompt.endswith("/no_think"))
+
+        # 3. Non-Qwen model must NOT have /no_think
+        config_gemma = ConfigManager(chat_model="google/gemma-2-9b-it")
+        mock_ai_gemma = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai_gemma.chat_completion_json.return_value = {
+            "concepts": [{"topic_it": "Topic", "claim_en": "Claim", "keywords_en": ["k1"], "keywords_it": []}]
+        }
+        pipeline_gemma = SmartSearchPipeline(config_gemma, self.storage, mock_ai_gemma)
+        pipeline_gemma.extract_concepts(unit)
+
+        gemma_prompt = mock_ai_gemma.chat_completion_json.call_args[1]["messages"][1]["content"]
+        self.assertNotIn("/no_think", gemma_prompt)
+
+    def test_stage1_retry_success_and_failure_without_ascii_fallback(self):
+        col = MockAnkiCol()
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, type, reps) VALUES (9001, 901, 100, 0, -1, 0, 0)")
+        col.conn.commit()
+
+        config = ConfigManager(selected_decks=["AnKing Step Deck"])
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+
+        # 1. Test retry on first failure: 1st fails, 2nd succeeds
+        mock_ai.chat_completion_json.side_effect = [
+            AIClientError("Temporary network glitch"),
+            {"concepts": [{"topic_it": "OK", "claim_en": "Claim OK", "keywords_en": ["k"], "keywords_it": []}]},
+        ]
+        pipeline = SmartSearchPipeline(config, self.storage, mock_ai)
+        unit = LectureUnit("Unit Retry", "Deck Retry", "Body text with medical concepts")
+
+        concepts = pipeline.extract_concepts(unit)
+        self.assertEqual(len(concepts), 1)
+        self.assertEqual(mock_ai.chat_completion_json.call_count, 2)
+
+        # 2. Test both attempts fail: raises Stage1ExtractionError and NO ASCII words fallback!
+        mock_ai.reset_mock()
+        mock_ai.chat_completion_json.side_effect = [
+            AIClientError("Invalid JSON from LLM: parse error"),
+            AIClientError("Invalid JSON from LLM: parse error attempt 2"),
+        ]
+
+        with self.assertRaises(Stage1ExtractionError):
+            pipeline.extract_concepts(unit)
+        self.assertEqual(mock_ai.chat_completion_json.call_count, 2)
+
+        # 3. Test search_unit marks unit_error and returns [] (0 notes found)
+        mock_ai.reset_mock()
+        mock_ai.chat_completion_json.side_effect = [
+            AIClientError("Error 1"),
+            AIClientError("Error 2"),
+        ]
+        scored_notes = pipeline.search_unit(unit, candidate_nids=[901], active_model_id="test-model")
+        self.assertEqual(scored_notes, [])
+        self.assertTrue(len(pipeline.last_unit_error) > 0)
+        self.assertIn("Error 2", pipeline.last_unit_error)
+
+        # 4. Test execute_unit_deck_creation with unit_error:
+        # No cards unsuspended, no filtered deck created, run saved in history with unit_error
+        run_res = execute_unit_deck_creation(
+            col=col,
+            unit=unit,
+            matched_nids=[],
+            config=config,
+            storage=self.storage,
+            unit_error=pipeline.last_unit_error,
+        )
+        self.assertEqual(run_res.total_cards_count, 0)
+        self.assertEqual(run_res.newly_unsuspended_count, 0)
+        self.assertEqual(run_res.filtered_did, 0)
+        self.assertEqual(run_res.unit_error, pipeline.last_unit_error)
+
+        # Verify unsuspend_cards was NEVER called
+        col.sched.unsuspend_cards.assert_not_called()
+
+        # Verify run_history recorded the unit_error
+        saved_run = self.storage.get_run(run_res.run_id)
+        self.assertIsNotNone(saved_run)
+        self.assertEqual(saved_run.unit_error, pipeline.last_unit_error)
+        self.assertEqual(saved_run.newly_unsuspended_cids, [])
+
+        # Verify get_runs also preserves unit_error
+        all_runs = self.storage.get_runs()
+        matched_saved = [r for r in all_runs if r.run_id == run_res.run_id]
+        self.assertEqual(len(matched_saved), 1)
+        self.assertEqual(matched_saved[0].unit_error, pipeline.last_unit_error)
         col.conn.close()
 
 
