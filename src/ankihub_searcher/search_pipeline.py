@@ -95,23 +95,29 @@ SYSTEM_PROMPT_STAGE1 = """You are an elite medical professor, USMLE Step 1/Step 
 Your task is to decompose the following Italian lecture text into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
 
 CRITICAL INSTRUCTIONS:
-1. Extract an atomic concept for every medical entity that the lecturer EXPLAINS or CHARACTERIZES (diseases, molecular mechanisms, molecules, drugs, signs, diagnostic criteria).
-2. STRICT NEGATIVE RULES:
-   - Do NOT create concepts for entities mentioned only in passing as fleeting examples (e.g., "una pielonefrite sospetta", "febbre di 39 °C"). Ignore non-medical digressions, trivia, anecdotes, costs, or administrative organization.
+1. Extract an atomic concept for EVERY distinct entity mentioned in the text:
+   - Every disease, syndrome, or pathology.
+   - Every molecular/cellular mechanism, pathway, or receptor.
+   - Every molecule, protein, cytokine, antibody, or biomarker.
+   - Every drug, pharmacological class, or therapeutic agent.
+   - Every clinical sign, symptom, or diagnostic finding.
+   - Every numerical criterion, cutoff, stage, or diagnostic threshold.
+2. STRICT RULES:
    - NEVER merge distinct entities together into a single concept (e.g., do not combine two different drugs or two separate cytokines).
-   - Forbid generic concepts without a specific entity (e.g., avoid vague topics like "general therapy" or "pathology overview").
-3. FIELD SPECIFICATIONS:
-   - "quote_it": The exact Italian sentence or phrase from the lecture text from which this concept originates.
-   - "topic_it": Short Italian topic summary naming the specific entity.
-   - "claim_en": Exactly ONE concise sentence stating the core medical fact, without generic fluff or extra sentences.
-   - "keywords_en": ONLY specific, searchable medical terms (disease names, molecules, drugs, clinical signs, eponyms, acronyms). NEVER include generic terms like "tissue injury", "metabolic pathways", "pathophysiology", "irreversible damage", "clinical management".
-   - "keywords_it": 2-5 original specific Italian terms from the lecture.
-4. Resolve Italian medical terminology, historical acronyms, and eponyms into standard USMLE English equivalents:
+   - Forbid generic concepts without a specific entity (e.g., avoid vague concepts like "general therapy" or "pathology overview").
+   - Ignore non-medical digressions entirely (costs, hospital administration, course organization, historical trivia, personal anecdotes).
+3. Resolve Italian medical terminology, historical acronyms, and eponyms into standard USMLE English equivalents:
    - e.g., "NALP3" -> "NLRP3 inflammasome"
    - e.g., "pirofosfato di calcio" -> "calcium pyrophosphate dihydrate (CPPD)", "pseudogout"
    - e.g., "acido urico" -> "uric acid", "monosodium urate", "gout"
    - e.g., "fattore di Hageman" -> "Factor XII", "Hageman factor"
    - e.g., "segno di Cullen" -> "Cullen sign", "acute pancreatitis"
+4. For each concept, provide:
+   - "quote_it": The exact Italian sentence or phrase from the lecture text from which this concept originates.
+   - "topic_it": Short Italian topic summary naming the specific entity.
+   - "claim_en": 1-2 concise, fact-dense English sentences summarizing the mechanism, pathology, clinical signs, or radiology findings as tested on USMLE/AnKing cards.
+   - "keywords_en": 4-10 precise English keywords, synonyms, eponyms, and acronyms.
+   - "keywords_it": 3-6 original Italian terms from the lecture.
 
 5. Do NOT overthink or write long reasoning monologues. Be fast, direct, and output ONLY the JSON object immediately.
 
@@ -387,17 +393,19 @@ class SmartSearchPipeline:
             )
             dense_scores: Dict[int, float] = {nid: score for nid, score in dense_hits}
 
-            # B. Lexical FTS5 BM25
-            if getattr(self.config, "fts_use_italian_keywords", False):
-                all_kws = concept.keywords_en + concept.keywords_it
-            else:
-                all_kws = list(concept.keywords_en) if concept.keywords_en else list(concept.keywords_it)
-            fts_hits = self.storage.search_fts(
-                keywords=all_kws,
-                candidate_nids=candidate_nids,
-                limit=150,
-            )
-            fts_scores: Dict[int, float] = {nid: score for nid, score in fts_hits}
+            # B. Lexical FTS5 BM25 (skipped completely when hybrid_dense_weight is 1.0)
+            fts_scores: Dict[int, float] = {}
+            if alpha < 1.0:
+                if getattr(self.config, "fts_use_italian_keywords", False):
+                    all_kws = concept.keywords_en + concept.keywords_it
+                else:
+                    all_kws = list(concept.keywords_en) if concept.keywords_en else list(concept.keywords_it)
+                fts_hits = self.storage.search_fts(
+                    keywords=all_kws,
+                    candidate_nids=candidate_nids,
+                    limit=150,
+                )
+                fts_scores = {nid: score for nid, score in fts_hits}
 
             # C. Score Fusion for this concept
             concept_candidates: List[Tuple[int, float]] = []
@@ -408,9 +416,12 @@ class SmartSearchPipeline:
                 if d_score < min_dense_floor:
                     continue
 
-                b_score = fts_scores.get(nid, 0.0)
-                # Combined linear fusion
-                combined = alpha * d_score + (1.0 - alpha) * b_score
+                if alpha >= 1.0:
+                    combined = d_score
+                else:
+                    b_score = fts_scores.get(nid, 0.0)
+                    # Combined linear fusion
+                    combined = alpha * d_score + (1.0 - alpha) * b_score
 
                 if combined >= min_threshold:
                     concept_candidates.append((nid, combined))
@@ -429,7 +440,10 @@ class SmartSearchPipeline:
                 if dense_hits:
                     top_d_nid, top_d_score = dense_hits[0]
                     best_nid = top_d_nid
-                    best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
+                    if alpha >= 1.0:
+                        best_score = round(top_d_score, 4)
+                    else:
+                        best_score = round(alpha * top_d_score + (1.0 - alpha) * fts_scores.get(top_d_nid, 0.0), 4)
 
             # Keep notes up to max_notes_per_concept for this concept.
             # When include_active_cards_in_filtered_deck is False and suspended_nids is provided,

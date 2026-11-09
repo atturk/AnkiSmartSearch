@@ -34,7 +34,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "relative_score_window": 0.05,
     "max_notes_per_concept": 10,
     "max_cards_per_unit": 150,
-    "hybrid_dense_weight": 0.78,
+    "hybrid_dense_weight": 1.0,
     "fts_use_italian_keywords": False,
     "enable_llm_verification": False,
     "include_active_cards_in_filtered_deck": False,
@@ -185,6 +185,7 @@ class ConfigManager:
             data["relative_score_window"] = 0.05
             data["max_notes_per_concept"] = 10
             data["max_cards_per_unit"] = 150
+            data["hybrid_dense_weight"] = 1.0
             data.pop("top_k_per_concept", None)
             data["config_version"] = 4
             return data, True

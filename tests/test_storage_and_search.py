@@ -1111,8 +1111,8 @@ I should decompose this into atomic concepts.
         self.assertNotIn(1102, returned_nids)
         self.assertNotIn(1103, returned_nids)
 
-        # 5. Test fts_use_italian_keywords option in SmartSearchPipeline
-        cfg_default = ConfigManager()
+        # 5. Test fts_use_italian_keywords option in SmartSearchPipeline (with hybrid_dense_weight < 1.0 to exercise FTS)
+        cfg_default = ConfigManager(hybrid_dense_weight=0.78)
         self.assertFalse(cfg_default.fts_use_italian_keywords)
 
         mock_ai = MagicMock(spec=OpenAICompatibleClient)
@@ -1151,7 +1151,7 @@ I should decompose this into atomic concepts.
 
         # With fts_use_italian_keywords=True: both keywords_en and keywords_it passed
         captured_keywords.clear()
-        cfg_it = ConfigManager(fts_use_italian_keywords=True)
+        cfg_it = ConfigManager(fts_use_italian_keywords=True, hybrid_dense_weight=0.78)
         pipeline_it = SmartSearchPipeline(cfg_it, self.storage, mock_ai)
         pipeline_it.search_unit(unit, candidate_nids=[1101], active_model_id=mid)
         self.assertEqual(len(captured_keywords), 1)
@@ -1954,6 +1954,7 @@ I should decompose this into atomic concepts.
         self.assertEqual(cfg.relative_score_window, 0.05)
         self.assertEqual(cfg.max_notes_per_concept, 10)
         self.assertEqual(cfg.max_cards_per_unit, 150)
+        self.assertEqual(cfg.hybrid_dense_weight, 1.0)
         self.assertEqual(cfg.config_version, 4)
 
         # get_min_similarity_threshold: 0.70 - s * 0.20
@@ -1969,6 +1970,7 @@ I should decompose this into atomic concepts.
             "relative_score_window": 0.20,
             "max_notes_per_concept": 50,
             "max_cards_per_unit": 300,
+            "hybrid_dense_weight": 0.78,
             "top_k_per_concept": 8,
             "search_query": '"deck:MyDeck"',
         }
@@ -1979,6 +1981,7 @@ I should decompose this into atomic concepts.
         self.assertEqual(migrated["relative_score_window"], 0.05)
         self.assertEqual(migrated["max_notes_per_concept"], 10)
         self.assertEqual(migrated["max_cards_per_unit"], 150)
+        self.assertEqual(migrated["hybrid_dense_weight"], 1.0)
         self.assertNotIn("top_k_per_concept", migrated)
         # Verify other user settings were strictly preserved
         self.assertEqual(migrated["chat_base_url"], "http://my-host:1234/v1")
@@ -2081,6 +2084,7 @@ I should decompose this into atomic concepts.
             self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
             self.assertEqual(cfg.max_notes_per_concept, 10)
             self.assertEqual(cfg.max_cards_per_unit, 150)
+            self.assertEqual(cfg.hybrid_dense_weight, 1.0)
             self.assertEqual(cfg.config_version, 4)
             self.assertIsNone(cfg.top_k_per_concept)
 
@@ -2093,15 +2097,42 @@ I should decompose this into atomic concepts.
             mock_addon_mgr.writeConfig.assert_called_once()
             self.assertEqual(stored_in_anki.get("config_version"), 4)
             self.assertEqual(stored_in_anki.get("sensitivity"), 0.5)
+            self.assertEqual(stored_in_anki.get("hybrid_dense_weight"), 1.0)
             self.assertNotIn("top_k_per_concept", stored_in_anki)
 
             # Second load: no migration should trigger, writeConfig must NOT be called again
             mock_addon_mgr.writeConfig.reset_mock()
             cfg2 = ConfigManager.load()
             self.assertEqual(cfg2.sensitivity, 0.5)
+            self.assertEqual(cfg2.hybrid_dense_weight, 1.0)
             self.assertEqual(cfg2.config_version, 4)
             self.assertEqual(cfg2.chat_model, "mistral-nemo-it")
             mock_addon_mgr.writeConfig.assert_not_called()
+
+    def test_hybrid_dense_weight_1_skips_fts(self):
+        cfg_default = ConfigManager(hybrid_dense_weight=1.0)
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        concept = ExtractedConcept(
+            topic_it="Inflammasoma",
+            claim_en="NLRP3 inflammasome cleaves pro-IL-1beta into IL-1beta.",
+            keywords_en=["NLRP3", "inflammasome", "IL-1beta"],
+            keywords_it=["inflammasoma"],
+            quote_it="Inflammasoma NLRP3 taglia la pro-IL-1beta.",
+        )
+
+        with patch.object(self.storage, "search_fts", wraps=self.storage.search_fts) as mock_fts:
+            pipe1 = SmartSearchPipeline(cfg_default, self.storage, mock_ai)
+            pipe1.retrieve_for_concepts([concept], active_model_id="test-model", candidate_nids={101})
+            mock_fts.assert_not_called()
+
+        cfg_hybrid = ConfigManager(hybrid_dense_weight=0.78)
+        with patch.object(self.storage, "search_fts", wraps=self.storage.search_fts) as mock_fts:
+            pipe2 = SmartSearchPipeline(cfg_hybrid, self.storage, mock_ai)
+            pipe2.retrieve_for_concepts([concept], active_model_id="test-model", candidate_nids={101})
+            mock_fts.assert_called_once()
+
 
 
 
