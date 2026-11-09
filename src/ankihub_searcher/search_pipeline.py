@@ -135,6 +135,7 @@ Respond strictly with a JSON object in this format:
 
 SYSTEM_PROMPT_STAGE3 = """You are an expert medical educator reviewing flashcards for a medical student's lecture.
 The student is studying the following lecture topic. Determine which candidate flashcards are genuinely relevant and essential to this lecture.
+For each candidate card, you are provided with its text and the excerpt/quote from the lecture that retrieved it.
 
 Respond strictly with a JSON object containing the list of relevant note IDs:
 {
@@ -503,10 +504,41 @@ class SmartSearchPipeline:
         unit: LectureUnit,
         candidates: List[ScoredNote],
         batch_size: int = 25,
+        concepts: Optional[List[ExtractedConcept]] = None,
     ) -> List[ScoredNote]:
         """Passes candidate notes to the Chat LLM to confirm relevance and filter out false positives."""
         if not self.config.enable_llm_verification or not candidates:
             return candidates
+
+        quote_lookup: Dict[str, str] = {}
+        if concepts:
+            for conc in concepts:
+                if conc.quote_it:
+                    if conc.topic_it:
+                        quote_lookup[conc.topic_it] = conc.quote_it
+                    if conc.claim_en:
+                        quote_lookup[conc.claim_en[:40]] = conc.quote_it
+                        quote_lookup[conc.claim_en] = conc.quote_it
+        if self.last_concept_coverage:
+            for cov in self.last_concept_coverage:
+                if cov.quote_it:
+                    if cov.topic_it:
+                        quote_lookup[cov.topic_it] = cov.quote_it
+                    if cov.claim_en:
+                        quote_lookup[cov.claim_en[:40]] = cov.quote_it
+                        quote_lookup[cov.claim_en] = cov.quote_it
+
+        def _get_candidate_quotes(c: ScoredNote) -> str:
+            quotes = []
+            for mc in c.matched_concepts:
+                q = quote_lookup.get(mc)
+                if q and q not in quotes:
+                    quotes.append(q)
+            if self.last_concept_coverage:
+                for cov in self.last_concept_coverage:
+                    if c.nid in cov.matched_nids and cov.quote_it and cov.quote_it not in quotes:
+                        quotes.append(cov.quote_it)
+            return " | ".join(quotes)
 
         verified_nids: Set[int] = set()
 
@@ -519,16 +551,19 @@ class SmartSearchPipeline:
                         "nid": c.nid,
                         "text": c.clean_text_preview,
                         "matched_concepts": c.matched_concepts,
+                        "quote": _get_candidate_quotes(c),
                     }
                 )
 
             user_prompt = f"### Lecture Topic: {unit.unit_title}\n"
             if unit.breadcrumb:
                 user_prompt += f"### Hierarchy: {unit.breadcrumb}\n"
-            user_prompt += f"### Lecture Excerpt:\n{unit.body_text[:1200]}\n\n"
+            user_prompt += f"### Lecture Excerpt:\n{unit.body_text}\n\n"
             user_prompt += "### Candidate Flashcards:\n"
             for n in notes_payload:
                 user_prompt += f"- ID {n['nid']}: {n['text']}\n"
+                if n.get("quote"):
+                    user_prompt += f"  Matched quote: \"{n['quote']}\"\n"
 
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT_STAGE3},
@@ -544,15 +579,19 @@ class SmartSearchPipeline:
                 )
                 if isinstance(res, dict) and "relevant_nids" in res:
                     for nid in res["relevant_nids"]:
-                        verified_nids.add(int(nid))
+                        try:
+                            verified_nids.add(int(nid))
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    print(f"[SmartSearch] Notice: Stage 3 verification invalid response schema ({res}), keeping batch.")
+                    for c in chunk:
+                        verified_nids.add(c.nid)
             except Exception as e:
                 # If verification call fails, retain chunk rather than losing results
                 print(f"[SmartSearch] Notice: Stage 3 verification call error ({e}), keeping batch.")
                 for c in chunk:
                     verified_nids.add(c.nid)
-
-        if not verified_nids:
-            return candidates
 
         return [c for c in candidates if c.nid in verified_nids]
 
@@ -584,7 +623,7 @@ class SmartSearchPipeline:
             suspended_nids=suspended_nids,
         )
         if self.config.enable_llm_verification:
-            candidates = self.verify_candidates(unit, candidates)
+            candidates = self.verify_candidates(unit, candidates, concepts=concepts)
             surviving_nids = {c.nid for c in candidates}
             min_threshold = self.config.get_min_similarity_threshold()
             for cov in self.last_concept_coverage:

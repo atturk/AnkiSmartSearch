@@ -1162,6 +1162,90 @@ I should decompose this into atomic concepts.
         custom_query = mock_ai_custom.get_embeddings.call_args[1]["texts"][0]
         self.assertTrue(custom_query.startswith("Custom Instruction:\n"))
 
+    def test_stage3_verification(self):
+        long_body = "Medical lecture text on crystal arthropathies. " * 50  # > 2000 chars
+        unit = LectureUnit(
+            unit_title="Gout and Pseudogout",
+            deck_name="Gout Deck",
+            body_text=long_body,
+            breadcrumb="Rheumatology > Crystal Arthropathies",
+        )
+
+        concept = ExtractedConcept(
+            topic_it="Gotta e cristalli MSU",
+            claim_en="Gout is caused by monosodium urate crystal deposition",
+            keywords_en=["gout", "monosodium urate"],
+            keywords_it=["gotta", "urato"],
+            quote_it="La gotta è una artropatia infiammatoria da deposito di cristalli di urato monosodico.",
+        )
+
+        c1 = ScoredNote(nid=101, score=0.85, matched_concepts=["Gotta e cristalli MSU"], clean_text_preview="Gout note 101")
+        c2 = ScoredNote(nid=102, score=0.80, matched_concepts=["Gotta e cristalli MSU"], clean_text_preview="Gout note 102")
+
+        # 1. Disabled by default: returns candidates untouched without LLM call
+        cfg_disabled = ConfigManager(enable_llm_verification=False)
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        pipeline = SmartSearchPipeline(cfg_disabled, self.storage, mock_ai)
+        result = pipeline.verify_candidates(unit, [c1, c2], concepts=[concept])
+        self.assertEqual([c.nid for c in result], [101, 102])
+        mock_ai.chat_completion_json.assert_not_called()
+
+        # 2. Enabled: check full body_text (>1200 chars) and quote_it are passed in prompt
+        cfg_enabled = ConfigManager(enable_llm_verification=True)
+        pipeline_enabled = SmartSearchPipeline(cfg_enabled, self.storage, mock_ai)
+
+        mock_ai.chat_completion_json.return_value = {"relevant_nids": [101]}
+        result = pipeline_enabled.verify_candidates(unit, [c1, c2], concepts=[concept])
+
+        # Verify return filters out 102 and keeps 101
+        self.assertEqual([c.nid for c in result], [101])
+
+        # Verify prompt details
+        call_kwargs = mock_ai.chat_completion_json.call_args[1]
+        user_msg = [m["content"] for m in call_kwargs["messages"] if m["role"] == "user"][0]
+        # Body text is NOT truncated at 1200 chars
+        self.assertIn(long_body, user_msg)
+        self.assertGreater(len(user_msg), 2000)
+        # Quote is included
+        self.assertIn('Matched quote: "La gotta è una artropatia infiammatoria da deposito di cristalli di urato monosodico."', user_msg)
+
+        # 3. Model returns valid empty list: NO candidate passes (returns empty list, does not keep all)
+        mock_ai.chat_completion_json.return_value = {"relevant_nids": []}
+        result_empty = pipeline_enabled.verify_candidates(unit, [c1, c2], concepts=[concept])
+        self.assertEqual(result_empty, [])
+
+        # 4. Model call raises Exception (e.g. timeout / network): batch is retained
+        mock_ai.chat_completion_json.side_effect = Exception("API connection timed out")
+        result_error = pipeline_enabled.verify_candidates(unit, [c1, c2], concepts=[concept])
+        self.assertEqual([c.nid for c in result_error], [101, 102])
+
+        # 5. End-to-end via search_unit: verify_candidates updates concept coverage
+        mock_ai.reset_mock()
+        mock_ai.chat_completion_json.side_effect = None
+        pipeline_enabled.extract_concepts = MagicMock(return_value=[concept])
+
+        def mock_retrieve(*args, **kwargs):
+            pipeline_enabled.last_concept_coverage = [
+                ConceptCoverage(
+                    topic_it="Gotta e cristalli MSU",
+                    claim_en="Gout is caused by monosodium urate crystal deposition",
+                    matched_notes_count=2,
+                    matched_nids=[101, 102],
+                    best_score=0.85,
+                    best_nid=101,
+                    status="covered",
+                    quote_it="La gotta è una artropatia infiammatoria da deposito di cristalli di urato monosodico.",
+                )
+            ]
+            return [c1, c2]
+
+        pipeline_enabled.retrieve_for_concepts = mock_retrieve
+        mock_ai.chat_completion_json.return_value = {"relevant_nids": [101]}
+        final_notes = pipeline_enabled.search_unit(unit, candidate_nids=None, active_model_id="test")
+        self.assertEqual([c.nid for c in final_notes], [101])
+        self.assertEqual(pipeline_enabled.last_concept_coverage[0].matched_nids, [101])
+        self.assertEqual(pipeline_enabled.last_concept_coverage[0].matched_notes_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
