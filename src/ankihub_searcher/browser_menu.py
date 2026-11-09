@@ -245,14 +245,14 @@ def on_browser_menus_did_init(browser: Any) -> None:
         menu = menubar.addMenu("Smart Search")
 
         act_search = menu.addAction("Cerca con la query corrente…")
-        act_search.triggered.connect(lambda: _open_search_from_browser(browser))
+        act_search.triggered.connect(lambda _checked=False: _open_search_from_browser(browser))
 
         act_similar = menu.addAction("Trova carte simili")
         if hasattr(act_similar, "setShortcut"):
             # Scorciatoia Ctrl+Alt+M: verificato sul form del Browser di Anki che Ctrl+Shift+S
             # è già occupata da "Riposiziona" e Ctrl+Alt+S è occupata da "Inverti selezione".
             act_similar.setShortcut("Ctrl+Alt+M")
-        act_similar.triggered.connect(lambda: on_find_similar_cards_clicked(browser))
+        act_similar.triggered.connect(lambda _checked=False: on_find_similar_cards_clicked(browser))
         setattr(browser, "_smart_search_similar_action", act_similar)
 
         if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):

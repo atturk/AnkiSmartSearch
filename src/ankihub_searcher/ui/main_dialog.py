@@ -367,7 +367,7 @@ class SearchDialog(QDialog):
     ):
         super().__init__(parent)
         self.col = col or (mw.col if mw else None)
-        self.initial_query = initial_query
+        self.initial_query = initial_query if isinstance(initial_query, str) else None
         self.config = ConfigManager.load()
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
@@ -400,7 +400,7 @@ class SearchDialog(QDialog):
             self.combo_query.addItems(self.config.search_query_history)
         eff_init = (
             self.initial_query.strip()
-            if (self.initial_query is not None and self.initial_query.strip())
+            if (isinstance(self.initial_query, str) and self.initial_query.strip())
             else self.config.get_effective_search_query()
         )
         if eff_init and self.combo_query.findText(eff_init) == -1:

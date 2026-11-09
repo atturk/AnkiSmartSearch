@@ -2777,6 +2777,26 @@ print("__JSON_RESULT__" + json.dumps(output))
             self.assertEqual(nid_no, nid_ref)
             self.assertAlmostEqual(score_no, score_ref, places=3)
 
+    def test_search_dialog_robust_initial_query(self):
+        """Verifies that non-string initial_query (e.g. bool False from QAction.triggered)
+        does not cause an AttributeError and safely falls back to default query."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog
+
+        col = MockAnkiCol()
+        # 1. Boolean False (reproducing Anki QAction.triggered signal)
+        dlg_false = SearchDialog(col=col, initial_query=False)
+        self.assertIsNone(dlg_false.initial_query)
+
+        # 2. Boolean True
+        dlg_true = SearchDialog(col=col, initial_query=True)
+        self.assertIsNone(dlg_true.initial_query)
+
+        # 3. Valid string
+        dlg_str = SearchDialog(col=col, initial_query="deck:TestDeck")
+        self.assertEqual(dlg_str.initial_query, "deck:TestDeck")
+
+        col.conn.close()
+
 
 
 

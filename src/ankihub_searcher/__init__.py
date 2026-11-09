@@ -34,8 +34,10 @@ from .ui.main_dialog import (
 from .updater import run_update_check_ui
 
 
-def open_search_dialog(initial_query: Optional[str] = None) -> None:
+def open_search_dialog(initial_query: Any = None) -> None:
     """Instantiates and presents the SearchDialog inside Anki."""
+    if not isinstance(initial_query, str):
+        initial_query = None
     try:
         from aqt import mw  # type: ignore
 
@@ -100,7 +102,7 @@ def init_addon() -> None:
         # 1. Cerca... (Shortcut: Ctrl+Shift+F)
         action_search = QAction("Cerca...", mw)
         action_search.setShortcut("Ctrl+Shift+F")
-        action_search.triggered.connect(open_search_dialog)
+        action_search.triggered.connect(lambda _checked=False: open_search_dialog())
         menu.addAction(action_search)
 
         # Connect default action if platform supports clicking parent menu
@@ -111,24 +113,24 @@ def init_addon() -> None:
 
         # 2. Cronologia
         action_history = QAction("Cronologia", mw)
-        action_history.triggered.connect(open_history_dialog)
+        action_history.triggered.connect(lambda _checked=False: open_history_dialog())
         menu.addAction(action_history)
 
         # 3. Indicizzazione
         action_index = QAction("Indicizzazione", mw)
-        action_index.triggered.connect(open_index_dialog)
+        action_index.triggered.connect(lambda _checked=False: open_index_dialog())
         menu.addAction(action_index)
 
         # 4. Impostazioni
         action_settings = QAction("Impostazioni", mw)
-        action_settings.triggered.connect(open_settings_dialog)
+        action_settings.triggered.connect(lambda _checked=False: open_settings_dialog())
         menu.addAction(action_settings)
 
         menu.addSeparator()
 
         # 5. Verifica aggiornamenti
         action_update = QAction("Verifica aggiornamenti", mw)
-        action_update.triggered.connect(lambda: run_update_check_ui(mw))
+        action_update.triggered.connect(lambda _checked=False: run_update_check_ui(mw))
         menu.addAction(action_update)
 
         # Register Smart Search Browser menu hooks
