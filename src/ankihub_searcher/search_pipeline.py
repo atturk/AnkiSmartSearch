@@ -560,6 +560,32 @@ class SmartSearchPipeline:
                             trans_dict[it_v] = en_v
             return trans_dict
 
+        all_keywords: List[str] = [
+            k.strip() for unit in units for k in getattr(unit, "keywords", []) if k.strip()
+        ]
+
+        def _align_to_keywords(res_obj: Any, trans_dict: Dict[str, str]) -> Dict[str, str]:
+            """Maps translations back to the original keywords.
+
+            Exact (case-insensitive) matches win; when the model rewrote the Italian side
+            but returned one translation per keyword in order, fall back to position.
+            """
+            lower_map = {k.lower(): v for k, v in trans_dict.items()}
+            ordered: List[str] = []
+            raw_list = res_obj.get("translations") if isinstance(res_obj, dict) else res_obj
+            if isinstance(raw_list, list):
+                for item in raw_list:
+                    if isinstance(item, dict):
+                        ordered.append(str(item.get("en", "")).strip())
+            aligned: Dict[str, str] = {}
+            for i, kw in enumerate(all_keywords):
+                en = trans_dict.get(kw) or lower_map.get(kw.lower())
+                if not en and len(ordered) == len(all_keywords):
+                    en = ordered[i]
+                if en:
+                    aligned[kw] = en
+            return aligned
+
         last_err: Optional[Exception] = None
         max_tokens = getattr(self.config, "chat_max_tokens", 16384)
         use_schema = bool(getattr(self.config, "chat_use_json_schema", False))
@@ -577,7 +603,7 @@ class SmartSearchPipeline:
                     max_tokens=max_tokens,
                 )
 
-                translations = _parse_translations(res)
+                translations = _align_to_keywords(res, _parse_translations(res))
                 if translations:
                     return translations
 
@@ -594,7 +620,7 @@ class SmartSearchPipeline:
                         json_schema=None,
                         max_tokens=max_tokens,
                     )
-                    translations_no_schema = _parse_translations(res_no_schema)
+                    translations_no_schema = _align_to_keywords(res_no_schema, _parse_translations(res_no_schema))
                     if translations_no_schema:
                         return translations_no_schema
 

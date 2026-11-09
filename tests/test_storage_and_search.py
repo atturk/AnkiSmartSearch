@@ -3398,8 +3398,9 @@ print("__JSON_RESULT__" + json.dumps(output))
             "keyword_min_similarity": 0.52,
         }
         mig_052, was_mig_052 = ConfigManager.migrate_dict(v5_with_052)
-        self.assertTrue(was_mig_052)
-        self.assertEqual(mig_052["keyword_min_similarity"], 0.55)
+        # A user-chosen 0.52 must be kept (no forced reset on every load)
+        self.assertFalse(was_mig_052)
+        self.assertEqual(mig_052["keyword_min_similarity"], 0.52)
 
         # 2. Settings dialog loads and saves keyword threshold and translation checkbox
         col = MockAnkiCol()
@@ -3640,3 +3641,24 @@ print("__JSON_RESULT__" + json.dumps(output))
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeywordTranslationAlignment(unittest.TestCase):
+    def test_positional_fallback_when_italian_side_rewritten(self):
+        from ankihub_searcher.search_pipeline import SmartSearchPipeline
+        from ankihub_searcher.config_manager import ConfigManager
+        from ankihub_searcher.text_utils import LectureUnit
+
+        class FakeAI:
+            def chat_completion_json(self, **kw):
+                return {"translations": [
+                    {"it": "chilomicroni", "en": "Chylomicrons"},
+                    {"it": "Proteina C reattiva", "en": "C-reactive protein"},
+                ]}
+
+        cfg = ConfigManager()
+        cfg.chat_model = "x"
+        pipe = SmartSearchPipeline(cfg, None, FakeAI())
+        unit = LectureUnit(unit_title="U", deck_name="U", body_text="", keywords=["Chilomicroni", "PCR"])
+        out = pipe.translate_keywords([unit])
+        self.assertEqual(out, {"Chilomicroni": "Chylomicrons", "PCR": "C-reactive protein"})

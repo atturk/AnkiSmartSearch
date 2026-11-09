@@ -228,10 +228,6 @@ class ConfigManager:
             data["config_version"] = 5
             was_migrated = True
 
-        if data.get("keyword_min_similarity") == 0.52:
-            data["keyword_min_similarity"] = 0.55
-            was_migrated = True
-
         return data, was_migrated
 
     def update(self, data: Dict[str, Any]) -> None:
