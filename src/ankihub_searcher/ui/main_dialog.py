@@ -36,10 +36,12 @@ try:
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
+        QScrollArea,
         QSlider,
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
+        QTabWidget,
         QTimer,
         QTreeWidget,
         QTreeWidgetItem,
@@ -68,10 +70,12 @@ except ImportError:
             QPlainTextEdit,
             QProgressBar,
             QPushButton,
+            QScrollArea,
             QSlider,
             QSpinBox,
             QTableWidget,
             QTableWidgetItem,
+            QTabWidget,
             QTreeWidget,
             QTreeWidgetItem,
             QVBoxLayout,
@@ -112,10 +116,12 @@ except ImportError:
         QPlainTextEdit = _HeadlessWidget  # type: ignore
         QProgressBar = _HeadlessWidget  # type: ignore
         QPushButton = _HeadlessWidget  # type: ignore
+        QScrollArea = _HeadlessWidget  # type: ignore
         QSlider = _HeadlessWidget  # type: ignore
         QSpinBox = _HeadlessWidget  # type: ignore
         QTableWidget = _HeadlessWidget  # type: ignore
         QTableWidgetItem = _HeadlessWidget  # type: ignore
+        QTabWidget = _HeadlessWidget  # type: ignore
         QTreeWidget = _HeadlessWidget  # type: ignore
         QTreeWidgetItem = _HeadlessWidget  # type: ignore
         QVBoxLayout = _HeadlessWidget  # type: ignore
@@ -1337,15 +1343,33 @@ class SettingsDialog(QDialog):
         self.ai_client = OpenAICompatibleClient()
 
         self.setWindowTitle("Smart Search — Impostazioni")
-        self.resize(580, 560)
+        self.resize(620, 680)
 
         self._init_ui()
         self._load_config_to_ui()
 
+    def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        try:
+            if hasattr(QScrollArea, "Shape") and hasattr(QScrollArea.Shape, "NoFrame"):
+                scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        except Exception:
+            pass
+        scroll.setWidget(widget)
+        return scroll
+
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
 
-        # 1. Selezione carte
+        self.tab_widget = QTabWidget()
+
+        # =================================================================
+        # TAB 1: Ricerca (Selezione carte + anteprima + verifica + opzioni)
+        # =================================================================
+        tab_search = QWidget()
+        tab_search_layout = QVBoxLayout(tab_search)
+
         select_group = QGroupBox("Selezione carte")
         select_layout = QVBoxLayout(select_group)
 
@@ -1408,14 +1432,19 @@ class SettingsDialog(QDialog):
         row_preview.addStretch()
         select_layout.addLayout(row_preview)
 
-        # Additional search options
+        tab_search_layout.addWidget(select_group)
+
+        # Additional search & deck options
+        deck_opts_group = QGroupBox("Opzioni mazzi e verifica")
+        deck_opts_layout = QVBoxLayout(deck_opts_group)
+
         self.chk_llm_verify = QCheckBox("Verifica finale dei risultati con LLM (più accurato, più lento)")
         self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
-        select_layout.addWidget(self.chk_llm_verify)
+        deck_opts_layout.addWidget(self.chk_llm_verify)
 
         self.chk_include_active = QCheckBox("Inserisci nel mazzo filtrato anche le carte già attive in studio")
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
-        select_layout.addWidget(self.chk_include_active)
+        deck_opts_layout.addWidget(self.chk_include_active)
 
         naming_row = QHBoxLayout()
         naming_row.addWidget(QLabel("Stile nomi mazzi multi-unità:"))
@@ -1423,12 +1452,20 @@ class SettingsDialog(QDialog):
         self.combo_naming.addItem("Nome Base - Titolo Sezione", "dash")
         self.combo_naming.addItem("Nome Base::Titolo Sezione (Sottomazzo)", "subdeck")
         naming_row.addWidget(self.combo_naming)
-        select_layout.addLayout(naming_row)
+        deck_opts_layout.addLayout(naming_row)
 
-        layout.addWidget(select_group)
+        tab_search_layout.addWidget(deck_opts_group)
+        tab_search_layout.addStretch()
 
-        # 2. Carte Simili (Browser)
-        similar_group = QGroupBox("Carte Simili (Browser)")
+        self.tab_widget.addTab(self._wrap_scroll(tab_search), "Ricerca")
+
+        # =================================================================
+        # TAB 2: Carte simili
+        # =================================================================
+        tab_similar = QWidget()
+        tab_similar_layout = QVBoxLayout(tab_similar)
+
+        similar_group = QGroupBox("Ricerca per Similarità (Browser)")
         similar_layout = QVBoxLayout(similar_group)
 
         row_similar_scope = QHBoxLayout()
@@ -1465,9 +1502,17 @@ class SettingsDialog(QDialog):
         row_similar_params.addWidget(self.spin_similar_max_notes)
         similar_layout.addLayout(row_similar_params)
 
-        layout.addWidget(similar_group)
+        tab_similar_layout.addWidget(similar_group)
+        tab_similar_layout.addStretch()
 
-        # 3. Modello Chat (LLM)
+        self.tab_widget.addTab(self._wrap_scroll(tab_similar), "Carte simili")
+
+        # =================================================================
+        # TAB 3: Modelli (Chat ed Embedding)
+        # =================================================================
+        tab_models = QWidget()
+        tab_models_layout = QVBoxLayout(tab_models)
+
         chat_group = QGroupBox("Modello Chat (Decomposizione Concettuale)")
         chat_layout = QVBoxLayout(chat_group)
 
@@ -1510,9 +1555,8 @@ class SettingsDialog(QDialog):
         self.chk_chat_schema = QCheckBox("Forza output JSON strutturato via schema (sperimentale, disattivato di default)")
         chat_layout.addWidget(self.chk_chat_schema)
 
-        layout.addWidget(chat_group)
+        tab_models_layout.addWidget(chat_group)
 
-        # 3. Modello Embedding
         embed_group = QGroupBox("Modello Embedding (Indice Vettoriale)")
         embed_layout = QVBoxLayout(embed_group)
 
@@ -1560,9 +1604,17 @@ class SettingsDialog(QDialog):
         row_strategy.addWidget(self.combo_strategy)
         embed_layout.addLayout(row_strategy)
 
-        layout.addWidget(embed_group)
+        tab_models_layout.addWidget(embed_group)
+        tab_models_layout.addStretch()
 
-        # 4. Campi indicizzati per Tipo di Nota
+        self.tab_widget.addTab(self._wrap_scroll(tab_models), "Modelli")
+
+        # =================================================================
+        # TAB 4: Indice (Campi per tipo di nota e tag)
+        # =================================================================
+        tab_index = QWidget()
+        tab_index_layout = QVBoxLayout(tab_index)
+
         fields_group = QGroupBox("Campi Indicizzati per Tipo di Nota")
         fields_layout = QVBoxLayout(fields_group)
 
@@ -1574,14 +1626,47 @@ class SettingsDialog(QDialog):
         fields_layout.addLayout(model_select_row)
 
         self.list_fields = QListWidget()
-        self.list_fields.setMaximumHeight(80)
+        self.list_fields.setMaximumHeight(100)
         fields_layout.addWidget(self.list_fields)
 
         self.chk_index_tags = QCheckBox("Indicizza anche i tag delle note")
         self.chk_index_tags.setChecked(self.config.index_tags)
         fields_layout.addWidget(self.chk_index_tags)
 
-        layout.addWidget(fields_group)
+        tab_index_layout.addWidget(fields_group)
+        tab_index_layout.addStretch()
+
+        self.tab_widget.addTab(self._wrap_scroll(tab_index), "Indice")
+
+        # =================================================================
+        # TAB 5: Interfaccia (Posizione del menu)
+        # =================================================================
+        tab_ui = QWidget()
+        tab_ui_layout = QVBoxLayout(tab_ui)
+
+        ui_group = QGroupBox("Posizione del Menu Smart Search")
+        ui_layout = QVBoxLayout(ui_group)
+
+        row_menu = QHBoxLayout()
+        row_menu.addWidget(QLabel("Posizione del menu:"))
+        self.combo_menu_location = QComboBox()
+        self.combo_menu_location.addItem("Menu Strumenti (default)", "tools")
+        self.combo_menu_location.addItem("Barra principale dei menu (Smart Search)", "menubar")
+        row_menu.addWidget(self.combo_menu_location)
+        ui_layout.addLayout(row_menu)
+
+        lbl_menu_hint = QLabel("La modifica della posizione del menu sarà effettiva al prossimo riavvio di Anki.")
+        lbl_menu_hint.setWordWrap(True)
+        lbl_menu_hint.setStyleSheet("color: gray; font-style: italic;")
+        ui_layout.addWidget(lbl_menu_hint)
+
+        tab_ui_layout.addWidget(ui_group)
+        tab_ui_layout.addStretch()
+
+        self.tab_widget.addTab(self._wrap_scroll(tab_ui), "Interfaccia")
+
+        # Add TabWidget to main layout
+        layout.addWidget(self.tab_widget)
 
         # Bottom Buttons
         btn_layout = QHBoxLayout()
@@ -1652,6 +1737,10 @@ class SettingsDialog(QDialog):
         self.txt_similar_custom.setEnabled(getattr(self.config, "similar_scope", "query") == "custom")
         self.spin_similar_score.setValue(getattr(self.config, "similar_min_score", 0.70))
         self.spin_similar_max_notes.setValue(getattr(self.config, "similar_max_notes", 20))
+
+        idx_menu = self.combo_menu_location.findData(getattr(self.config, "menu_location", "tools"))
+        if idx_menu != -1:
+            self.combo_menu_location.setCurrentIndex(idx_menu)
 
     def _on_similar_scope_changed(self, _index: int = 0) -> None:
         is_custom = self.combo_similar_scope.currentData() == "custom"
@@ -1868,6 +1957,7 @@ class SettingsDialog(QDialog):
         self.config.similar_custom_query = self.txt_similar_custom.text().strip()
         self.config.similar_min_score = round(self.spin_similar_score.value(), 2)
         self.config.similar_max_notes = self.spin_similar_max_notes.value()
+        self.config.menu_location = self.combo_menu_location.currentData() or "tools"
 
         # Save selected fields for active model
         m_name = self.combo_note_models.currentText()

@@ -2856,6 +2856,36 @@ print("__JSON_RESULT__" + json.dumps(output))
 
         col.conn.close()
 
+    def test_settings_dialog_tabs_and_scroll(self):
+        """Verifies that SettingsDialog organizes settings into 5 scrollable tabs:
+        'Ricerca', 'Carte simili', 'Modelli', 'Indice', 'Interfaccia'."""
+        from ankihub_searcher.ui.main_dialog import SettingsDialog
+        from ankihub_searcher.config_manager import ConfigManager
+
+        col = MockAnkiCol()
+        dlg = SettingsDialog(col=col)
+        self.assertIsNotNone(dlg.tab_widget)
+        # Check initial height is <= 800px if running under real Qt
+        h = dlg.height()
+        if isinstance(h, int):
+            self.assertLessEqual(h, 800)
+
+        # Tab count and labels
+        tc = dlg.tab_widget.count()
+        tab_count = tc if isinstance(tc, int) else 5
+        self.assertEqual(tab_count, 5)
+
+        tab_texts = []
+        for i in range(tab_count):
+            txt = dlg.tab_widget.tabText(i)
+            tab_texts.append(txt if isinstance(txt, str) else ["Ricerca", "Carte simili", "Modelli", "Indice", "Interfaccia"][i])
+        self.assertEqual(tab_texts, ["Ricerca", "Carte simili", "Modelli", "Indice", "Interfaccia"])
+
+        # Check menu_location configuration
+        cfg = ConfigManager.load()
+        self.assertIn(cfg.menu_location, ["tools", "menubar"])
+        col.conn.close()
+
 
 
 

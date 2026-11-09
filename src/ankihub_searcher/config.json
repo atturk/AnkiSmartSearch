@@ -26,6 +26,7 @@
   "similar_custom_query": "",
   "similar_min_score": 0.65,
   "similar_max_notes": 20,
+  "menu_location": "tools",
   "fts_use_italian_keywords": false,
   "enable_llm_verification": false,
   "include_active_cards_in_filtered_deck": false,

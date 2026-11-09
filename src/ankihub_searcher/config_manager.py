@@ -39,6 +39,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "similar_custom_query": "",
     "similar_min_score": 0.65,
     "similar_max_notes": 20,
+    "menu_location": "tools",
     "fts_use_italian_keywords": False,
     "enable_llm_verification": False,
     "include_active_cards_in_filtered_deck": False,
@@ -96,6 +97,7 @@ class ConfigManager:
     similar_custom_query: str = str(DEFAULT_CONFIG["similar_custom_query"])
     similar_min_score: float = float(DEFAULT_CONFIG["similar_min_score"])
     similar_max_notes: int = int(DEFAULT_CONFIG["similar_max_notes"])
+    menu_location: str = str(DEFAULT_CONFIG.get("menu_location", "tools"))
     fts_use_italian_keywords: bool = bool(DEFAULT_CONFIG.get("fts_use_italian_keywords", False))
     enable_llm_verification: bool = bool(DEFAULT_CONFIG["enable_llm_verification"])
     include_active_cards_in_filtered_deck: bool = bool(DEFAULT_CONFIG["include_active_cards_in_filtered_deck"])
