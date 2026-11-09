@@ -483,6 +483,52 @@ def _get_op_changes(changes: Any) -> Any:
     return None
 
 
+def assign_notes_to_best_units(units_search_data: List[Dict[str, Any]]) -> None:
+    """Assigns each note exclusively to the unit where it achieved the highest score.
+
+    For units that lose a note to another unit with a higher score, the note is removed
+    from their matched_nids, and their concept_coverage records 'shared_with': <winning_unit_title>.
+    """
+    if len(units_search_data) <= 1:
+        return
+
+    # 1. Find the highest score and winning unit index for each nid across all units
+    best_unit_idx_for_nid: Dict[int, int] = {}
+    best_score_for_nid: Dict[int, float] = {}
+
+    for u_idx, u_data in enumerate(units_search_data):
+        scores = u_data.get("note_scores", {})
+        for nid in u_data.get("matched_nids", []):
+            score = scores.get(nid, 0.0)
+            if nid not in best_unit_idx_for_nid or score > best_score_for_nid[nid]:
+                best_unit_idx_for_nid[nid] = u_idx
+                best_score_for_nid[nid] = score
+
+    # 2. Partition notes and record 'shared_with' on concept coverage
+    for u_idx, u_data in enumerate(units_search_data):
+        winning_nids: List[int] = []
+        lost_nids_to_unit: Dict[int, str] = {}  # nid -> winning_unit_title
+
+        for nid in u_data.get("matched_nids", []):
+            best_idx = best_unit_idx_for_nid.get(nid, u_idx)
+            if best_idx == u_idx:
+                winning_nids.append(nid)
+            else:
+                winning_unit_obj = units_search_data[best_idx].get("unit")
+                winning_title = getattr(winning_unit_obj, "unit_title", "") or f"Unità {best_idx + 1}"
+                lost_nids_to_unit[nid] = winning_title
+
+        u_data["matched_nids"] = winning_nids
+
+        if lost_nids_to_unit:
+            for cov in u_data.get("concept_coverage", []):
+                matched = cov.get("matched_nids", [])
+                lost_for_cov = [n for n in matched if n in lost_nids_to_unit]
+                if lost_for_cov:
+                    target_units = list(dict.fromkeys(lost_nids_to_unit[n] for n in lost_for_cov))
+                    cov["shared_with"] = ", ".join(target_units)
+
+
 def create_batch_filtered_decks_op(
     col: Any,
     units_data: List[Dict[str, Any]],
@@ -495,6 +541,8 @@ def create_batch_filtered_decks_op(
 
     Returns (results, op_changes).
     """
+    assign_notes_to_best_units(units_data)
+
     undo_pos = None
     if hasattr(col, "add_custom_undo_entry"):
         try:

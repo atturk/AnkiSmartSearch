@@ -58,6 +58,7 @@ class ConceptCoverage:
     best_note_preview: str = ""
     status: str = "uncovered"  # "covered" | "partial" | "uncovered"
     quote_it: str = ""
+    shared_with: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -71,6 +72,7 @@ class ConceptCoverage:
             "best_note_preview": self.best_note_preview,
             "status": self.status,
             "quote_it": self.quote_it,
+            "shared_with": self.shared_with,
         }
 
     @classmethod

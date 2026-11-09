@@ -61,6 +61,7 @@ from ..deck_ops import (
     RollbackResult,
     RunResult,
     _get_op_changes,
+    assign_notes_to_best_units,
     create_batch_filtered_decks_op,
     execute_unit_deck_creation,
     rollback_run,
@@ -272,12 +273,14 @@ class SearchBatchWorker(QThread):
                 )
                 unit_error = getattr(pipeline, "last_unit_error", "")
                 matched_nids = [sn.nid for sn in scored_notes]
+                note_scores = {sn.nid: sn.score for sn in scored_notes}
                 cov_dicts = [c.to_dict() for c in pipeline.last_concept_coverage]
 
                 units_search_data.append(
                     {
                         "unit": unit,
                         "matched_nids": matched_nids,
+                        "note_scores": note_scores,
                         "concept_coverage": cov_dicts,
                         "unit_error": unit_error,
                     }
@@ -286,6 +289,9 @@ class SearchBatchWorker(QThread):
             if self._is_cancelled:
                 self.finished_sig.emit({"status": "cancelled", "units_processed": 0, "results": []})
                 return
+
+            # Disambiguate notes across units: assign each note exclusively to the unit where it scored highest
+            assign_notes_to_best_units(units_search_data)
 
             self.progress_sig.emit(
                 total_units,

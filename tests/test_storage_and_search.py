@@ -14,6 +14,7 @@ from ankihub_searcher.config_manager import ConfigManager
 from ankihub_searcher.deck_ops import (
     RollbackResult,
     RunResult,
+    assign_notes_to_best_units,
     create_batch_filtered_decks_op,
     execute_unit_deck_creation,
     resolve_notes_to_cards,
@@ -1567,6 +1568,91 @@ I should decompose this into atomic concepts.
 
         # Verify run2's deck is still in col.decks_dict!
         self.assertIn(run2.filtered_did, col.decks_dict)
+
+    def test_batch_shared_cards_assignment(self):
+        col = MockAnkiCol()
+        # Note 101: card 1001 (suspended)
+        # Note 102: card 1002 (suspended)
+        # Note 103: card 1003 (suspended)
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (1001, 101, 100, 0, -1)")
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (1002, 102, 100, 0, -1)")
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (1003, 103, 100, 0, -1)")
+        col.conn.commit()
+
+        config = ConfigManager(selected_decks=["AnKing Step Deck"])
+
+        unit_a = LectureUnit("Unit A: Acute", "Target Deck::Unit A", "Body A")
+        unit_b = LectureUnit("Unit B: Chronic", "Target Deck::Unit B", "Body B")
+
+        # Both units matched note 101, but Unit B has higher score (0.91 vs 0.82)
+        u_data_a = {
+            "unit": unit_a,
+            "matched_nids": [101, 102],
+            "note_scores": {101: 0.82, 102: 0.75},
+            "concept_coverage": [
+                {
+                    "topic_it": "Pancreatite acuta",
+                    "matched_nids": [101],
+                    "status": "covered",
+                },
+                {
+                    "topic_it": "Lipasi",
+                    "matched_nids": [102],
+                    "status": "covered",
+                },
+            ],
+            "unit_error": "",
+        }
+
+        u_data_b = {
+            "unit": unit_b,
+            "matched_nids": [101, 103],
+            "note_scores": {101: 0.91, 103: 0.65},
+            "concept_coverage": [
+                {
+                    "topic_it": "Pancreatite cronica",
+                    "matched_nids": [101, 103],
+                    "status": "covered",
+                }
+            ],
+            "unit_error": "",
+        }
+
+        units_data = [u_data_a, u_data_b]
+        assign_notes_to_best_units(units_data)
+
+        # Note 101 assigned to Unit B (score 0.91 > 0.82)
+        # Unit A loses note 101 and keeps only note 102
+        self.assertEqual(u_data_a["matched_nids"], [102])
+        # Unit A's concept coverage for note 101 records shared_with = 'Unit B: Chronic'
+        self.assertEqual(u_data_a["concept_coverage"][0].get("shared_with"), "Unit B: Chronic")
+        # Unit A's second concept (note 102) has no shared_with
+        self.assertNotIn("shared_with", u_data_a["concept_coverage"][1])
+
+        # Unit B kept both notes 101 and 103
+        self.assertEqual(u_data_b["matched_nids"], [101, 103])
+        self.assertNotIn("shared_with", u_data_b["concept_coverage"][0])
+
+        # Now execute batch deck creation
+        results, changes = create_batch_filtered_decks_op(
+            col=col,
+            units_data=units_data,
+            config=config,
+            storage=self.storage,
+        )
+
+        self.assertEqual(len(results), 2)
+        # Unit A filtered deck contains only card 1002
+        deck_a = col.decks_dict[results[0].filtered_did]
+        self.assertEqual(results[0].total_cards_count, 1)
+        self.assertIn("1002", deck_a["terms"][0][0])
+        self.assertNotIn("1001", deck_a["terms"][0][0])
+
+        # Unit B filtered deck contains cards 1001 and 1003
+        deck_b = col.decks_dict[results[1].filtered_did]
+        self.assertEqual(results[1].total_cards_count, 2)
+        self.assertIn("1001", deck_b["terms"][0][0])
+        self.assertIn("1003", deck_b["terms"][0][0])
 
 
 if __name__ == "__main__":

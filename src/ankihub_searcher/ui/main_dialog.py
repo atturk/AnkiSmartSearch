@@ -163,6 +163,8 @@ class CoverageDetailDialog(QDialog):
         for r_idx, item in enumerate(self.sorted_items):
             st_raw = str(item.get("status", "uncovered"))
             st_text = status_labels.get(st_raw, st_raw)
+            if item.get("shared_with"):
+                st_text += f" (con {item['shared_with']})"
             topic_it = str(item.get("topic_it", ""))
             claim_en = str(item.get("claim_en", ""))
             notes_cnt = int(item.get("matched_notes_count", 0))
@@ -220,11 +222,14 @@ class CoverageDetailDialog(QDialog):
         st = st_map.get(str(item.get("status", "uncovered")), "SCOPERTO")
         kws = ", ".join(item.get("keywords_en", []))
         preview = str(item.get("best_note_preview", "")).strip() or "Nessuna nota corrispondente."
+        shared_with = item.get("shared_with", "")
+        shared_line = f"\nCondivisa con: {shared_with}" if shared_with else ""
         text = (
             f"[{st}] {item.get('topic_it', '')}\n"
             f"Claim (EN): {item.get('claim_en', '')}\n"
             f"Keywords: {kws}\n"
             f"Nota più vicina nel mazzo (score {float(item.get('best_score', 0.0)):.2f}): {preview}"
+            f"{shared_line}"
         )
         self.txt_detail.setPlainText(text)
 
