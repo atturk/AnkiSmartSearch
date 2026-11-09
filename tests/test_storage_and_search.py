@@ -3285,7 +3285,7 @@ print("__JSON_RESULT__" + json.dumps(output))
 
     def test_config_keyword_threshold(self):
         cfg = ConfigManager()
-        self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.52)
+        self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.55)
         cfg.keyword_min_similarity = 0.58
         self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.58)
 
@@ -3374,7 +3374,8 @@ print("__JSON_RESULT__" + json.dumps(output))
 
         self.assertEqual(DEFAULT_CONFIG["config_version"], 5)
         self.assertEqual(DEFAULT_CONFIG["search_input_mode"], "keyword")
-        self.assertEqual(DEFAULT_CONFIG["keyword_min_similarity"], 0.52)
+        self.assertEqual(DEFAULT_CONFIG["keyword_min_similarity"], 0.55)
+        self.assertEqual(DEFAULT_CONFIG["keyword_translate"], True)
 
         # 1. Migration from v4 dict
         v4_dict = {
@@ -3386,21 +3387,35 @@ print("__JSON_RESULT__" + json.dumps(output))
         self.assertTrue(was_migrated)
         self.assertEqual(migrated["config_version"], 5)
         self.assertEqual(migrated["search_input_mode"], "keyword")
-        self.assertEqual(migrated["keyword_min_similarity"], 0.52)
+        self.assertEqual(migrated["keyword_min_similarity"], 0.55)
+        self.assertEqual(migrated["keyword_translate"], True)
         self.assertEqual(migrated["sensitivity"], 0.35)
         self.assertEqual(migrated["search_query"], "deck:Test")
 
-        # 2. Settings dialog loads and saves keyword threshold
+        # 1b. Migration of v5 dict with old unreleased 0.52 threshold
+        v5_with_052 = {
+            "config_version": 5,
+            "keyword_min_similarity": 0.52,
+        }
+        mig_052, was_mig_052 = ConfigManager.migrate_dict(v5_with_052)
+        self.assertTrue(was_mig_052)
+        self.assertEqual(mig_052["keyword_min_similarity"], 0.55)
+
+        # 2. Settings dialog loads and saves keyword threshold and translation checkbox
         col = MockAnkiCol()
         cfg = ConfigManager()
         cfg.keyword_min_similarity = 0.58
+        cfg.keyword_translate = False
         dlg = SettingsDialog(col=col, config=cfg)
         self.assertAlmostEqual(dlg.spin_kw_thresh.value(), 0.58, places=2)
+        self.assertFalse(dlg.chk_keyword_translate.isChecked())
 
         dlg.spin_kw_thresh.setValue(0.64)
+        dlg.chk_keyword_translate.setChecked(True)
         with patch.object(cfg, "save"):
             dlg._save_settings()
         self.assertAlmostEqual(cfg.keyword_min_similarity, 0.64, places=2)
+        self.assertTrue(cfg.keyword_translate)
         col.conn.close()
 
     def test_search_dialog_two_tabs_and_retry(self):
@@ -3477,6 +3492,149 @@ print("__JSON_RESULT__" + json.dumps(output))
             dlg = SearchDialog(col=col)
             self.assertEqual(dlg.input_tabs.currentIndex(), 0)
             self.assertEqual(dlg.last_search_mode, "text")
+        col.conn.close()
+
+    def test_keyword_translation_and_worker(self):
+        """Item 33: translate_keywords, concepts_from_keywords, worker keyword translation, fallback and single-call."""
+        from ankihub_searcher.search_pipeline import SmartSearchPipeline, concepts_from_keywords
+        from ankihub_searcher.text_utils import LectureUnit
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        mid = "model_kw_trans_test"
+        self.storage.save_embeddings_batch([
+            (9001, mid, "h9001", 2, [1.0, 0.0]),
+            (9002, mid, "h9002", 2, [0.0, 1.0]),
+        ])
+
+        # 1. Pipeline translate_keywords and concepts_from_keywords
+        cfg = ConfigManager()
+        cfg.chat_model = "test-chat"
+        cfg.embed_model = mid
+        cfg.keyword_translate = True
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "translations": [
+                {"it": "ApoB48", "en": "ApoB-48"},
+                {"it": "Chilomicroni", "en": "Chylomicrons"},
+            ]
+        }
+        embedded_queries = []
+        mock_ai.get_embeddings.side_effect = lambda texts, **kwargs: (
+            embedded_queries.extend(texts) or [[1.0, 0.0] for _ in texts]
+        )
+
+        pipeline = SmartSearchPipeline(cfg, self.storage, mock_ai)
+        u1 = LectureUnit(unit_title="Lipidi", body_text="", deck_name="Deck1", keywords=["ApoB48"])
+        u2 = LectureUnit(unit_title="Metabolismo", body_text="", deck_name="Deck2", keywords=["Chilomicroni"])
+
+        trans = pipeline.translate_keywords([u1, u2])
+        self.assertEqual(trans, {"ApoB48": "ApoB-48", "Chilomicroni": "Chylomicrons"})
+        mock_ai.chat_completion_json.assert_called_once()
+
+        # concepts_from_keywords maps translations
+        concepts = concepts_from_keywords(["ApoB48"], translations=trans)
+        self.assertEqual(len(concepts), 1)
+        self.assertEqual(concepts[0].topic_it, "ApoB48")
+        self.assertEqual(concepts[0].quote_it, "ApoB48")
+        self.assertEqual(concepts[0].keywords_it, ["ApoB48"])
+        self.assertEqual(concepts[0].claim_en, "ApoB-48")
+        self.assertEqual(concepts[0].keywords_en, ["ApoB-48"])
+        self.assertEqual(concepts[0].source, "keyword")
+
+        # Vector retrieval uses claim_en
+        embedded_queries.clear()
+        pipeline.retrieve_for_concepts(concepts, candidate_nids=[9001])
+        self.assertIn("ApoB-48", embedded_queries[0])
+
+        # 2. Worker translates keywords in a single call for multiple units
+        mock_ai.chat_completion_json.reset_mock()
+        mock_ai.chat_completion_json.return_value = {
+            "translations": [
+                {"it": "ApoB48", "en": "ApoB-48"},
+                {"it": "Chilomicroni", "en": "Chylomicrons"},
+            ]
+        }
+        precomputed_data = {
+            "candidate_nids": {9001, 9002},
+            "suspended_nids": {9001, 9002},
+            "allowed_cids": {9001, 9002},
+            "parent_deck_prefix": None,
+            "precomputed_notes_data": None,
+        }
+        finished_payloads = []
+        worker = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Lipidi\n- ApoB48\n\n# Metabolismo\n- Chilomicroni\n",
+            base_deck_name="KwDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=lambda t: t(),
+            input_mode="keyword",
+        )
+        worker.finished_sig.connect(lambda res: finished_payloads.append(res))
+        worker.run()
+
+        # Single call for two units
+        self.assertEqual(mock_ai.chat_completion_json.call_count, 1)
+        self.assertEqual(len(finished_payloads), 1)
+        self.assertEqual(finished_payloads[0]["units_processed"], 2)
+        self.assertEqual(finished_payloads[0].get("warning"), "")
+
+        # 3. Fallback to original keywords on exception with warning
+        mock_ai.chat_completion_json.reset_mock()
+        mock_ai.chat_completion_json.side_effect = Exception("Chat model error")
+        finished_payloads.clear()
+
+        worker_fallback = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Lipidi\n- ApoB48\n",
+            base_deck_name="KwDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=lambda t: t(),
+            input_mode="keyword",
+        )
+        worker_fallback.finished_sig.connect(lambda res: finished_payloads.append(res))
+        worker_fallback.run()
+
+        self.assertEqual(len(finished_payloads), 1)
+        self.assertEqual(finished_payloads[0]["units_processed"], 1)
+        self.assertEqual(
+            finished_payloads[0].get("warning"),
+            "Traduzione non riuscita: keyword usate senza traduzione.",
+        )
+
+        # 4. No chat call with keyword_translate=False
+        cfg_no_trans = ConfigManager()
+        cfg_no_trans.chat_model = "test-chat"
+        cfg_no_trans.embed_model = mid
+        cfg_no_trans.keyword_translate = False
+        mock_ai.chat_completion_json.reset_mock()
+        finished_payloads.clear()
+
+        worker_no_trans = SearchBatchWorker(
+            col=col,
+            config=cfg_no_trans,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Lipidi\n- ApoB48\n",
+            base_deck_name="KwDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=lambda t: t(),
+            input_mode="keyword",
+        )
+        worker_no_trans.finished_sig.connect(lambda res: finished_payloads.append(res))
+        worker_no_trans.run()
+
+        mock_ai.chat_completion_json.assert_not_called()
+        self.assertEqual(finished_payloads[0].get("warning"), "")
+
         col.conn.close()
 
 

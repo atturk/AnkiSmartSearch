@@ -19,7 +19,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         '"deck:AnKing Step Deck" OR "deck:Mastering Radiology"',
     ],
     "search_input_mode": "keyword",
-    "keyword_min_similarity": 0.52,
+    "keyword_min_similarity": 0.55,
+    "keyword_translate": True,
     "chat_provider": "lm_studio",
     "chat_base_url": "http://127.0.0.1:1234/v1",
     "chat_api_key": "",
@@ -77,6 +78,7 @@ class ConfigManager:
     )
     search_input_mode: str = str(DEFAULT_CONFIG["search_input_mode"])
     keyword_min_similarity: float = float(DEFAULT_CONFIG["keyword_min_similarity"])
+    keyword_translate: bool = bool(DEFAULT_CONFIG["keyword_translate"])
     chat_provider: str = DEFAULT_CONFIG["chat_provider"]
     chat_base_url: str = DEFAULT_CONFIG["chat_base_url"]
     chat_api_key: str = DEFAULT_CONFIG["chat_api_key"]
@@ -135,7 +137,7 @@ class ConfigManager:
 
     def get_keyword_min_similarity_threshold(self) -> float:
         """Returns the minimum similarity threshold for keyword mode."""
-        return float(getattr(self, "keyword_min_similarity", 0.52))
+        return float(getattr(self, "keyword_min_similarity", 0.55))
 
     def get_effective_top_k(self) -> int:
         """Returns the number of top candidate notes to keep per concept."""
@@ -220,8 +222,14 @@ class ConfigManager:
             if "search_input_mode" not in data:
                 data["search_input_mode"] = "keyword"
             if "keyword_min_similarity" not in data:
-                data["keyword_min_similarity"] = 0.52
+                data["keyword_min_similarity"] = 0.55
+            if "keyword_translate" not in data:
+                data["keyword_translate"] = True
             data["config_version"] = 5
+            was_migrated = True
+
+        if data.get("keyword_min_similarity") == 0.52:
+            data["keyword_min_similarity"] = 0.55
             was_migrated = True
 
         return data, was_migrated

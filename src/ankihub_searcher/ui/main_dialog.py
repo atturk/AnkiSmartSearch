@@ -94,6 +94,7 @@ except ImportError:
                 self._val = 0.0
                 self._idx = 0
                 self._text = ""
+                self._checked = False
 
             def setValue(self, val):
                 self._val = val
@@ -114,10 +115,10 @@ except ImportError:
                 self._text = text
 
             def isChecked(self):
-                return False
+                return self._checked
 
             def setChecked(self, val):
-                pass
+                self._checked = bool(val)
 
             def text(self):
                 return self._text
@@ -686,6 +687,9 @@ class SearchDialog(QDialog):
                 + "\n\n"
             )
 
+        warning_msg = res.get("warning", "")
+        warn_section = f"⚠️ {warning_msg}\n\n" if warning_msg else ""
+
         # 2. Present clean post-search summary popup with Browser, Coverage Details, Undo & Retry buttons
         parent_widget = mw if mw else None
         msg_box = QMessageBox(parent_widget)
@@ -695,11 +699,18 @@ class SearchDialog(QDialog):
                 msg_box.setIcon(QMessageBox.Icon.Warning)
             except Exception:
                 pass
+        elif warning_msg:
+            msg_box.setWindowTitle("Ricerca completata con avvisi")
+            try:
+                msg_box.setIcon(QMessageBox.Icon.Warning)
+            except Exception:
+                pass
         else:
             msg_box.setWindowTitle("Ricerca completata")
 
         if total_added == 0 and total_already_active > 0:
             msg_box.setText(
+                f"{warn_section}"
                 f"{err_section}"
                 f"Nessuna nuova carta da riattivare.\n\n"
                 f"Carte correlate già attive in studio: {total_already_active}"
@@ -707,12 +718,14 @@ class SearchDialog(QDialog):
             )
         elif total_added == 0 and not total_already_active and err_units:
             msg_box.setText(
+                f"{warn_section}"
                 f"{err_section}"
                 f"Nessun mazzo filtrato creato a causa degli errori sopra indicati."
                 f"{cov_line}"
             )
         else:
             msg_box.setText(
+                f"{warn_section}"
                 f"{err_section}"
                 f"Mazzi filtrati creati: {decks_created}\n"
                 f"Nuove carte riattivate: {total_unsuspended}\n"
@@ -1483,8 +1496,12 @@ class SettingsDialog(QDialog):
         self.spin_kw_thresh.setRange(0.30, 0.90)
         self.spin_kw_thresh.setSingleStep(0.01)
         self.spin_kw_thresh.setDecimals(2)
-        self.spin_kw_thresh.setValue(getattr(self.config, "keyword_min_similarity", 0.52))
+        self.spin_kw_thresh.setValue(getattr(self.config, "keyword_min_similarity", 0.55))
         row_kw_thresh.addWidget(self.spin_kw_thresh)
+        row_kw_thresh.addSpacing(15)
+        self.chk_keyword_translate = QCheckBox("Traduci keyword in inglese")
+        self.chk_keyword_translate.setChecked(bool(getattr(self.config, "keyword_translate", True)))
+        row_kw_thresh.addWidget(self.chk_keyword_translate)
         row_kw_thresh.addStretch()
         select_layout.addLayout(row_kw_thresh)
 
@@ -1786,7 +1803,8 @@ class SettingsDialog(QDialog):
         current_thresh = self.config.get_min_similarity_threshold()
         self.slider_thresh.setValue(int(round(current_thresh * 100)))
         self.lbl_thresh_val.setText(f"{current_thresh:.2f}")
-        self.spin_kw_thresh.setValue(float(getattr(self.config, "keyword_min_similarity", 0.52)))
+        self.spin_kw_thresh.setValue(float(getattr(self.config, "keyword_min_similarity", 0.55)))
+        self.chk_keyword_translate.setChecked(bool(getattr(self.config, "keyword_translate", True)))
 
         self.spin_max_notes.setValue(getattr(self.config, "max_notes_per_concept", 10))
         self.spin_rel_window.setValue(getattr(self.config, "relative_score_window", 0.05))
@@ -2036,6 +2054,7 @@ class SettingsDialog(QDialog):
         thresh = self.slider_thresh.value() / 100.0
         self.config.sensitivity = max(0.0, min(1.0, round((0.70 - thresh) / 0.20, 2)))
         self.config.keyword_min_similarity = round(self.spin_kw_thresh.value(), 2)
+        self.config.keyword_translate = self.chk_keyword_translate.isChecked()
         self.config.max_notes_per_concept = self.spin_max_notes.value()
         self.config.relative_score_window = round(self.spin_rel_window.value(), 4)
         self.config.max_cards_per_unit = self.spin_max_cards.value()

@@ -213,6 +213,48 @@ STAGE1_JSON_SCHEMA: Dict[str, Any] = {
 }
 
 
+SYSTEM_PROMPT_KEYWORD_TRANSLATE = """You are an expert medical translation assistant specializing in USMLE and AnKing medical flashcard decks.
+Your task is to translate Italian medical keywords into their standard English medical terminology as used in USMLE / AnKing.
+
+Guidelines:
+1. For each Italian medical keyword provided, return its standard English medical term.
+2. The keywords are grouped by section/unit title to provide context and disambiguate acronyms (for example, in an inflammatory context "PCR" means "C-reactive protein").
+3. Well-known universal medical acronyms can remain acronyms, but if an acronym is ambiguous, expand it (e.g., "IDL" -> "IDL (intermediate-density lipoprotein)").
+4. Provide only a single short translated term per keyword. Do NOT write full sentences or explanations.
+5. Return strictly a JSON object with a "translations" array containing objects with "it" and "en" keys:
+{
+  "translations": [
+    {"it": "ApoB48", "en": "ApoB-48"},
+    {"it": "Chilomicroni", "en": "Chylomicrons"},
+    {"it": "Recettore LDL", "en": "LDL receptor"}
+  ]
+}
+"""
+
+KEYWORD_TRANSLATION_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "keyword_translations",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "translations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "it": {"type": "string"},
+                        "en": {"type": "string"},
+                    },
+                    "required": ["it", "en"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["translations"],
+        "additionalProperties": False,
+    },
+}
+
+
 def extract_first_sentence(text: str) -> str:
     """Extracts the first sentence from a text block, stripping trailing punctuation."""
     cleaned = (text or "").strip()
@@ -223,18 +265,31 @@ def extract_first_sentence(text: str) -> str:
     return first.rstrip(".!?").strip()
 
 
-def concepts_from_keywords(keywords: Sequence[str]) -> List[ExtractedConcept]:
+def concepts_from_keywords(
+    keywords: Sequence[str],
+    translations: Optional[Dict[str, str]] = None,
+) -> List[ExtractedConcept]:
     """Converts a sequence of keyword strings into ExtractedConcept instances."""
     concepts: List[ExtractedConcept] = []
+    trans_lookup: Dict[str, str] = {}
+    if translations:
+        for k, v in translations.items():
+            k_clean = str(k).strip()
+            v_clean = str(v).strip()
+            if k_clean and v_clean:
+                trans_lookup[k_clean] = v_clean
+                trans_lookup[k_clean.lower()] = v_clean
+
     for kw in keywords:
         cleaned = kw.strip()
         if not cleaned:
             continue
+        trans = trans_lookup.get(cleaned) or trans_lookup.get(cleaned.lower()) or cleaned
         concepts.append(
             ExtractedConcept(
                 topic_it=cleaned,
-                claim_en=cleaned,
-                keywords_en=[cleaned],
+                claim_en=trans,
+                keywords_en=[trans],
                 keywords_it=[cleaned],
                 quote_it=cleaned,
                 source="keyword",
@@ -436,6 +491,121 @@ class SmartSearchPipeline:
             f"Stage 1 extraction failed after 2 attempts: {last_err}"
         )
 
+    # ---------------- Keyword Translation ----------------
+
+    def translate_keywords(self, units: Sequence[LectureUnit]) -> Dict[str, str]:
+        """Translates Italian medical keywords into USMLE/AnKing English terms in a single LLM call.
+
+        Keywords are grouped by unit title for contextual disambiguation.
+        Returns a dict mapping original Italian keyword to translated English term.
+        """
+        prompt_lines: List[str] = []
+        has_keywords = False
+        for unit in units:
+            kws = [k.strip() for k in getattr(unit, "keywords", []) if k.strip()]
+            if not kws:
+                continue
+            has_keywords = True
+            title = unit.unit_title.strip() if unit.unit_title else "Keywords"
+            prompt_lines.append(f"### Unit: {title}")
+            for kw in kws:
+                prompt_lines.append(f"- {kw}")
+
+        if not has_keywords:
+            return {}
+
+        user_prompt = (
+            "Translate the following Italian keywords to standard English medical terms used in USMLE/AnKing:\n\n"
+            + "\n".join(prompt_lines)
+        )
+
+        if "qwen" in (self.config.chat_model or "").lower():
+            user_prompt += "\n\n/no_think"
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_KEYWORD_TRANSLATE},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        def _parse_translations(res_obj: Any) -> Dict[str, str]:
+            trans_dict: Dict[str, str] = {}
+            if isinstance(res_obj, dict):
+                raw_list = res_obj.get("translations")
+                if isinstance(raw_list, list):
+                    for item in raw_list:
+                        if isinstance(item, dict):
+                            it_v = str(item.get("it", "")).strip()
+                            en_v = str(item.get("en", "")).strip()
+                            if it_v and en_v:
+                                trans_dict[it_v] = en_v
+                elif isinstance(raw_list, dict):
+                    for it_k, en_v in raw_list.items():
+                        if str(it_k).strip() and str(en_v).strip():
+                            trans_dict[str(it_k).strip()] = str(en_v).strip()
+                elif "it" in res_obj and "en" in res_obj:
+                    it_v = str(res_obj.get("it", "")).strip()
+                    en_v = str(res_obj.get("en", "")).strip()
+                    if it_v and en_v:
+                        trans_dict[it_v] = en_v
+                else:
+                    for k, v in res_obj.items():
+                        if isinstance(v, str) and k.strip() and v.strip():
+                            trans_dict[k.strip()] = v.strip()
+            elif isinstance(res_obj, list):
+                for item in res_obj:
+                    if isinstance(item, dict):
+                        it_v = str(item.get("it", "")).strip()
+                        en_v = str(item.get("en", "")).strip()
+                        if it_v and en_v:
+                            trans_dict[it_v] = en_v
+            return trans_dict
+
+        last_err: Optional[Exception] = None
+        max_tokens = getattr(self.config, "chat_max_tokens", 16384)
+        use_schema = bool(getattr(self.config, "chat_use_json_schema", False))
+
+        for attempt in range(2):
+            try:
+                schema_to_use = KEYWORD_TRANSLATION_JSON_SCHEMA if use_schema else None
+                res = self.ai_client.chat_completion_json(
+                    messages=messages,
+                    model=self.config.chat_model,
+                    base_url=self.config.chat_base_url,
+                    api_key=self.config.chat_api_key,
+                    temperature=0.1,
+                    json_schema=schema_to_use,
+                    max_tokens=max_tokens,
+                )
+
+                translations = _parse_translations(res)
+                if translations:
+                    return translations
+
+                if schema_to_use is not None:
+                    print(
+                        f"[SmartSearch] Notice: 0 translations with response_format active in attempt {attempt + 1}, retrying once without response_format..."
+                    )
+                    res_no_schema = self.ai_client.chat_completion_json(
+                        messages=messages,
+                        model=self.config.chat_model,
+                        base_url=self.config.chat_base_url,
+                        api_key=self.config.chat_api_key,
+                        temperature=0.1,
+                        json_schema=None,
+                        max_tokens=max_tokens,
+                    )
+                    translations_no_schema = _parse_translations(res_no_schema)
+                    if translations_no_schema:
+                        return translations_no_schema
+
+                raise RuntimeError("LLM response did not contain any valid keyword translations.")
+
+            except Exception as e:
+                last_err = e
+                print(f"[SmartSearch] Notice: Keyword translation attempt {attempt + 1} failed: {e}")
+
+        raise RuntimeError(f"Keyword translation failed after 2 attempts: {last_err}")
+
     # ---------------- Stage 2: Hybrid Retrieval ----------------
 
     def retrieve_for_concepts(
@@ -469,7 +639,7 @@ class SmartSearchPipeline:
         query_texts: List[str] = []
         for c in concepts:
             if getattr(c, "source", "llm") == "keyword":
-                text = c.topic_it or c.claim_en
+                text = c.claim_en or c.topic_it
             elif self.config.embed_language_strategy == "multilingual_direct":
                 kws = ", ".join(k.strip() for k in c.keywords_en if k.strip())
                 text = f"{c.topic_it} | {c.claim_en} | {kws}"
