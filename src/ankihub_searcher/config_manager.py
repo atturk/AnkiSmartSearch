@@ -35,7 +35,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_notes_per_concept": 10,
     "max_cards_per_unit": 150,
     "hybrid_dense_weight": 1.0,
-    "similar_scope": "query",
+    "similar_scope": "all",
     "similar_custom_query": "",
     "similar_min_score": 0.65,
     "similar_max_notes": 20,

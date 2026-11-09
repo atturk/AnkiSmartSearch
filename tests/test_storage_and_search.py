@@ -2584,6 +2584,57 @@ I should decompose this into atomic concepts.
 
         # Browser search should have been updated with comma-separated "nid:502,503"
         self.assertIn("nid:502,503", browser.executed_searches)
+
+        # 5. Test context menu hook (Item 20d)
+        from ankihub_searcher.browser_menu import (
+            on_browser_will_show_context_menu,
+            on_browser_did_fetch_columns,
+            on_browser_did_fetch_row,
+            SimilarNotesDialog,
+        )
+
+        ctx_menu = MockMenu("Context")
+        on_browser_will_show_context_menu(browser, ctx_menu)
+        self.assertEqual(len(ctx_menu.actions), 1)
+        self.assertEqual(ctx_menu.actions[0].text, "Smart Search: Trova carte simili")
+        self.assertEqual(ctx_menu.actions[0].shortcut, "Ctrl+Alt+M")
+        self.assertTrue(ctx_menu.actions[0].enabled)
+
+        # 6. Test custom column registration and row fetching (Item 20c)
+        columns_dict = {}
+        fake_browser_mod = types.ModuleType("aqt.browser")
+        fake_browser_mod.Column = lambda key, cards_mode_label, notes_mode_label: {
+            "key": key,
+            "cards_mode_label": cards_mode_label,
+            "notes_mode_label": notes_mode_label,
+        }
+        fake_browser_mod.Cell = lambda text: type("Cell", (), {"text": text})()
+        with patch.dict(sys.modules, {"aqt.browser": fake_browser_mod}):
+            on_browser_did_fetch_columns(columns_dict)
+            self.assertIn("smart_search_similarity", columns_dict)
+
+            # Test row fetching for matched note 502
+            class MockCellRow:
+                def __init__(self):
+                    self.cells = [type("Cell", (), {"text": ""})()]
+
+            row_matched = MockCellRow()
+            on_browser_did_fetch_row(502, True, row_matched, ["smart_search_similarity"])
+            self.assertEqual(row_matched.cells[0].text, "1.00")
+
+            # Test row fetching for unrelated note 999 (empty)
+            row_unrelated = MockCellRow()
+            on_browser_did_fetch_row(999, True, row_unrelated, ["smart_search_similarity"])
+            self.assertEqual(row_unrelated.cells[0].text, "")
+
+        # 7. Test non-modal panel instantiation (Item 20c)
+        panel = SimilarNotesDialog(
+            browser=browser,
+            matched=[(502, 0.95), (503, 0.92)],
+            min_score=0.65,
+            note_previews={502: "Line 1 of note 502\nLine 2", 503: "Line 1 of note 503"},
+        )
+        self.assertEqual(panel.matched, [(502, 0.95), (503, 0.92)])
         col.conn.close()
 
     def test_workers_and_deck_ops_profile_fallback_with_fake_mw(self):
@@ -2794,6 +2845,14 @@ print("__JSON_RESULT__" + json.dumps(output))
         # 3. Valid string
         dlg_str = SearchDialog(col=col, initial_query="deck:TestDeck")
         self.assertEqual(dlg_str.initial_query, "deck:TestDeck")
+
+        # 4. Opening SearchDialog with a temporary browser query does NOT overwrite saved search_query
+        saved_before = ConfigManager.load().search_query
+        dlg_temp = SearchDialog(col=col, initial_query="aspirin and")
+        dlg_temp._update_query_stats()
+        saved_after = ConfigManager.load().search_query
+        self.assertEqual(saved_before, saved_after)
+        self.assertNotEqual(saved_after, "aspirin and")
 
         col.conn.close()
 

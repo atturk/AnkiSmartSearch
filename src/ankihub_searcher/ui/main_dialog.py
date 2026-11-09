@@ -486,12 +486,6 @@ class SearchDialog(QDialog):
             self.lbl_query_stats.setText(
                 f"Carte: {total_cards:,} ({total_notes:,} note) — Indicizzate: {pct}% ({indexed_notes:,} / {total_notes:,})"
             )
-            # Persist current valid query so IndexDialog sees it immediately
-            self.config.search_query = query
-            extracted_decks = self.indexer.extract_deck_names_from_query(query)
-            if extracted_decks:
-                self.config.selected_decks = extracted_decks
-            self.config.save()
         except Exception:
             self.lbl_query_stats.setText("Query incompleta o sintassi non valida.")
 
@@ -527,6 +521,7 @@ class SearchDialog(QDialog):
                 QMessageBox.warning(self, "Query non valida", f"Errore nella query di ricerca:\n{e}")
                 return
 
+        self.config.search_query = query
         self.config.add_query_to_history(query)
         extracted_decks = self.indexer.extract_deck_names_from_query(query)
         if extracted_decks:
