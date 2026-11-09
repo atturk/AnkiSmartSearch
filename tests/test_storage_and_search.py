@@ -16,7 +16,10 @@ from ankihub_searcher.deck_ops import (
     rollback_run,
 )
 from ankihub_searcher.search_pipeline import (
+    ConceptCoverage,
     ExtractedConcept,
+    STAGE1_JSON_SCHEMA,
+    SYSTEM_PROMPT_STAGE1,
     ScoredNote,
     SmartSearchPipeline,
     Stage1ExtractionError,
@@ -852,6 +855,88 @@ I should decompose this into atomic concepts.
         matched_saved = [r for r in all_runs if r.run_id == run_res.run_id]
         self.assertEqual(len(matched_saved), 1)
         self.assertEqual(matched_saved[0].unit_error, pipeline.last_unit_error)
+        col.conn.close()
+
+    def test_stage1_prompt_entity_and_quote_it(self):
+        # 1. Verify prompt rules: no "3 to 12", mentions entities, prohibitions, quote_it
+        self.assertNotIn("3 to 12", SYSTEM_PROMPT_STAGE1)
+        self.assertIn("quote_it", SYSTEM_PROMPT_STAGE1)
+        self.assertIn("NEVER merge distinct entities", SYSTEM_PROMPT_STAGE1)
+        self.assertIn("Ignore non-medical digressions", SYSTEM_PROMPT_STAGE1)
+
+        # 2. Verify STAGE1_JSON_SCHEMA requires quote_it and other required fields
+        schema_props = STAGE1_JSON_SCHEMA["schema"]["properties"]["concepts"]["items"]["properties"]
+        self.assertIn("quote_it", schema_props)
+        schema_required = STAGE1_JSON_SCHEMA["schema"]["properties"]["concepts"]["items"]["required"]
+        expected_required = ["quote_it", "topic_it", "claim_en", "keywords_en", "keywords_it"]
+        for req in expected_required:
+            self.assertIn(req, schema_required)
+
+        # 3. Test extraction with quote_it and propagation into ConceptCoverage and history
+        col = MockAnkiCol()
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, type, reps) VALUES (9501, 950, 100, 0, -1, 0, 0)")
+        col.conn.commit()
+
+        config = ConfigManager(selected_decks=["AnKing Step Deck"])
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [
+                {
+                    "quote_it": "L'eparina attiva l'antitrombina III inibendo la trombina.",
+                    "topic_it": "Eparina non frazionata",
+                    "claim_en": "Heparin potentiates antithrombin III to inhibit thrombin and factor Xa.",
+                    "keywords_en": ["unfractionated heparin", "antithrombin III", "factor Xa"],
+                    "keywords_it": ["eparina", "antitrombina III"],
+                }
+            ]
+        }
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        pipeline = SmartSearchPipeline(config, self.storage, mock_ai)
+        unit = LectureUnit(
+            "Terapia Anticoagulante",
+            "Farmacologia - Eparina",
+            "L'eparina attiva l'antitrombina III inibendo la trombina.",
+        )
+
+        concepts = pipeline.extract_concepts(unit)
+        self.assertEqual(len(concepts), 1)
+        self.assertEqual(
+            concepts[0].quote_it,
+            "L'eparina attiva l'antitrombina III inibendo la trombina.",
+        )
+
+        # Run search to populate pipeline.last_concept_coverage
+        self.storage.save_embeddings_batch([(950, "default::default", "h", 2, [1.0, 0.0])])
+        results = pipeline.search_unit(unit, candidate_nids=[950], active_model_id="default::default")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(pipeline.last_concept_coverage), 1)
+
+        cov = pipeline.last_concept_coverage[0]
+        self.assertEqual(cov.quote_it, "L'eparina attiva l'antitrombina III inibendo la trombina.")
+
+        # Test to_dict and from_dict
+        cov_dict = cov.to_dict()
+        self.assertEqual(cov_dict["quote_it"], "L'eparina attiva l'antitrombina III inibendo la trombina.")
+        restored_cov = ConceptCoverage.from_dict(cov_dict)
+        self.assertEqual(restored_cov.quote_it, cov.quote_it)
+
+        # Test persistence in SQLite run_history
+        run_res = execute_unit_deck_creation(
+            col=col,
+            unit=unit,
+            matched_nids=[950],
+            config=config,
+            storage=self.storage,
+            concept_coverage=[cov_dict],
+        )
+        saved_run = self.storage.get_run(run_res.run_id)
+        self.assertIsNotNone(saved_run)
+        self.assertEqual(len(saved_run.concept_coverage), 1)
+        self.assertEqual(
+            saved_run.concept_coverage[0]["quote_it"],
+            "L'eparina attiva l'antitrombina III inibendo la trombina.",
+        )
         col.conn.close()
 
 

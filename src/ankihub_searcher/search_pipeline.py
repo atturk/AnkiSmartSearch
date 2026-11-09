@@ -31,6 +31,7 @@ class ExtractedConcept:
     claim_en: str
     keywords_en: List[str]
     keywords_it: List[str] = field(default_factory=list)
+    quote_it: str = ""
 
 
 @dataclass
@@ -56,6 +57,7 @@ class ConceptCoverage:
     best_nid: Optional[int] = None
     best_note_preview: str = ""
     status: str = "uncovered"  # "covered" | "partial" | "uncovered"
+    quote_it: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -68,6 +70,7 @@ class ConceptCoverage:
             "best_nid": self.best_nid,
             "best_note_preview": self.best_note_preview,
             "status": self.status,
+            "quote_it": self.quote_it,
         }
 
     @classmethod
@@ -82,22 +85,34 @@ class ConceptCoverage:
             best_nid=int(data["best_nid"]) if data.get("best_nid") is not None else None,
             best_note_preview=str(data.get("best_note_preview", "")),
             status=str(data.get("status", "uncovered")),
+            quote_it=str(data.get("quote_it", "")),
         )
 
 
 SYSTEM_PROMPT_STAGE1 = """You are an elite medical professor, USMLE Step 1/Step 2 expert, and AnKing deck specialist.
-Your task is to decompose the following Italian lecture notes into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
+Your task is to decompose the following Italian lecture text into atomic medical concepts and translate them into high-yield USMLE English claims and keywords.
 
 CRITICAL INSTRUCTIONS:
-1. Deconstruct the lecture text into 3 to 12 atomic medical concepts.
-2. Resolve Italian medical terminology, historical acronyms, and eponyms into their standard USMLE English equivalents:
+1. Extract an atomic concept for EVERY distinct entity mentioned in the text:
+   - Every disease, syndrome, or pathology.
+   - Every molecular/cellular mechanism, pathway, or receptor.
+   - Every molecule, protein, cytokine, antibody, or biomarker.
+   - Every drug, pharmacological class, or therapeutic agent.
+   - Every clinical sign, symptom, or diagnostic finding.
+   - Every numerical criterion, cutoff, stage, or diagnostic threshold.
+2. STRICT RULES:
+   - NEVER merge distinct entities together into a single concept (e.g., do not combine two different drugs or two separate cytokines).
+   - Forbid generic concepts without a specific entity (e.g., avoid vague concepts like "general therapy" or "pathology overview").
+   - Ignore non-medical digressions entirely (costs, hospital administration, course organization, historical trivia, personal anecdotes).
+3. Resolve Italian medical terminology, historical acronyms, and eponyms into standard USMLE English equivalents:
    - e.g., "NALP3" -> "NLRP3 inflammasome"
    - e.g., "pirofosfato di calcio" -> "calcium pyrophosphate dihydrate (CPPD)", "pseudogout"
    - e.g., "acido urico" -> "uric acid", "monosodium urate", "gout"
    - e.g., "fattore di Hageman" -> "Factor XII", "Hageman factor"
    - e.g., "segno di Cullen" -> "Cullen sign", "acute pancreatitis"
-3. For each concept, provide:
-   - "topic_it": Short Italian topic summary.
+4. For each concept, provide:
+   - "quote_it": The exact Italian sentence or phrase from the lecture text from which this concept originates.
+   - "topic_it": Short Italian topic summary naming the specific entity.
    - "claim_en": 1-2 concise, fact-dense English sentences summarizing the mechanism, pathology, clinical signs, or radiology findings as tested on USMLE/AnKing cards.
    - "keywords_en": 4-10 precise English keywords, synonyms, eponyms, and acronyms.
    - "keywords_it": 3-6 original Italian terms from the lecture.
@@ -108,6 +123,7 @@ Respond strictly with a JSON object in this format:
 {
   "concepts": [
     {
+      "quote_it": "...",
       "topic_it": "...",
       "claim_en": "...",
       "keywords_en": ["...", "..."],
@@ -137,6 +153,7 @@ STAGE1_JSON_SCHEMA: Dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "quote_it": {"type": "string"},
                         "topic_it": {"type": "string"},
                         "claim_en": {"type": "string"},
                         "keywords_en": {
@@ -148,7 +165,7 @@ STAGE1_JSON_SCHEMA: Dict[str, Any] = {
                             "items": {"type": "string"},
                         },
                     },
-                    "required": ["topic_it", "claim_en", "keywords_en", "keywords_it"],
+                    "required": ["quote_it", "topic_it", "claim_en", "keywords_en", "keywords_it"],
                     "additionalProperties": False,
                 },
             }
@@ -229,6 +246,7 @@ class SmartSearchPipeline:
                     claim_en = str(item.get("claim_en", "")).strip()
                     kws_en = [str(k).strip() for k in item.get("keywords_en", []) if str(k).strip()]
                     kws_it = [str(k).strip() for k in item.get("keywords_it", []) if str(k).strip()]
+                    quote_it = str(item.get("quote_it", "")).strip()
 
                     if claim_en or kws_en or topic_it:
                         concepts.append(
@@ -237,6 +255,7 @@ class SmartSearchPipeline:
                                 claim_en=claim_en or topic_it,
                                 keywords_en=kws_en or [unit.unit_title],
                                 keywords_it=kws_it,
+                                quote_it=quote_it,
                             )
                         )
 
@@ -308,6 +327,7 @@ class SmartSearchPipeline:
                         topic_it=concept.topic_it,
                         claim_en=concept.claim_en,
                         keywords_en=list(concept.keywords_en),
+                        quote_it=concept.quote_it,
                     )
                 )
                 continue
@@ -396,6 +416,7 @@ class SmartSearchPipeline:
                     best_score=best_score,
                     best_nid=best_nid,
                     status=c_status,
+                    quote_it=concept.quote_it,
                 )
             )
 
