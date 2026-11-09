@@ -2489,8 +2489,9 @@ I should decompose this into atomic concepts.
                     cb()
 
         class MockMenu:
-            def __init__(self, title=""):
+            def __init__(self, title="", parent=None):
                 self.title = title
+                self.parent = parent
                 self.actions = []
                 self._about_to_show_cbs = []
 
@@ -2498,6 +2499,12 @@ I should decompose this into atomic concepts.
                 act = MockAction(text)
                 self.actions.append(act)
                 return act
+
+            def addSeparator(self):
+                pass
+
+            def setDefaultAction(self, act):
+                pass
 
             @property
             def aboutToShow(self):
@@ -2537,18 +2544,33 @@ I should decompose this into atomic concepts.
         col = MockAnkiCol()
         browser = MockBrowser(col=col, selected_nids=[], current_search_str='"deck:AnKing"')
 
-        # 1. Initialize browser menus
+        # 1. Initialize browser menus (unified Smart Search menu)
         on_browser_menus_did_init(browser)
         self.assertEqual(len(browser.form.menubar.menus), 1)
         menu = browser.form.menubar.menus[0]
         self.assertEqual(menu.title, "Smart Search")
-        self.assertEqual(len(menu.actions), 2)
+        # 7 unified actions
+        self.assertEqual(len(menu.actions), 7)
 
-        act_search = menu.actions[0]
-        act_similar = menu.actions[1]
+        act_new = menu.actions[0]
+        act_search = menu.actions[1]
+        act_similar = menu.actions[2]
+        act_history = menu.actions[3]
+        act_index = menu.actions[4]
+        act_settings = menu.actions[5]
+        act_updates = menu.actions[6]
+
+        self.assertEqual(act_new.text, "Nuova ricerca…")
+        self.assertEqual(act_new.shortcut, "Ctrl+Shift+F")
         self.assertEqual(act_search.text, "Cerca con la query corrente…")
+        self.assertTrue(act_search.enabled)
+
         self.assertEqual(act_similar.text, "Trova carte simili")
         self.assertEqual(act_similar.shortcut, "Ctrl+Alt+M")
+        self.assertEqual(act_history.text, "Cronologia & rollback")
+        self.assertEqual(act_index.text, "Indice")
+        self.assertEqual(act_settings.text, "Impostazioni")
+        self.assertEqual(act_updates.text, "Verifica aggiornamenti")
 
         # Initial selection is empty -> act_similar disabled
         self.assertFalse(act_similar.enabled)
@@ -2885,6 +2907,144 @@ print("__JSON_RESULT__" + json.dumps(output))
         cfg = ConfigManager.load()
         self.assertIn(cfg.menu_location, ["tools", "menubar"])
         col.conn.close()
+
+    def test_unified_menu_structure_and_location(self):
+        """Verifies unified menu across Main Window and Browser Window,
+        disabling browser-dependent actions outside the browser, and
+        supporting menu_location='tools' vs 'menubar'."""
+        from ankihub_searcher.browser_menu import populate_smart_search_menu
+        from ankihub_searcher import init_addon
+
+        class MockAction:
+            def __init__(self, text=""):
+                self.text = text
+                self.enabled = True
+                self.shortcut = ""
+                self.callbacks = []
+
+            def setEnabled(self, val):
+                self.enabled = bool(val)
+
+            def setShortcut(self, sc):
+                self.shortcut = sc
+
+            @property
+            def triggered(self):
+                act_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        act_self.callbacks.append(fn)
+                return _Sig()
+
+        class MockMenu:
+            def __init__(self, title="", parent=None):
+                self.title = title
+                self.parent = parent
+                self.actions = []
+
+            def addAction(self, text):
+                act = MockAction(text)
+                self.actions.append(act)
+                return act
+
+            def addSeparator(self):
+                pass
+
+            def setDefaultAction(self, act):
+                pass
+
+            @property
+            def aboutToShow(self):
+                class _Sig:
+                    def connect(self, fn):
+                        pass
+                return _Sig()
+
+        # 1. Main window menu (browser=None)
+        mw_menu = MockMenu("Smart Search")
+        acts_mw = populate_smart_search_menu(mw_menu, parent_window=None, browser=None)
+
+        self.assertEqual(len(mw_menu.actions), 7)
+        expected_labels = [
+            "Nuova ricerca…",
+            "Cerca con la query corrente…",
+            "Trova carte simili",
+            "Cronologia & rollback",
+            "Indice",
+            "Impostazioni",
+            "Verifica aggiornamenti",
+        ]
+        actual_labels = [a.text for a in mw_menu.actions]
+        self.assertEqual(actual_labels, expected_labels)
+
+        # Outside browser: browser-dependent actions are visible but disabled
+        self.assertTrue(acts_mw["new_search"].enabled)
+        self.assertFalse(acts_mw["search_current"].enabled)
+        self.assertFalse(acts_mw["find_similar"].enabled)
+        self.assertTrue(acts_mw["history"].enabled)
+        self.assertTrue(acts_mw["index"].enabled)
+        self.assertTrue(acts_mw["settings"].enabled)
+        self.assertTrue(acts_mw["updates"].enabled)
+
+        # 2. Browser window menu (browser with selection)
+        class FakeBrowser:
+            def selected_notes(self):
+                return [101]
+
+        browser = FakeBrowser()
+        b_menu = MockMenu("Smart Search")
+        acts_b = populate_smart_search_menu(b_menu, parent_window=browser, browser=browser)
+
+        self.assertEqual([a.text for a in b_menu.actions], expected_labels)
+        self.assertTrue(acts_b["new_search"].enabled)
+        self.assertTrue(acts_b["search_current"].enabled)
+        self.assertTrue(acts_b["find_similar"].enabled)
+
+        # 3. Test init_addon with menu_location='tools' vs 'menubar'
+        class FakeMenubar:
+            def __init__(self):
+                self.menus = []
+            def addMenu(self, title_or_menu):
+                self.menus.append(title_or_menu)
+                return MockMenu(title_or_menu if isinstance(title_or_menu, str) else "")
+
+        class FakeToolsMenu:
+            def __init__(self):
+                self.submenus = []
+            def addMenu(self, menu):
+                self.submenus.append(menu)
+
+        class FakeMW:
+            def __init__(self):
+                self.form = type("Form", (), {
+                    "menubar": FakeMenubar(),
+                    "menuTools": FakeToolsMenu(),
+                })()
+
+        fake_mw = FakeMW()
+        fake_aqt = type("FakeAqt", (), {
+            "mw": fake_mw,
+            "qt": type("Qt", (), {"QAction": MockAction, "QMenu": MockMenu}),
+        })
+
+        with patch.dict(sys.modules, {"aqt": fake_aqt, "aqt.qt": fake_aqt.qt}):
+            # Tools menu
+            with patch.object(ConfigManager, "load", return_value=ConfigManager(menu_location="tools")):
+                init_addon()
+                self.assertEqual(len(fake_mw.form.menuTools.submenus), 1)
+                self.assertEqual(len(fake_mw.form.menubar.menus), 0)
+
+            # Menubar
+            fake_mw_menubar = FakeMW()
+            fake_aqt_mb = type("FakeAqt", (), {
+                "mw": fake_mw_menubar,
+                "qt": type("Qt", (), {"QAction": MockAction, "QMenu": MockMenu}),
+            })
+            with patch.dict(sys.modules, {"aqt": fake_aqt_mb, "aqt.qt": fake_aqt_mb.qt}):
+                with patch.object(ConfigManager, "load", return_value=ConfigManager(menu_location="menubar")):
+                    init_addon()
+                    self.assertEqual(len(fake_mw_menubar.form.menubar.menus), 1)
+                    self.assertEqual(len(fake_mw_menubar.form.menuTools.submenus), 0)
 
 
 

@@ -390,17 +390,58 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
         _on_success(res)
 
 
-def _open_search_from_browser(browser: Any) -> None:
-    """Opens SearchDialog pre-filled with the browser's current search query."""
-    query = get_browser_search_text(browser)
+def _open_search_dialog(parent: Any, initial_query: Optional[str] = None) -> None:
+    """Opens SearchDialog with the given parent and optional initial query."""
     try:
         from .ui.main_dialog import SearchDialog
 
-        col = getattr(browser, "col", None) or (mw.col if mw else None)
-        dialog = SearchDialog(col=col, parent=browser, initial_query=query)
+        col = getattr(parent, "col", None) or (mw.col if mw else None)
+        dialog = SearchDialog(col=col, parent=parent, initial_query=initial_query)
         dialog.exec()
     except Exception as e:
-        print(f"[SmartSearch] Error opening SearchDialog from browser: {e}")
+        print(f"[SmartSearch] Error opening SearchDialog: {e}")
+
+
+def _open_history_dialog(parent: Any) -> None:
+    """Opens HistoryDialog with the given parent."""
+    try:
+        from .ui.main_dialog import HistoryDialog
+
+        col = getattr(parent, "col", None) or (mw.col if mw else None)
+        dialog = HistoryDialog(col=col, parent=parent)
+        dialog.exec()
+    except Exception as e:
+        print(f"[SmartSearch] Error opening HistoryDialog: {e}")
+
+
+def _open_index_dialog(parent: Any) -> None:
+    """Opens IndexDialog with the given parent."""
+    try:
+        from .ui.main_dialog import IndexDialog
+
+        col = getattr(parent, "col", None) or (mw.col if mw else None)
+        dialog = IndexDialog(col=col, parent=parent)
+        dialog.exec()
+    except Exception as e:
+        print(f"[SmartSearch] Error opening IndexDialog: {e}")
+
+
+def _open_settings_dialog(parent: Any) -> None:
+    """Opens SettingsDialog with the given parent."""
+    try:
+        from .ui.main_dialog import SettingsDialog
+
+        col = getattr(parent, "col", None) or (mw.col if mw else None)
+        dialog = SettingsDialog(col=col, parent=parent)
+        dialog.exec()
+    except Exception as e:
+        print(f"[SmartSearch] Error opening SettingsDialog: {e}")
+
+
+def _open_search_from_browser(browser: Any) -> None:
+    """Opens SearchDialog pre-filled with the browser's current search query."""
+    query = get_browser_search_text(browser)
+    _open_search_dialog(parent=browser, initial_query=query)
 
 
 def _update_similar_action_state(browser: Any) -> None:
@@ -418,30 +459,119 @@ def _update_similar_action_state(browser: Any) -> None:
             pass
 
 
+def populate_smart_search_menu(
+    menu: Any, parent_window: Any, browser: Optional[Any] = None
+) -> Dict[str, Any]:
+    """Populates a QMenu with the unified Smart Search action items.
+
+    Items and order:
+    1. Nuova ricerca… (Ctrl+Shift+F)
+    2. Cerca con la query corrente… (disabled outside browser)
+    3. Trova carte simili (Ctrl+Alt+M, disabled outside browser or without selection)
+    -- Separator --
+    4. Cronologia & rollback
+    5. Indice
+    6. Impostazioni
+    -- Separator --
+    7. Verifica aggiornamenti
+    """
+    from .updater import run_update_check_ui
+
+    actions: Dict[str, Any] = {}
+
+    # 1. Nuova ricerca…
+    act_new = menu.addAction("Nuova ricerca…")
+    if hasattr(act_new, "setShortcut"):
+        act_new.setShortcut("Ctrl+Shift+F")
+    act_new.triggered.connect(
+        lambda _checked=False: _open_search_dialog(browser or parent_window)
+    )
+    actions["new_search"] = act_new
+
+    if hasattr(menu, "setDefaultAction"):
+        menu.setDefaultAction(act_new)
+
+    # 2. Cerca con la query corrente…
+    act_current = menu.addAction("Cerca con la query corrente…")
+    if browser is not None:
+        act_current.setEnabled(True)
+        act_current.triggered.connect(
+            lambda _checked=False: _open_search_from_browser(browser)
+        )
+    else:
+        act_current.setEnabled(False)
+    actions["search_current"] = act_current
+
+    # 3. Trova carte simili
+    act_similar = menu.addAction("Trova carte simili")
+    if hasattr(act_similar, "setShortcut"):
+        # Scorciatoia Ctrl+Alt+M: verificato sul form del Browser di Anki che Ctrl+Shift+S
+        # è già occupata da "Riposiziona" e Ctrl+Alt+S è occupata da "Inverti selezione".
+        act_similar.setShortcut("Ctrl+Alt+M")
+    if browser is not None:
+        has_sel = (
+            bool(browser.selected_notes())
+            if hasattr(browser, "selected_notes")
+            else False
+        )
+        act_similar.setEnabled(has_sel)
+        act_similar.triggered.connect(
+            lambda _checked=False: on_find_similar_cards_clicked(browser)
+        )
+        setattr(browser, "_smart_search_similar_action", act_similar)
+        if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):
+            menu.aboutToShow.connect(lambda: _update_similar_action_state(browser))
+    else:
+        act_similar.setEnabled(False)
+    actions["find_similar"] = act_similar
+
+    menu.addSeparator()
+
+    # 4. Cronologia & rollback
+    act_history = menu.addAction("Cronologia & rollback")
+    act_history.triggered.connect(
+        lambda _checked=False: _open_history_dialog(browser or parent_window)
+    )
+    actions["history"] = act_history
+
+    # 5. Indice
+    act_index = menu.addAction("Indice")
+    act_index.triggered.connect(
+        lambda _checked=False: _open_index_dialog(browser or parent_window)
+    )
+    actions["index"] = act_index
+
+    # 6. Impostazioni
+    act_settings = menu.addAction("Impostazioni")
+    act_settings.triggered.connect(
+        lambda _checked=False: _open_settings_dialog(browser or parent_window)
+    )
+    actions["settings"] = act_settings
+
+    menu.addSeparator()
+
+    # 7. Verifica aggiornamenti
+    act_updates = menu.addAction("Verifica aggiornamenti")
+    act_updates.triggered.connect(
+        lambda _checked=False: run_update_check_ui(browser or parent_window)
+    )
+    actions["updates"] = act_updates
+
+    return actions
+
+
 def on_browser_menus_did_init(browser: Any) -> None:
-    """Adds the Smart Search menu to the Browser menubar."""
+    """Adds the unified Smart Search menu to the Browser menubar."""
     try:
-        menubar = getattr(browser.form, "menubar", None) or getattr(browser, "menubar", None)
+        menubar = (
+            getattr(browser.form, "menubar", None)
+            or getattr(browser, "menubar", None)
+        )
         if not menubar:
             return
 
         menu = menubar.addMenu("Smart Search")
-
-        act_search = menu.addAction("Cerca con la query corrente…")
-        act_search.triggered.connect(lambda _checked=False: _open_search_from_browser(browser))
-
-        act_similar = menu.addAction("Trova carte simili")
-        if hasattr(act_similar, "setShortcut"):
-            # Scorciatoia Ctrl+Alt+M: verificato sul form del Browser di Anki che Ctrl+Shift+S
-            # è già occupata da "Riposiziona" e Ctrl+Alt+S è occupata da "Inverti selezione".
-            act_similar.setShortcut("Ctrl+Alt+M")
-        act_similar.triggered.connect(lambda _checked=False: on_find_similar_cards_clicked(browser))
-        setattr(browser, "_smart_search_similar_action", act_similar)
-
-        if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):
-            menu.aboutToShow.connect(lambda: _update_similar_action_state(browser))
-
-        _update_similar_action_state(browser)
+        populate_smart_search_menu(menu=menu, parent_window=browser, browser=browser)
     except Exception as e:
         print(f"[SmartSearch] Error initializing browser menu: {e}")
 
