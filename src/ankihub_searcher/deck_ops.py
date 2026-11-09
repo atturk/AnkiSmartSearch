@@ -141,6 +141,13 @@ def execute_unit_deck_creation(
 ) -> RunResult:
     """Unsuspends matching cards and builds a clean Filtered Deck with cid: search query."""
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    if not profile:
+        try:
+            from aqt import mw
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                profile = str(mw.pm.name or "")
+        except Exception:
+            profile = ""
     coverage_list = list(concept_coverage) if concept_coverage else []
     target_deck_name = _format_target_deck_name(unit.deck_name, parent_deck_prefix)
 
@@ -359,6 +366,14 @@ def rollback_run(
             kept_reviewed_count=0,
         )
 
+    if not current_profile:
+        try:
+            from aqt import mw
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                current_profile = str(mw.pm.name or "")
+        except Exception:
+            current_profile = ""
+
     if record.profile and current_profile and record.profile != current_profile:
         raise ValueError(
             f"Rollback rifiutato: il run appartiene al profilo '{record.profile}', mentre il profilo aperto è '{current_profile}'."
@@ -569,6 +584,14 @@ def create_batch_filtered_decks_op(
     """
     assign_notes_to_best_units(units_data)
 
+    if not profile:
+        try:
+            from aqt import mw
+            if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                profile = str(mw.pm.name or "")
+        except Exception:
+            profile = ""
+
     undo_pos = None
     if hasattr(col, "add_custom_undo_entry"):
         try:
@@ -588,7 +611,7 @@ def create_batch_filtered_decks_op(
             parent_deck_prefix=parent_deck_prefix,
             allowed_cids=allowed_cids,
             unit_error=item.get("unit_error", ""),
-            profile=item.get("profile", profile),
+            profile=item.get("profile") or profile,
             search_id=item.get("search_id", search_id),
         )
         results.append(run_res)

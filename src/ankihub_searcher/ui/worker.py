@@ -182,6 +182,13 @@ class SearchBatchWorker(QThread):
         self.base_deck_name = base_deck_name
         self.precomputed_data = precomputed_data
         self.main_thread_runner = main_thread_runner
+        if not profile:
+            try:
+                from aqt import mw
+                if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                    profile = str(mw.pm.name or "")
+            except Exception:
+                profile = ""
         self.profile = profile
         self._is_cancelled = False
 
@@ -479,6 +486,13 @@ class RollbackWorker(QThread):
         self.run_id = run_id
         self.keep_reviewed = keep_reviewed
         self.main_thread_runner = main_thread_runner
+        if not current_profile:
+            try:
+                from aqt import mw
+                if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "name"):
+                    current_profile = str(mw.pm.name or "")
+            except Exception:
+                current_profile = ""
         self.current_profile = current_profile
 
     def run(self) -> None:

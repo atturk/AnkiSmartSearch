@@ -2,7 +2,7 @@
 
 Registers the "Smart Search" menu inside Anki's Browser window:
 1. "Cerca con la query corrente…": opens SearchDialog pre-filled with the current browser search query.
-2. "Trova carte simili" (Ctrl+Shift+S): enabled only when at least 1 card is selected;
+2. "Trova carte simili" (Ctrl+Alt+M): enabled only when at least 1 card is selected;
    computes cosine similarity across indexed notes using the normalized mean vector of selected notes,
    and displays matching note IDs in the browser search bar.
 """
@@ -249,7 +249,9 @@ def on_browser_menus_did_init(browser: Any) -> None:
 
         act_similar = menu.addAction("Trova carte simili")
         if hasattr(act_similar, "setShortcut"):
-            act_similar.setShortcut("Ctrl+Shift+S")
+            # Scorciatoia Ctrl+Alt+M: verificato sul form del Browser di Anki che Ctrl+Shift+S
+            # è già occupata da "Riposiziona" e Ctrl+Alt+S è occupata da "Inverti selezione".
+            act_similar.setShortcut("Ctrl+Alt+M")
         act_similar.triggered.connect(lambda: on_find_similar_cards_clicked(browser))
         setattr(browser, "_smart_search_similar_action", act_similar)
 

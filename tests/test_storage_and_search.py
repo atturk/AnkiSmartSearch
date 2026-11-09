@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -2546,7 +2547,7 @@ I should decompose this into atomic concepts.
         act_similar = menu.actions[1]
         self.assertEqual(act_search.text, "Cerca con la query corrente…")
         self.assertEqual(act_similar.text, "Trova carte simili")
-        self.assertEqual(act_similar.shortcut, "Ctrl+Shift+S")
+        self.assertEqual(act_similar.shortcut, "Ctrl+Alt+M")
 
         # Initial selection is empty -> act_similar disabled
         self.assertFalse(act_similar.enabled)
@@ -2582,6 +2583,89 @@ I should decompose this into atomic concepts.
 
         # Browser search should have been updated with comma-separated "nid:502,503"
         self.assertIn("nid:502,503", browser.executed_searches)
+        col.conn.close()
+
+    def test_workers_and_deck_ops_profile_fallback_with_fake_mw(self):
+        from ankihub_searcher.deck_ops import create_batch_filtered_decks_op
+        from ankihub_searcher.ui.worker import SearchBatchWorker, RollbackWorker
+        from ankihub_searcher.text_utils import LectureUnit
+
+        fake_mw = MagicMock()
+        fake_mw.pm.name = "FakeDoctorProfile"
+
+        col = MockAnkiCol()
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (8801, 880, 100, 0, -1)")
+        col.conn.commit()
+
+        cfg = ConfigManager()
+
+        fake_aqt = types.ModuleType("aqt")
+        fake_aqt.mw = fake_mw
+
+        with patch.dict(sys.modules, {"aqt": fake_aqt}):
+            # 1. SearchBatchWorker constructor with empty profile reads from fake_mw
+            worker = SearchBatchWorker(
+                col=col,
+                config=cfg,
+                storage=self.storage,
+                ai_client=MagicMock(),
+                raw_text="Sample",
+                base_deck_name="Test Deck",
+                profile="",
+            )
+            self.assertEqual(worker.profile, "FakeDoctorProfile")
+
+            # 2. RollbackWorker constructor with empty current_profile reads from fake_mw
+            rb_worker = RollbackWorker(
+                col=col,
+                storage=self.storage,
+                run_id="run_test",
+                current_profile="",
+            )
+            self.assertEqual(rb_worker.current_profile, "FakeDoctorProfile")
+
+            # 3. create_batch_filtered_decks_op with empty profile reads from fake_mw
+            unit = LectureUnit(
+                unit_title="Unit Fallback",
+                deck_name="Test - Unit Fallback",
+                body_text="Body text",
+            )
+            units_data = [
+                {
+                    "unit": unit,
+                    "matched_nids": [880],
+                    "concept_coverage": [],
+                }
+            ]
+            results, changes = create_batch_filtered_decks_op(
+                col=col,
+                units_data=units_data,
+                config=cfg,
+                storage=self.storage,
+                profile="",
+            )
+            self.assertEqual(len(results), 1)
+            saved_rec = self.storage.get_run(results[0].run_id)
+            self.assertIsNotNone(saved_rec)
+            self.assertEqual(saved_rec.profile, "FakeDoctorProfile")
+
+        # 4. Fallback to "" when mw is None or pm.name is empty
+        fake_aqt_empty = types.ModuleType("aqt")
+        fake_empty_mw = MagicMock()
+        fake_empty_mw.pm.name = ""
+        fake_aqt_empty.mw = fake_empty_mw
+        with patch.dict(sys.modules, {"aqt": fake_aqt_empty}):
+            worker_empty = SearchBatchWorker(
+                col=col,
+                config=cfg,
+                storage=self.storage,
+                ai_client=MagicMock(),
+                raw_text="Sample",
+                base_deck_name="Test Deck",
+                profile="",
+            )
+            self.assertEqual(worker_empty.profile, "")
+
         col.conn.close()
 
 
