@@ -1005,6 +1005,100 @@ I should decompose this into atomic concepts.
         # Best is 701, next within window is 702. 703 dropped by max_notes_per_concept=2. 704 dropped by relative window.
         self.assertEqual(scored_nids, [701, 702])
 
+    def test_fts_clean_lexical_search_and_30k_candidates(self):
+        # 1. Test stopword and <3 char discarding
+        hits_empty = self.storage.search_fts(["the", "di", "in", "a", "x", "no"])
+        self.assertEqual(hits_empty, [])
+
+        # Seed sample notes for phrase query testing
+        self.storage.upsert_notes_content_batch(
+            [
+                (1101, 1, 100, "h1101", "Patient presents with acute pancreatitis and elevated amylase.", "GI"),
+                (1102, 1, 100, "h1102", "Pancreatitis can be chronic or recurrent.", "GI"),
+                (1103, 1, 100, "h1103", "Acute intermittent porphyria has neurological symptoms.", "Heme"),
+            ]
+        )
+
+        # 2. Test multi-word phrase query: "acute pancreatitis"
+        # 1101 has the exact phrase -> must be the top result with higher score than 1102 or 1103
+        phrase_hits = self.storage.search_fts(["acute pancreatitis"])
+        self.assertTrue(len(phrase_hits) >= 2)
+        self.assertEqual(phrase_hits[0][0], 1101)
+        self.assertEqual(phrase_hits[0][1], 1.0)
+        # 1102 matched only 'pancreatitis', so its score should be lower than 1101
+        hit_1102 = next((h for h in phrase_hits if h[0] == 1102), None)
+        self.assertIsNotNone(hit_1102)
+        self.assertLess(hit_1102[1], 1.0)
+
+        # 3. Test quote escaping inside phrase query
+        hits_quoted = self.storage.search_fts(['"acute" pancreatitis'])
+        self.assertTrue(len(hits_quoted) >= 1)
+        self.assertEqual(hits_quoted[0][0], 1101)
+
+        # 4. Test candidate filtering with 30,000 NIDs (avoids SQLite variable limits)
+        # Note 1101 is included in the 30k candidates; Note 1102 is NOT.
+        large_candidates = list(range(2000, 32000)) + [1101]
+        self.assertEqual(len(large_candidates), 30001)
+
+        large_filtered_hits = self.storage.search_fts(
+            keywords=["acute pancreatitis"],
+            candidate_nids=large_candidates,
+            limit=50,
+        )
+        returned_nids = {h[0] for h in large_filtered_hits}
+        self.assertIn(1101, returned_nids)
+        self.assertNotIn(1102, returned_nids)
+        self.assertNotIn(1103, returned_nids)
+
+        # 5. Test fts_use_italian_keywords option in SmartSearchPipeline
+        cfg_default = ConfigManager()
+        self.assertFalse(cfg_default.fts_use_italian_keywords)
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [
+                {
+                    "quote_it": "Pancreatite acuta",
+                    "topic_it": "Pancreatite acuta",
+                    "claim_en": "Acute pancreatitis signs",
+                    "keywords_en": ["acute pancreatitis"],
+                    "keywords_it": ["pancreatite acuta"],
+                }
+            ]
+        }
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+        mid = cfg_default.get_active_model_id()
+        self.storage.save_embeddings_batch([(1101, mid, "h", 2, [1.0, 0.0])])
+
+        # Spy on storage.search_fts
+        original_search_fts = self.storage.search_fts
+        captured_keywords = []
+
+        def spy_search_fts(keywords, candidate_nids=None, limit=100):
+            captured_keywords.append(list(keywords))
+            return original_search_fts(keywords, candidate_nids=candidate_nids, limit=limit)
+
+        self.storage.search_fts = spy_search_fts
+
+        # With default fts_use_italian_keywords=False: only keywords_en passed
+        pipeline = SmartSearchPipeline(cfg_default, self.storage, mock_ai)
+        unit = LectureUnit("Test", "Test", "Pancreatite acuta")
+        pipeline.search_unit(unit, candidate_nids=[1101], active_model_id=mid)
+        self.assertEqual(len(captured_keywords), 1)
+        self.assertIn("acute pancreatitis", captured_keywords[0])
+        self.assertNotIn("pancreatite acuta", captured_keywords[0])
+
+        # With fts_use_italian_keywords=True: both keywords_en and keywords_it passed
+        captured_keywords.clear()
+        cfg_it = ConfigManager(fts_use_italian_keywords=True)
+        pipeline_it = SmartSearchPipeline(cfg_it, self.storage, mock_ai)
+        pipeline_it.search_unit(unit, candidate_nids=[1101], active_model_id=mid)
+        self.assertEqual(len(captured_keywords), 1)
+        self.assertIn("acute pancreatitis", captured_keywords[0])
+        self.assertIn("pancreatite acuta", captured_keywords[0])
+
+        self.storage.search_fts = original_search_fts
+
 
 if __name__ == "__main__":
     unittest.main()

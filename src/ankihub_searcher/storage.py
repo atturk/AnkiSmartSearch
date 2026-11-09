@@ -66,6 +66,26 @@ def unpack_vector(blob: bytes, dim: int) -> List[float]:
     return list(struct.unpack(f"<{dim}f", blob))
 
 
+# Short list of English and Italian stopwords discarded during FTS lexical search
+_FTS_STOPWORDS = {
+    # English
+    "a", "an", "the", "and", "or", "but", "if", "of", "at", "by", "for", "with",
+    "about", "against", "between", "into", "through", "during", "before", "after",
+    "above", "below", "to", "from", "up", "down", "in", "out", "on", "off", "over",
+    "under", "again", "further", "then", "once", "here", "there", "when", "where",
+    "why", "how", "all", "any", "both", "each", "few", "more", "most", "other",
+    "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too",
+    "very", "can", "will", "just", "don", "should", "now", "are", "is", "was", "were",
+    # Italian
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "da", "con",
+    "su", "per", "tra", "fra", "ed", "del", "dello", "della", "dei", "degli",
+    "delle", "al", "allo", "alla", "ai", "agli", "alle", "dal", "dallo", "dalla",
+    "dai", "dagli", "dalle", "nel", "nello", "nella", "nei", "negli", "nelle",
+    "sul", "sullo", "sulla", "sui", "sugli", "sulle", "che", "non", "si", "ma",
+    "anche", "come", "piu", "sono", "sia", "era", "stato", "stata", "stati", "state",
+}
+
+
 class SearchDatabase:
     """Thread-safe SQLite database manager for Smart Search."""
 
@@ -586,56 +606,101 @@ class SearchDatabase:
         """Searches notes_fts using BM25 ranking.
 
         keywords: list of terms/phrases.
+        candidate_nids: optional collection of note IDs to filter within SQL.
         Returns list of (nid, normalized_bm25_score in [0, 1]).
         """
         if not keywords:
             return []
 
-        # Sanitize query tokens and support prefix/stem matching for singular/plural inflection
-        clean_terms = []
-        for kw in keywords:
-            # Keep letters, numbers, and hyphens/underscores
-            term = "".join(c if (c.isalnum() or c in "-_") else " " for c in kw).strip()
-            for sub in term.split():
-                sub_clean = sub.strip()
-                if len(sub_clean) >= 2:
-                    stem = re.sub(r"(?:ies|es|s)$", "", sub_clean.lower())
-                    if len(stem) >= 3:
-                        clean_terms.append(f"{stem}*")
-                    else:
-                        clean_terms.append(f"{sub_clean}*")
-
-        if not clean_terms:
+        if candidate_nids is not None and len(candidate_nids) == 0:
             return []
 
-        # Deduplicate terms
-        unique_terms = list(dict.fromkeys(clean_terms))
-        fts_query = " OR ".join(unique_terms)
+        # Sanitize query tokens:
+        # 1. Discard tokens < 3 characters and stopwords (English + Italian).
+        # 2. Multi-word keywords -> phrase query ("acute pancreatitis") in OR with significant individual tokens.
+        # 3. Escape internal double quotes in phrases.
+        query_parts: List[str] = []
+        seen_terms: Set[str] = set()
+
+        for kw in keywords:
+            if not kw or not kw.strip():
+                continue
+
+            raw_words = re.findall(r"\b[A-Za-z0-9_-]+\b", kw)
+            sig_words: List[str] = []
+            for w in raw_words:
+                clean_w = w.strip("-_")
+                if len(clean_w) >= 3 and clean_w.lower() not in _FTS_STOPWORDS:
+                    sig_words.append(clean_w)
+
+            if not sig_words:
+                continue
+
+            # Multi-word phrase query in FTS5
+            if len(sig_words) > 1:
+                escaped_phrase = " ".join(sig_words).replace('"', '""')
+                phrase_clause = f'"{escaped_phrase}"'
+                if phrase_clause not in seen_terms:
+                    seen_terms.add(phrase_clause)
+                    query_parts.append(phrase_clause)
+
+            # Individual tokens with prefix matching for singular/plural inflection
+            for w in sig_words:
+                stem = re.sub(r"(?:ies|es|s)$", "", w.lower())
+                token = f"{stem}*" if len(stem) >= 3 else f"{w.lower()}*"
+                if token not in seen_terms:
+                    seen_terms.add(token)
+                    query_parts.append(token)
+
+        if not query_parts:
+            return []
+
+        fts_query = " OR ".join(query_parts)
+        effective_limit = max(limit, 300)
 
         with self._get_connection() as conn:
             cur = conn.cursor()
-            # bm25() in FTS5 returns negative numbers where smaller (more negative) is better
             try:
-                cur.execute(
-                    "SELECT nid, bm25(notes_fts, 1.0, 1.5) as score FROM notes_fts WHERE notes_fts MATCH ? ORDER BY score ASC LIMIT 300",
-                    (fts_query,),
-                )
-                rows = cur.fetchall()
-            except sqlite3.OperationalError:
+                if candidate_nids is not None:
+                    # Filter candidates directly inside SQL using a temp table to avoid SQLite variable limits (up to 30k+ NIDs)
+                    conn.execute("CREATE TEMP TABLE temp_fts_cand (nid INTEGER PRIMARY KEY)")
+                    conn.executemany("INSERT OR IGNORE INTO temp_fts_cand (nid) VALUES (?)", ((int(n),) for n in candidate_nids))
+                    cur.execute(
+                        """
+                        SELECT f.nid, bm25(notes_fts, 1.0, 1.5) as score
+                        FROM notes_fts f
+                        JOIN temp_fts_cand c ON f.nid = c.nid
+                        WHERE notes_fts MATCH ?
+                        ORDER BY score ASC
+                        LIMIT ?
+                        """,
+                        (fts_query, effective_limit),
+                    )
+                    rows = cur.fetchall()
+                    conn.execute("DROP TABLE IF EXISTS temp_fts_cand")
+                else:
+                    cur.execute(
+                        """
+                        SELECT nid, bm25(notes_fts, 1.0, 1.5) as score
+                        FROM notes_fts
+                        WHERE notes_fts MATCH ?
+                        ORDER BY score ASC
+                        LIMIT ?
+                        """,
+                        (fts_query, effective_limit),
+                    )
+                    rows = cur.fetchall()
+            except sqlite3.OperationalError as e:
                 # Fallback if syntax error occurs
+                print(f"[SmartSearch] Notice: FTS5 query operational error: {e}")
                 return []
 
         if not rows:
             return []
 
-        candidate_set: Optional[Set[int]] = set(candidate_nids) if candidate_nids is not None else None
-
-        filtered = []
+        filtered: List[Tuple[int, float]] = []
         for r in rows:
-            nid = r["nid"]
-            if candidate_set is not None and nid not in candidate_set:
-                continue
-            # r["score"] is negative (e.g., -15.4)
+            nid = int(r["nid"])
             raw_bm = float(r["score"])
             # Invert to positive magnitude: higher is better
             abs_bm = max(0.0, -raw_bm)

@@ -342,7 +342,10 @@ class SmartSearchPipeline:
             dense_scores: Dict[int, float] = {nid: score for nid, score in dense_hits}
 
             # B. Lexical FTS5 BM25
-            all_kws = concept.keywords_en + concept.keywords_it
+            if getattr(self.config, "fts_use_italian_keywords", False):
+                all_kws = concept.keywords_en + concept.keywords_it
+            else:
+                all_kws = list(concept.keywords_en) if concept.keywords_en else list(concept.keywords_it)
             fts_hits = self.storage.search_fts(
                 keywords=all_kws,
                 candidate_nids=candidate_nids,

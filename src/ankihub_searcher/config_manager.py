@@ -33,6 +33,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_notes_per_concept": 30,
     "max_cards_per_unit": 150,
     "hybrid_dense_weight": 0.78,
+    "fts_use_italian_keywords": False,
     "enable_llm_verification": False,
     "include_active_cards_in_filtered_deck": False,
     "batch_deck_naming_style": "dash",
@@ -82,6 +83,7 @@ class ConfigManager:
     max_notes_per_concept: int = int(DEFAULT_CONFIG["max_notes_per_concept"])
     max_cards_per_unit: int = int(DEFAULT_CONFIG["max_cards_per_unit"])
     hybrid_dense_weight: float = float(DEFAULT_CONFIG["hybrid_dense_weight"])
+    fts_use_italian_keywords: bool = bool(DEFAULT_CONFIG.get("fts_use_italian_keywords", False))
     enable_llm_verification: bool = bool(DEFAULT_CONFIG["enable_llm_verification"])
     include_active_cards_in_filtered_deck: bool = bool(DEFAULT_CONFIG["include_active_cards_in_filtered_deck"])
     batch_deck_naming_style: str = DEFAULT_CONFIG["batch_deck_naming_style"]
