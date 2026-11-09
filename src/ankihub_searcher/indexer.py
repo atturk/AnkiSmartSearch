@@ -198,39 +198,19 @@ class DeckIndexer:
         except Exception:
             return None
 
-    def index_selected_decks(
+    def scan_notes_metadata(
         self,
         col: Any,
-        selected_deck_names: Optional[List[str]] = None,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        nids: List[int],
         cancel_check: Optional[Callable[[], bool]] = None,
-        batch_size: int = 32,
-        search_query: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Runs incremental indexing on notes from a Browser search query or selected decks.
+    ) -> Tuple[Dict[int, Tuple[int, str]], Dict[int, Tuple[int, int, str, str, str]]]:
+        """Scans notes metadata and text from Anki collection (safe to run on main thread or QueryOp).
 
-        Commits embeddings after every batch to guarantee instant pause/resume safety.
+        Returns:
+            (notes_meta, notes_raw_data)
         """
-        if search_query and search_query.strip():
-            nids = self.get_notes_for_query(col, search_query.strip())
-        elif selected_deck_names is not None:
-            target_dids = self.find_target_deck_ids(col, selected_deck_names)
-            nids = self.get_notes_in_decks(col, target_dids)
-        elif self.config.search_query and self.config.search_query.strip() and hasattr(col, "find_notes"):
-            nids = self.get_notes_for_query(col, self.config.search_query.strip())
-        else:
-            decks_to_index = self.config.selected_decks
-            target_dids = self.find_target_deck_ids(col, decks_to_index)
-            nids = self.get_notes_in_decks(col, target_dids)
-
         if not nids:
-            if progress_callback:
-                progress_callback(0, 0, "Nessuna nota trovata nei mazzi selezionati.")
-            return {"total": 0, "text_indexed": 0, "embeddings_indexed": 0, "cancelled": False}
-
-        # Step 1: Read notes metadata from Anki
-        if progress_callback:
-            progress_callback(0, len(nids), f"Scansione di {len(nids)} note nei mazzi selezionati...")
+            return {}, {}
 
         # Map model IDs to model structures
         models_by_mid: Dict[int, Any] = {}
@@ -257,7 +237,7 @@ class DeckIndexer:
         chunk_size = 1000
         for i in range(0, len(nids), chunk_size):
             if cancel_check and cancel_check():
-                return {"total": len(nids), "text_indexed": 0, "embeddings_indexed": 0, "cancelled": True}
+                break
 
             chunk = nids[i : i + chunk_size]
             placeholders = ",".join(str(x) for x in chunk)
@@ -311,6 +291,51 @@ class DeckIndexer:
 
                 notes_meta[nid] = (note_mod, content_hash)
                 notes_raw_data[nid] = (mid, note_mod, content_hash, clean_text, clean_tags_str)
+
+        return notes_meta, notes_raw_data
+
+    def index_selected_decks(
+        self,
+        col: Any,
+        selected_deck_names: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        batch_size: int = 32,
+        search_query: Optional[str] = None,
+        precomputed_notes_data: Optional[Tuple[Dict[int, Tuple[int, str]], Dict[int, Tuple[int, int, str, str, str]]]] = None,
+    ) -> Dict[str, Any]:
+        """Runs incremental indexing on notes from a Browser search query or selected decks.
+
+        Commits embeddings after every batch to guarantee instant pause/resume safety.
+        """
+        if precomputed_notes_data is not None:
+            notes_meta, notes_raw_data = precomputed_notes_data
+            nids = list(notes_meta.keys())
+        else:
+            if search_query and search_query.strip():
+                nids = self.get_notes_for_query(col, search_query.strip())
+            elif selected_deck_names is not None:
+                target_dids = self.find_target_deck_ids(col, selected_deck_names)
+                nids = self.get_notes_in_decks(col, target_dids)
+            elif self.config.search_query and self.config.search_query.strip() and hasattr(col, "find_notes"):
+                nids = self.get_notes_for_query(col, self.config.search_query.strip())
+            else:
+                decks_to_index = self.config.selected_decks
+                target_dids = self.find_target_deck_ids(col, decks_to_index)
+                nids = self.get_notes_in_decks(col, target_dids)
+
+            if not nids:
+                if progress_callback:
+                    progress_callback(0, 0, "Nessuna nota trovata nei mazzi selezionati.")
+                return {"total": 0, "text_indexed": 0, "embeddings_indexed": 0, "cancelled": False}
+
+            # Step 1: Read notes metadata from Anki
+            if progress_callback:
+                progress_callback(0, len(nids), f"Scansione di {len(nids)} note nei mazzi selezionati...")
+
+            notes_meta, notes_raw_data = self.scan_notes_metadata(col, nids, cancel_check=cancel_check)
+            if cancel_check and cancel_check():
+                return {"total": len(nids), "text_indexed": 0, "embeddings_indexed": 0, "cancelled": True}
 
         active_model_id = self.config.get_active_model_id()
         needs_text_nids, needs_embed_nids = self.storage.get_notes_needing_indexing(notes_meta, active_model_id)
@@ -402,3 +427,27 @@ class DeckIndexer:
             "embeddings_indexed": embedded_count,
             "cancelled": False,
         }
+
+
+def collect_presearch_data(
+    col: Any,
+    config: ConfigManager,
+    storage: SearchDatabase,
+    ai_client: OpenAICompatibleClient,
+    search_query: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reads all necessary Anki collection data on the main thread before starting background search."""
+    indexer = DeckIndexer(config, storage, ai_client)
+    q = search_query if search_query is not None else config.get_effective_search_query()
+    candidate_nids = indexer.get_notes_for_query(col, q)
+    suspended_nids = indexer.get_notes_with_suspended_cards_for_query(col, q)
+    allowed_cids = set(indexer.get_cards_for_query(col, q))
+    parent_deck_prefix = indexer.detect_single_parent_deck(col, q)
+    notes_meta, notes_raw_data = indexer.scan_notes_metadata(col, candidate_nids)
+    return {
+        "candidate_nids": candidate_nids,
+        "suspended_nids": suspended_nids,
+        "allowed_cids": allowed_cids,
+        "parent_deck_prefix": parent_deck_prefix,
+        "precomputed_notes_data": (notes_meta, notes_raw_data),
+    }

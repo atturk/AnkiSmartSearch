@@ -405,26 +405,53 @@ def rollback_run(
     )
 
 
-def delete_filtered_deck_only(col: Any, storage: SearchDatabase, run_id: str) -> bool:
-    """Empties and removes the filtered deck without modifying card suspension states.
+def delete_filtered_deck_only_op(
+    col: Any,
+    storage: SearchDatabase,
+    run_id: str,
+) -> Tuple[bool, Any]:
+    """Empties and removes a filtered deck within a custom undo entry.
 
-    Handy shortcut for students who want to keep all unsuspended cards in their main decks.
+    Returns (deck_removed, op_changes).
     """
-    record = storage.get_run(run_id)
-    if not record or not record.filtered_did:
-        return False
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search")
+        except Exception:
+            undo_pos = None
 
-    if col.decks.have(record.filtered_did):
+    record = storage.get_run(run_id)
+    deck_removed = False
+    if record and record.filtered_did and col.decks.have(record.filtered_did):
         d_obj = col.decks.get(record.filtered_did)
         is_dyn = (
             d_obj.get("dyn", 1) == 1
             if isinstance(d_obj, dict)
             else getattr(d_obj, "dyn", 1) == 1
         )
-        if not is_dyn:
-            return False
-        col.sched.empty_filtered_deck(record.filtered_did)
-        col.decks.remove([record.filtered_did])
+        if is_dyn:
+            col.sched.empty_filtered_deck(record.filtered_did)
+            col.decks.remove([record.filtered_did])
+            deck_removed = True
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return deck_removed, changes
+
+
+def delete_filtered_deck_only(col: Any, storage: SearchDatabase, run_id: str) -> bool:
+    """Empties and removes the filtered deck without modifying card suspension states.
+
+    Handy shortcut for students who want to keep all unsuspended cards in their main decks.
+    """
+    success, changes = delete_filtered_deck_only_op(col, storage, run_id)
+    if success and changes is None:
         try:
             from aqt import mw  # type: ignore
 
@@ -432,6 +459,98 @@ def delete_filtered_deck_only(col: Any, storage: SearchDatabase, run_id: str) ->
                 mw.reset()
         except Exception:
             pass
-        return True
+    return success
 
-    return False
+
+def _get_op_changes(changes: Any) -> Any:
+    """Ensures an OpChanges object is returned for CollectionOp."""
+    if changes is not None:
+        return changes
+    try:
+        from anki.collection import OpChanges  # type: ignore
+
+        ch = OpChanges()
+        ch.deck = True
+        ch.card = True
+        return ch
+    except Exception:
+        pass
+    return None
+
+
+def create_batch_filtered_decks_op(
+    col: Any,
+    units_data: List[Dict[str, Any]],
+    config: ConfigManager,
+    storage: SearchDatabase,
+    parent_deck_prefix: Optional[str] = None,
+    allowed_cids: Optional[Set[int]] = None,
+) -> Tuple[List[RunResult], Any]:
+    """Applies deck creation and card unsuspension for multiple units in a single custom undo entry.
+
+    Returns (results, op_changes).
+    """
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search")
+        except Exception:
+            undo_pos = None
+
+    results: List[RunResult] = []
+    for item in units_data:
+        run_res = execute_unit_deck_creation(
+            col=col,
+            unit=item["unit"],
+            matched_nids=item["matched_nids"],
+            config=config,
+            storage=storage,
+            concept_coverage=item.get("concept_coverage"),
+            parent_deck_prefix=parent_deck_prefix,
+            allowed_cids=allowed_cids,
+            unit_error=item.get("unit_error", ""),
+        )
+        results.append(run_res)
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return results, changes
+
+
+def rollback_run_op(
+    col: Any,
+    storage: SearchDatabase,
+    run_id: str,
+    keep_reviewed: bool = True,
+) -> Tuple[RollbackResult, Any]:
+    """Rolls back a run within a custom undo entry.
+
+    Returns (rollback_result, op_changes).
+    """
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search Rollback")
+        except Exception:
+            undo_pos = None
+
+    res = rollback_run(
+        col=col,
+        storage=storage,
+        run_id=run_id,
+        keep_reviewed=keep_reviewed,
+    )
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return res, changes

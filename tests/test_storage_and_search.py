@@ -11,10 +11,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from ankihub_searcher.ai_client import AIClientError, OpenAICompatibleClient, repair_json_escapes
 from ankihub_searcher.config_manager import ConfigManager
 from ankihub_searcher.deck_ops import (
+    RollbackResult,
+    RunResult,
+    create_batch_filtered_decks_op,
     execute_unit_deck_creation,
     resolve_notes_to_cards,
     rollback_run,
+    rollback_run_op,
 )
+from ankihub_searcher.ui.worker import RollbackWorker, SearchBatchWorker
 from ankihub_searcher.search_pipeline import (
     ConceptCoverage,
     ExtractedConcept,
@@ -40,7 +45,7 @@ class MockAnkiCol:
     def __init__(self):
         import sqlite3
 
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
@@ -74,7 +79,33 @@ class MockAnkiCol:
         self.decks.have.side_effect = lambda did: did in self.decks_dict
         self.decks.remove.side_effect = lambda dids: [self.decks_dict.pop(d, None) for d in dids]
 
+        # Undo entries support
+        self.undo_entries = []
+        self.add_custom_undo_entry = MagicMock(side_effect=self._mock_add_undo)
+        self.merge_undo_entries = MagicMock(side_effect=self._mock_merge_undo)
+
+    def _mock_add_undo(self, name: str) -> int:
+        self.undo_entries.append(name)
+        return len(self.undo_entries)
+
+    def _mock_merge_undo(self, pos: int) -> Any:
+        changes = MagicMock(name="OpChanges")
+        changes.deck = True
+        changes.card = True
+        return changes
+
     def _init_schema(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY,
+                mid INTEGER NOT NULL,
+                mod INTEGER NOT NULL,
+                flds TEXT NOT NULL,
+                tags TEXT NOT NULL
+            )
+            """
+        )
         self.conn.execute(
             """
             CREATE TABLE cards (
@@ -1245,6 +1276,249 @@ I should decompose this into atomic concepts.
         self.assertEqual([c.nid for c in final_notes], [101])
         self.assertEqual(pipeline_enabled.last_concept_coverage[0].matched_nids, [101])
         self.assertEqual(pipeline_enabled.last_concept_coverage[0].matched_notes_count, 1)
+
+    def test_search_worker_thread_isolation_and_undo(self):
+        import threading
+        import ankihub_searcher.ui.worker as worker_module
+
+        col = MockAnkiCol()
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (8001, 801, 100, 0, -1)")
+        col.conn.execute(
+            "INSERT INTO notes (id, mid, mod, flds, tags) VALUES (801, 1, 1234, 'Colchicine for gout\x1fExtra', '#AK_Step1')"
+        )
+        col.conn.commit()
+
+        mock_m = MagicMock()
+        mock_m.id = 1
+        col.models.all_names_and_ids.return_value = [mock_m]
+        col.models.get.return_value = {
+            "id": 1,
+            "name": "Custom Model",
+            "flds": [{"name": "Text"}, {"name": "Extra"}],
+        }
+
+        config = ConfigManager(selected_decks=["AnKing Step Deck"])
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [
+                {
+                    "topic_it": "Trattamento gotta",
+                    "claim_en": "Colchicine is used in gout",
+                    "keywords_en": ["colchicine", "gout"],
+                    "keywords_it": ["colchicina", "gotta"],
+                    "quote_it": "Colchicina per attacco acuto.",
+                }
+            ]
+        }
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        events_order = []
+        write_calling_threads = []
+        worker_thread_ids = []
+
+        def fake_main_runner(task):
+            events_order.append("main_runner")
+            # Execute on a separate thread to simulate the main UI thread
+            t = threading.Thread(target=lambda: (write_calling_threads.append(threading.get_ident()), task()))
+            t.start()
+            t.join()
+
+        orig_create = worker_module.create_batch_filtered_decks_op
+
+        def track_create(*args, **kwargs):
+            events_order.append("create_decks")
+            return orig_create(*args, **kwargs)
+
+        worker_module.create_batch_filtered_decks_op = track_create
+        try:
+            raw_text = "# Gout Lecture\nColchicina per attacco acuto di gotta."
+            worker = SearchBatchWorker(
+                col=col,
+                config=config,
+                storage=self.storage,
+                ai_client=mock_ai,
+                raw_text=raw_text,
+                base_deck_name="Gout Filtered",
+                main_thread_runner=fake_main_runner,
+            )
+
+            finished_payload = []
+            worker.progress_sig.connect(lambda *args: worker_thread_ids.append(threading.get_ident()))
+            worker.finished_sig.connect(lambda res: (events_order.append("finished_sig"), finished_payload.append(res)))
+
+            worker.start()
+            worker.wait(timeout=5.0)
+        finally:
+            worker_module.create_batch_filtered_decks_op = orig_create
+
+        self.assertEqual(len(finished_payload), 1)
+        res = finished_payload[0]
+        self.assertEqual(res["status"], "done")
+        self.assertEqual(res["units_processed"], 1)
+        self.assertIsInstance(res["results"][0], RunResult)
+        self.assertEqual(res["results"][0].total_cards_count, 1)
+
+        # Check thread isolation: write was NOT called on the worker thread
+        self.assertTrue(len(worker_thread_ids) > 0)
+        self.assertTrue(len(write_calling_threads) > 0)
+        self.assertNotEqual(worker_thread_ids[0], write_calling_threads[0])
+
+        # Check execution order: deck creation was called via main runner BEFORE finished_sig
+        self.assertIn("main_runner", events_order)
+        self.assertIn("create_decks", events_order)
+        self.assertIn("finished_sig", events_order)
+        self.assertLess(events_order.index("create_decks"), events_order.index("finished_sig"))
+
+        # Check undo entry was created on col
+        col.add_custom_undo_entry.assert_called_with("Smart Search")
+        col.merge_undo_entries.assert_called()
+
+    def test_rollback_worker_thread_isolation_and_undo(self):
+        import threading
+        import ankihub_searcher.ui.worker as worker_module
+
+        col = MockAnkiCol()
+        run_record = RunRecord(
+            run_id="run_test_rb_1",
+            created_at=1000,
+            deck_name="Test Deck",
+            filtered_did=501,
+            source_decks=["AnKing Step Deck"],
+            unit_title="Test Unit",
+            unit_preview="Preview",
+            total_matched_cids=[8001],
+            newly_unsuspended_cids=[8001],
+            rolled_back=0,
+        )
+        self.storage.save_run(run_record)
+        col.decks_dict[501] = {"id": 501, "name": "Test Deck", "dyn": 1}
+
+        events_order = []
+        rb_write_threads = []
+        rb_worker_threads = []
+
+        def fake_main_runner(task):
+            events_order.append("main_runner")
+            # Execute on a separate thread to simulate the main UI thread
+            t = threading.Thread(target=lambda: (rb_write_threads.append(threading.get_ident()), task()))
+            t.start()
+            t.join()
+
+        orig_rb = worker_module.rollback_run_op
+
+        def track_rb(*args, **kwargs):
+            events_order.append("rollback_op")
+            return orig_rb(*args, **kwargs)
+
+        worker_module.rollback_run_op = track_rb
+        try:
+            worker = RollbackWorker(
+                col=col,
+                storage=self.storage,
+                run_id="run_test_rb_1",
+                keep_reviewed=True,
+                main_thread_runner=fake_main_runner,
+            )
+
+            # Record worker thread in run
+            orig_run = worker.run
+            def track_worker_run():
+                rb_worker_threads.append(threading.get_ident())
+                orig_run()
+            worker.run = track_worker_run
+
+            finished_payload = []
+            worker.finished_sig.connect(lambda res: (events_order.append("finished_sig"), finished_payload.append(res)))
+
+            worker.start()
+            worker.wait(timeout=5.0)
+        finally:
+            worker_module.rollback_run_op = orig_rb
+
+        self.assertEqual(len(finished_payload), 1)
+        res = finished_payload[0]
+        self.assertIsInstance(res, RollbackResult)
+        self.assertEqual(res.run_id, "run_test_rb_1")
+
+        # Check thread isolation
+        self.assertTrue(len(rb_worker_threads) > 0)
+        self.assertTrue(len(rb_write_threads) > 0)
+        self.assertNotEqual(rb_worker_threads[0], rb_write_threads[0])
+
+        self.assertIn("main_runner", events_order)
+        self.assertIn("rollback_op", events_order)
+        self.assertIn("finished_sig", events_order)
+        self.assertLess(events_order.index("rollback_op"), events_order.index("finished_sig"))
+        col.add_custom_undo_entry.assert_called_with("Smart Search Rollback")
+        col.merge_undo_entries.assert_called()
+
+    def test_workers_standalone_fallback_outside_anki(self):
+        col = MockAnkiCol()
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue) VALUES (9001, 901, 100, 0, -1)")
+        col.conn.execute(
+            "INSERT INTO notes (id, mid, mod, flds, tags) VALUES (901, 1, 1234, 'Allopurinol note\x1fExtra', '#AK_Step1')"
+        )
+        col.conn.commit()
+
+        mock_m = MagicMock()
+        mock_m.id = 1
+        col.models.all_names_and_ids.return_value = [mock_m]
+        col.models.get.return_value = {
+            "id": 1,
+            "name": "Custom Model",
+            "flds": [{"name": "Text"}, {"name": "Extra"}],
+        }
+
+        config = ConfigManager(selected_decks=["AnKing Step Deck"])
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "concepts": [
+                {
+                    "topic_it": "Allopurinolo",
+                    "claim_en": "Allopurinol inhibits xanthine oxidase",
+                    "keywords_en": ["allopurinol", "xanthine oxidase"],
+                    "keywords_it": ["allopurinolo"],
+                    "quote_it": "Allopurinolo inibitore xantina ossidasi.",
+                }
+            ]
+        }
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+
+        # Run SearchBatchWorker with default main_thread_runner=None outside Anki
+        worker = SearchBatchWorker(
+            col=col,
+            config=config,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Allopurinol\nAllopurinolo inibitore xantina ossidasi.",
+            base_deck_name="Allopurinol Filtered",
+        )
+        finished_search = []
+        worker.finished_sig.connect(lambda res: finished_search.append(res))
+        worker.start()
+        worker.wait(timeout=5.0)
+
+        self.assertEqual(len(finished_search), 1)
+        self.assertEqual(finished_search[0]["status"], "done")
+        self.assertIsInstance(finished_search[0]["results"][0], RunResult)
+
+        run_id = finished_search[0]["results"][0].run_id
+
+        # Run RollbackWorker with default main_thread_runner=None outside Anki
+        rb_worker = RollbackWorker(
+            col=col,
+            storage=self.storage,
+            run_id=run_id,
+            keep_reviewed=True,
+        )
+        finished_rb = []
+        rb_worker.finished_sig.connect(lambda res: finished_rb.append(res))
+        rb_worker.start()
+        rb_worker.wait(timeout=5.0)
+
+        self.assertEqual(len(finished_rb), 1)
+        self.assertIsInstance(finished_rb[0], RollbackResult)
+        self.assertEqual(finished_rb[0].run_id, run_id)
 
 
 if __name__ == "__main__":

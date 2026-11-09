@@ -84,8 +84,8 @@ except ImportError:
 
 from ..ai_client import OpenAICompatibleClient
 from ..config_manager import ConfigManager
-from ..deck_ops import delete_filtered_deck_only
-from ..indexer import DeckIndexer
+from ..deck_ops import _get_op_changes, delete_filtered_deck_only, delete_filtered_deck_only_op
+from ..indexer import DeckIndexer, collect_presearch_data
 from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
@@ -437,6 +437,15 @@ class SearchDialog(QDialog):
         self.lbl_status.setVisible(True)
         self.lbl_status.setText("Avvio elaborazione in corso...")
 
+        # Pre-read collection notes and card mappings on the main thread before starting background thread
+        presearch_data = collect_presearch_data(
+            col=self.col,
+            config=self.config,
+            storage=self.storage,
+            ai_client=self.ai_client,
+            search_query=query,
+        )
+
         self.search_worker = SearchBatchWorker(
             col=self.col,
             config=self.config,
@@ -444,6 +453,7 @@ class SearchDialog(QDialog):
             ai_client=self.ai_client,
             raw_text=raw_text,
             base_deck_name=self.txt_base_deck.text().strip(),
+            precomputed_data=presearch_data,
         )
         self.search_worker.progress_sig.connect(self._on_search_progress)
         self.search_worker.finished_sig.connect(self._on_search_finished)
@@ -497,18 +507,10 @@ class SearchDialog(QDialog):
             err_lines = [f"• {r.unit_title}: {r.unit_error}" for r in err_units]
             err_section = "\n\n⚠️ Errori Stage 1:\n" + "\n".join(err_lines)
 
-        # 1. Reset Anki window so created filtered decks are immediately visible
-        try:
-            from aqt import mw
-            if mw:
-                mw.reset()
-        except Exception:
-            pass
-
-        # 2. Automatically close the SearchDialog
+        # 1. Automatically close the SearchDialog (CollectionOp handles UI refresh)
         self.accept()
 
-        # 3. Present clean post-search summary popup with Browser & Coverage Details buttons
+        # 2. Present clean post-search summary popup with Browser & Coverage Details buttons
         parent_widget = mw if mw else None
         msg_box = QMessageBox(parent_widget)
         msg_box.setWindowTitle("Ricerca completata")
@@ -730,8 +732,6 @@ class HistoryDialog(QDialog):
 
     def _on_rollback_finished(self, res: Any) -> None:
         self.btn_rollback.setEnabled(True)
-        if mw:
-            mw.reset()
         self._refresh_history()
         QMessageBox.information(
             self,
@@ -763,11 +763,29 @@ class HistoryDialog(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            success = delete_filtered_deck_only(self.col, self.storage, run_id)
-            if success:
-                QMessageBox.information(self, "Fatto", "Mazzo filtrato eliminato. Le carte restano attive.")
+            try:
+                from aqt.operations import CollectionOp  # type: ignore
+            except ImportError:
+                CollectionOp = None
+
+            if mw is not None and CollectionOp is not None:
+
+                def _del_op(col: Any):
+                    ok, changes = delete_filtered_deck_only_op(col, self.storage, run_id)
+                    return _get_op_changes(changes)
+
+                def _on_del_success(changes: Any):
+                    self._refresh_history()
+                    QMessageBox.information(self, "Fatto", "Mazzo filtrato eliminato. Le carte restano attive.")
+
+                CollectionOp(parent=self, op=_del_op).success(_on_del_success).run_in_background()
             else:
-                QMessageBox.warning(self, "Avviso", "Il mazzo filtrato non esiste più.")
+                success = delete_filtered_deck_only(self.col, self.storage, run_id)
+                self._refresh_history()
+                if success:
+                    QMessageBox.information(self, "Fatto", "Mazzo filtrato eliminato. Le carte restano attive.")
+                else:
+                    QMessageBox.warning(self, "Avviso", "Il mazzo filtrato non esiste più.")
 
     def _on_coverage_clicked(self) -> None:
         run_id = self._get_selected_run_id()
@@ -920,12 +938,23 @@ class IndexDialog(QDialog):
         self.lbl_progress_msg.setVisible(True)
         self.lbl_progress_msg.setText("Avvio indicizzazione...")
 
+        # Scan note metadata on the main thread before launching background embedding worker
+        indexer = DeckIndexer(self.config, self.storage, self.ai_client)
+        active_query = self.config.get_effective_search_query()
+        if active_query:
+            nids = indexer.get_notes_for_query(self.col, active_query)
+        else:
+            dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
+            nids = indexer.get_notes_in_decks(self.col, dids)
+        precomputed_notes = indexer.scan_notes_metadata(self.col, nids)
+
         self.index_worker = IndexWorker(
             col=self.col,
             config=self.config,
             storage=self.storage,
             ai_client=self.ai_client,
             selected_decks=None,
+            precomputed_notes_data=precomputed_notes,
         )
         self.index_worker.progress_sig.connect(self._on_progress)
         self.index_worker.finished_sig.connect(self._on_finished)
