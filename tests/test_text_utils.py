@@ -11,6 +11,8 @@ from ankihub_searcher.text_utils import (
     clean_tags,
     normalize_inline_latex,
     parse_markdown_units,
+    parse_keyword_lines,
+    parse_keyword_units,
     LectureUnit,
 )
 
@@ -165,6 +167,62 @@ Content here.
         self.assertEqual(normalize_inline_latex(""), "")
         self.assertEqual(normalize_inline_latex(None), "")
         self.assertEqual(normalize_inline_latex("Plain text with no LaTeX"), "Plain text with no LaTeX")
+
+    def test_parse_keyword_lines(self):
+        text = """
+# Intestazione da ignorare
+- ApoB48,
+* chilomicroni;
++ Recettore LDL
+• $\\beta$-bloccanti
+1. PCSK9
+2) chilomicroni
+apob48
+  ,;; 
+"""
+        kws = parse_keyword_lines(text)
+        self.assertEqual(
+            kws,
+            ["ApoB48", "chilomicroni", "Recettore LDL", "β-bloccanti", "PCSK9"],
+        )
+        self.assertEqual(parse_keyword_lines(""), [])
+        self.assertEqual(parse_keyword_lines(None), [])
+        self.assertEqual(parse_keyword_lines("  \n# Solo header\n  "), [])
+
+    def test_parse_keyword_units_no_headers(self):
+        text = "- ApoB48\n- Chilomicroni"
+        units = parse_keyword_units(text, base_deck_name="Lipidi")
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].unit_title, "Lipidi")
+        self.assertEqual(units[0].deck_name, "Lipidi")
+        self.assertEqual(units[0].keywords, ["ApoB48", "Chilomicroni"])
+
+    def test_parse_keyword_units_with_headers(self):
+        text = """
+# Capitolo 1 - Metabolismo
+## 1.1 Lipoproteine
+- ApoB48
+- Chilomicroni
+
+## 1.2 Vuoto
+---
+
+## 1.3 Farmaci
+- $\\alpha$-litici
+- $\\beta$-bloccanti
+"""
+        units = parse_keyword_units(text, base_deck_name="Farmacologia", naming_style="dash")
+        # 1.2 is empty so discarded, Capitolo 1 is empty so discarded
+        self.assertEqual(len(units), 2)
+        self.assertEqual(units[0].unit_title, "1.1 Lipoproteine")
+        self.assertEqual(units[0].deck_name, "Farmacologia - 1.1 Lipoproteine")
+        self.assertEqual(units[0].breadcrumb, "Capitolo 1 - Metabolismo > 1.1 Lipoproteine")
+        self.assertEqual(units[0].keywords, ["ApoB48", "Chilomicroni"])
+
+        self.assertEqual(units[1].unit_title, "1.3 Farmaci")
+        self.assertEqual(units[1].deck_name, "Farmacologia - 1.3 Farmaci")
+        self.assertEqual(units[1].breadcrumb, "Capitolo 1 - Metabolismo > 1.3 Farmaci")
+        self.assertEqual(units[1].keywords, ["α-litici", "β-bloccanti"])
 
 
 if __name__ == "__main__":

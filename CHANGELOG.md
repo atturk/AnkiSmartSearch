@@ -2,6 +2,20 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.5.0] - 2026-11-09
+
+### Novità
+- **Modalità "Keyword" (lite):** Nuova modalità di ricerca veloce focalizzata sulle keyword. Inserisci direttamente le parole chiave mediche da cercare, una per riga. Il dialogo di ricerca si apre ora sempre sulla scheda "Keyword" come predefinita.
+- **Traduzione contestuale delle keyword con LLM:** Se il modello chat è configurato e l'opzione è attiva (`keyword_translate: true`, default), le keyword vengono tradotte automaticamente nei termini medici inglesi standard usati su USMLE/AnKing con un'unica chiamata chat per ricerca. Le keyword sono raggruppate per titolo di unità per disambiguare le sigle dal contesto (es. "PCR" = proteina C reattiva). Durante la traduzione, un cronometro mostra il tempo trascorso; in caso di errore o assenza del modello chat, il sistema usa direttamente le keyword originali riportando un avviso nel riepilogo finale ("Traduzione non riuscita: keyword usate senza traduzione.").
+- **Pannello di ricerca con due schede ("Keyword" e "Testo"):** Il dialogo principale offre due schede: "Keyword" (aperta di default ad ogni avvio) e "Testo" (ricerca estesa con decomposizione completa tramite LLM). La modalità utilizzata viene registrata per "Riprova più stretto".
+- **Parsing intelligente delle keyword:** Rimozione automatica dei marcatori di elenco (`-`, `*`, `+`, `•`, `1.`, `1)`), spazi, virgole e punti e virgola finali, deduplicazione case-insensitive con ordine e grafia originale preservati, e normalizzazione automatica dei simboli e caratteri greci LaTeX inline.
+- **Supporto multi-unità Markdown in modalità Keyword:** È possibile strutturare le keyword con intestazioni Markdown (`# Unità 1`, `## Sottounità 2`) per generare batch di mazzi filtrati separati per ciascuna sezione, scartando automaticamente le sezioni prive di keyword.
+- **Soglia keyword calibrata (default 0.55):** Nuova impostazione `keyword_min_similarity` (default 0.55, adatta sia a keyword inglesi che a keyword tradotte con punteggi top 0.60–0.74; configurabile con `QDoubleSpinBox` 0.30–0.90 nella scheda "Ricerca" delle Impostazioni), separata dalla sensibilità della modalità Testo. Nuova checkbox "Traduci keyword in inglese". L'anteprima sull'ultima ricerca adotta automaticamente la soglia keyword per ricerche eseguite tramite keyword. Migrazione automatica a `config_version = 5`.
+- **Riepilogo e copertura specifici:** Conteggio trasparente con etichetta "Copertura keyword" sia nel riepilogo finale che nella finestra dettagliata di copertura quando si cercano keyword.
+- **Correzioni a "Riprova più stretto":** Risolti bug su `self.profile` e `self.txt_deck_name`. "Riprova più stretto" mantiene ora la modalità della ricerca precedente (Keyword o Testo), calcola la soglia partendo da quella della modalità + 0.03 e preserva la sorgente `source` ("keyword" o "llm") dei concetti precomputati.
+
+---
+
 ## [0.4.0] - 2026-11-09
 
 ### Novità

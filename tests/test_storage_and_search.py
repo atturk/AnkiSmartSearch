@@ -1000,7 +1000,7 @@ I should decompose this into atomic concepts.
         self.assertIsNone(cfg_legacy.top_k_per_concept)
         self.assertEqual(cfg_legacy.relative_score_window, 0.05)
         self.assertEqual(cfg_legacy.max_notes_per_concept, 10)
-        self.assertEqual(cfg_legacy.config_version, 4)
+        self.assertEqual(cfg_legacy.config_version, 5)
 
         model_id = config.get_active_model_id()
         # Seed 4 notes with different similarity levels:
@@ -1959,7 +1959,7 @@ I should decompose this into atomic concepts.
         self.assertEqual(cfg.max_notes_per_concept, 10)
         self.assertEqual(cfg.max_cards_per_unit, 150)
         self.assertEqual(cfg.hybrid_dense_weight, 1.0)
-        self.assertEqual(cfg.config_version, 4)
+        self.assertEqual(cfg.config_version, 5)
 
         # get_min_similarity_threshold: 0.70 - s * 0.20
         self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
@@ -1980,7 +1980,7 @@ I should decompose this into atomic concepts.
         }
         migrated, was_migrated = ConfigManager.migrate_dict(legacy_cfg)
         self.assertTrue(was_migrated)
-        self.assertEqual(migrated["config_version"], 4)
+        self.assertEqual(migrated["config_version"], 5)
         self.assertEqual(migrated["sensitivity"], 0.5)
         self.assertEqual(migrated["relative_score_window"], 0.05)
         self.assertEqual(migrated["max_notes_per_concept"], 10)
@@ -1992,17 +1992,17 @@ I should decompose this into atomic concepts.
         self.assertEqual(migrated["chat_model"], "gpt-custom")
         self.assertEqual(migrated["search_query"], '"deck:MyDeck"')
 
-        # Version 4 config is NOT re-migrated
-        v4_cfg = {
-            "config_version": 4,
+        # Version 5 config is NOT re-migrated
+        v5_cfg = {
+            "config_version": 5,
             "sensitivity": 0.65,
             "relative_score_window": 0.03,
             "max_notes_per_concept": 15,
         }
-        migrated_v4, was_migrated_v4 = ConfigManager.migrate_dict(v4_cfg)
-        self.assertFalse(was_migrated_v4)
-        self.assertEqual(migrated_v4["sensitivity"], 0.65)
-        self.assertEqual(migrated_v4["relative_score_window"], 0.03)
+        migrated_v5, was_migrated_v5 = ConfigManager.migrate_dict(v5_cfg)
+        self.assertFalse(was_migrated_v5)
+        self.assertEqual(migrated_v5["sensitivity"], 0.65)
+        self.assertEqual(migrated_v5["relative_score_window"], 0.03)
 
         # 3. Test extract_first_sentence
         self.assertEqual(
@@ -2089,7 +2089,7 @@ I should decompose this into atomic concepts.
             self.assertEqual(cfg.max_notes_per_concept, 10)
             self.assertEqual(cfg.max_cards_per_unit, 150)
             self.assertEqual(cfg.hybrid_dense_weight, 1.0)
-            self.assertEqual(cfg.config_version, 4)
+            self.assertEqual(cfg.config_version, 5)
             self.assertIsNone(cfg.top_k_per_concept)
 
             # Check that user custom settings remain preserved
@@ -2097,9 +2097,9 @@ I should decompose this into atomic concepts.
             self.assertEqual(cfg.search_query, '"deck:AnKing Step Deck" OR "deck:Custom"')
             self.assertEqual(cfg.embed_model, "text-embedding-3-small")
 
-            # Check that writeConfig was called and stored_in_anki was updated with config_version 4
+            # Check that writeConfig was called and stored_in_anki was updated with config_version 5
             mock_addon_mgr.writeConfig.assert_called_once()
-            self.assertEqual(stored_in_anki.get("config_version"), 4)
+            self.assertEqual(stored_in_anki.get("config_version"), 5)
             self.assertEqual(stored_in_anki.get("sensitivity"), 0.5)
             self.assertEqual(stored_in_anki.get("hybrid_dense_weight"), 1.0)
             self.assertNotIn("top_k_per_concept", stored_in_anki)
@@ -2109,7 +2109,7 @@ I should decompose this into atomic concepts.
             cfg2 = ConfigManager.load()
             self.assertEqual(cfg2.sensitivity, 0.5)
             self.assertEqual(cfg2.hybrid_dense_weight, 1.0)
-            self.assertEqual(cfg2.config_version, 4)
+            self.assertEqual(cfg2.config_version, 5)
             self.assertEqual(cfg2.chat_model, "mistral-nemo-it")
             mock_addon_mgr.writeConfig.assert_not_called()
 
@@ -3214,11 +3214,451 @@ print("__JSON_RESULT__" + json.dumps(output))
 
         col.conn.close()
 
+    def test_extracted_concept_and_coverage_source_and_serialization(self):
+        from ankihub_searcher.search_pipeline import ExtractedConcept, ConceptCoverage, concepts_from_keywords
 
+        # 1. Defaults to source="llm"
+        ec = ExtractedConcept(
+            topic_it="Topic",
+            claim_en="Claim",
+            keywords_en=["kw1"],
+            keywords_it=["kw2"],
+            quote_it="Quote",
+        )
+        self.assertEqual(ec.source, "llm")
+        d = ec.to_dict()
+        self.assertEqual(d["source"], "llm")
 
+        # from_dict with and without source
+        ec2 = ExtractedConcept.from_dict({"topic_it": "T", "claim_en": "C"})
+        self.assertEqual(ec2.source, "llm")
+        ec3 = ExtractedConcept.from_dict({"topic_it": "T", "claim_en": "C", "source": "keyword"})
+        self.assertEqual(ec3.source, "keyword")
 
+        # ConceptCoverage
+        cov = ConceptCoverage(topic_it="T", claim_en="C")
+        self.assertEqual(cov.source, "llm")
+        cov_d = cov.to_dict()
+        self.assertEqual(cov_d["source"], "llm")
+        cov_from = ConceptCoverage.from_dict({"topic_it": "T", "claim_en": "C", "source": "keyword"})
+        self.assertEqual(cov_from.source, "keyword")
 
+        # 2. concepts_from_keywords
+        kws = ["ApoB48", "  Recettore LDL  ", ""]
+        extracted = concepts_from_keywords(kws)
+        self.assertEqual(len(extracted), 2)
+        self.assertEqual(extracted[0].topic_it, "ApoB48")
+        self.assertEqual(extracted[0].claim_en, "ApoB48")
+        self.assertEqual(extracted[0].quote_it, "ApoB48")
+        self.assertEqual(extracted[0].keywords_en, ["ApoB48"])
+        self.assertEqual(extracted[0].keywords_it, ["ApoB48"])
+        self.assertEqual(extracted[0].source, "keyword")
+
+        self.assertEqual(extracted[1].topic_it, "Recettore LDL")
+        self.assertEqual(extracted[1].source, "keyword")
+
+    def test_retrieve_for_concepts_keyword_source_query_text(self):
+        from ankihub_searcher.search_pipeline import ExtractedConcept, concepts_from_keywords
+
+        embedded_queries = []
+
+        class MockEmbeddingAIClient:
+            def get_embeddings(self, texts, model=None, base_url=None, api_key=None):
+                embedded_queries.extend(texts)
+                return [[1.0, 0.0] for _ in texts]
+
+        cfg = ConfigManager()
+        cfg.embed_language_strategy = "translate_to_en"
+        cfg.embed_query_instruction = "Query: "
+
+        pipeline = SmartSearchPipeline(
+            config=cfg,
+            storage=self.storage,
+            ai_client=MockEmbeddingAIClient(),
+        )
+
+        kw_concepts = concepts_from_keywords(["ApoB48"])
+        # Should embed "Query: ApoB48", ignoring translate_to_en formatting
+        pipeline.retrieve_for_concepts(kw_concepts, candidate_nids=[100])
+        self.assertIn("Query: ApoB48", embedded_queries)
+        self.assertEqual(pipeline.last_concept_coverage[0].source, "keyword")
+
+    def test_config_keyword_threshold(self):
+        cfg = ConfigManager()
+        self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.55)
+        cfg.keyword_min_similarity = 0.58
+        self.assertEqual(cfg.get_keyword_min_similarity_threshold(), 0.58)
+
+    def test_search_batch_worker_keyword_mode(self):
+        """Item 28: keyword mode worker bypasses LLM, vectorizes keywords, creates decks."""
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        mid = "model_kw_test"
+        self.storage.save_embeddings_batch([
+            (8001, mid, "h8001", 2, [1.0, 0.0]),
+            (8002, mid, "h8002", 2, [0.0, 1.0]),
+        ])
+
+        cfg = ConfigManager.load()
+        cfg.embed_model = mid
+        cfg.enable_llm_verification = True  # Must be ignored in keyword mode
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.side_effect = lambda texts, **kwargs: [[1.0, 0.0] for _ in texts]
+
+        # 1. Test empty keyword input emits error
+        worker_empty = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="   \n# Solo intestazione senza kw\n",
+            base_deck_name="KwDeck",
+            input_mode="keyword",
+        )
+        errors = []
+        worker_empty.error_sig.connect(lambda msg: errors.append(msg))
+        worker_empty.run()
+        self.assertEqual(errors, ["Nessuna keyword trovata."])
+
+        # 2. Test 2 markdown units with keywords
+        raw_text = "# Unita Uno\n- ApoB48\n\n# Unita Due\n- Recettore LDL\n"
+        progress_msgs = []
+        finished_payloads = []
+
+        def fake_main_runner(task):
+            task()
+
+        precomputed_data = {
+            "candidate_nids": {8001, 8002},
+            "suspended_nids": {8001, 8002},
+            "allowed_cids": {8001, 8002},
+            "parent_deck_prefix": None,
+            "precomputed_notes_data": None,
+        }
+
+        worker = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text=raw_text,
+            base_deck_name="KwBatchDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=fake_main_runner,
+            input_mode="keyword",
+        )
+        worker.progress_sig.connect(lambda cur, tot, msg: progress_msgs.append(msg))
+        worker.finished_sig.connect(lambda res: finished_payloads.append(res))
+
+        worker.run()
+
+        # chat_completion_json must NEVER be called
+        mock_ai.chat_completion_json.assert_not_called()
+
+        # Finished with 2 units processed
+        self.assertEqual(len(finished_payloads), 1)
+        self.assertEqual(finished_payloads[0]["units_processed"], 2)
+        self.assertEqual(len(finished_payloads[0]["results"]), 2)
+
+        # Progress messages must contain the keyword vector search phrasing
+        self.assertTrue(any("Ricerca vettoriale di 1 keyword tra" in m for m in progress_msgs))
+
+        col.conn.close()
+
+    def test_config_version_5_migration_and_settings_dialog(self):
+        """Item 29: config v5 migration, keyword threshold in settings dialog and preview."""
+        from ankihub_searcher.config_manager import ConfigManager, DEFAULT_CONFIG
+        from ankihub_searcher.ui.main_dialog import SettingsDialog
+
+        self.assertEqual(DEFAULT_CONFIG["config_version"], 5)
+        self.assertEqual(DEFAULT_CONFIG["search_input_mode"], "keyword")
+        self.assertEqual(DEFAULT_CONFIG["keyword_min_similarity"], 0.55)
+        self.assertEqual(DEFAULT_CONFIG["keyword_translate"], True)
+
+        # 1. Migration from v4 dict
+        v4_dict = {
+            "config_version": 4,
+            "sensitivity": 0.35,
+            "search_query": "deck:Test",
+        }
+        migrated, was_migrated = ConfigManager.migrate_dict(v4_dict)
+        self.assertTrue(was_migrated)
+        self.assertEqual(migrated["config_version"], 5)
+        self.assertEqual(migrated["search_input_mode"], "keyword")
+        self.assertEqual(migrated["keyword_min_similarity"], 0.55)
+        self.assertEqual(migrated["keyword_translate"], True)
+        self.assertEqual(migrated["sensitivity"], 0.35)
+        self.assertEqual(migrated["search_query"], "deck:Test")
+
+        # 1b. Migration of v5 dict with old unreleased 0.52 threshold
+        v5_with_052 = {
+            "config_version": 5,
+            "keyword_min_similarity": 0.52,
+        }
+        mig_052, was_mig_052 = ConfigManager.migrate_dict(v5_with_052)
+        # A user-chosen 0.52 must be kept (no forced reset on every load)
+        self.assertFalse(was_mig_052)
+        self.assertEqual(mig_052["keyword_min_similarity"], 0.52)
+
+        # 2. Settings dialog loads and saves keyword threshold and translation checkbox
+        col = MockAnkiCol()
+        cfg = ConfigManager()
+        cfg.keyword_min_similarity = 0.58
+        cfg.keyword_translate = False
+        dlg = SettingsDialog(col=col, config=cfg)
+        self.assertAlmostEqual(dlg.spin_kw_thresh.value(), 0.58, places=2)
+        self.assertFalse(dlg.chk_keyword_translate.isChecked())
+
+        dlg.spin_kw_thresh.setValue(0.64)
+        dlg.chk_keyword_translate.setChecked(True)
+        with patch.object(cfg, "save"):
+            dlg._save_settings()
+        self.assertAlmostEqual(cfg.keyword_min_similarity, 0.64, places=2)
+        self.assertTrue(cfg.keyword_translate)
+        col.conn.close()
+
+    def test_search_dialog_two_tabs_and_retry(self):
+        """Item 30: two tabs in SearchDialog, mode validation, profile definition, and retry tighter."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog, QMessageBox
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        dlg = SearchDialog(col=col)
+
+        # 1. Profile is defined
+        self.assertIsNotNone(dlg.profile)
+
+        # 2. Tabs initialized and selected according to config
+        self.assertIsNotNone(dlg.input_tabs)
+        self.assertIsNotNone(dlg.txt_keywords)
+        self.assertIsNotNone(dlg.txt_lecture)
+
+        # 3. Test validation for empty keyword
+        dlg.input_tabs.setCurrentIndex(0)
+        dlg.txt_keywords.setText("")
+        dlg.combo_query.setCurrentText("deck:Test")
+        warn_msgs = []
+        with patch.object(QMessageBox, "warning", side_effect=lambda parent, title, msg: warn_msgs.append(msg)):
+            dlg._start_search()
+        self.assertTrue(any("Inserisci almeno una keyword" in m for m in warn_msgs))
+
+        # 4. Test validation for empty text
+        dlg.input_tabs.setCurrentIndex(1)
+        dlg.txt_lecture.setText("")
+        warn_msgs.clear()
+        with patch.object(QMessageBox, "warning", side_effect=lambda parent, title, msg: warn_msgs.append(msg)):
+            dlg._start_search()
+        self.assertTrue(any("Inserisci il testo della lezione" in m for m in warn_msgs))
+
+        # 5. Test _do_retry_tighter in keyword mode
+        dlg.last_search_mode = "keyword"
+        dlg.last_search_text = "ApoB48\nLDL"
+        dlg.txt_base_deck.setText("BaseLipidi")
+        dlg.config.keyword_min_similarity = 0.52
+
+        mock_result = MagicMock()
+        mock_result.unit_title = "Unità 1"
+        mock_result.concept_coverage = [
+            {
+                "topic_it": "ApoB48",
+                "claim_en": "ApoB48",
+                "keywords_en": ["ApoB48"],
+                "keywords_it": ["ApoB48"],
+                "quote_it": "ApoB48",
+                "source": "keyword",
+            }
+        ]
+
+        with patch.object(dlg, "_do_batch_rollback", side_effect=lambda run_ids, on_done=None: on_done() if on_done else None):
+            with patch.object(SearchBatchWorker, "start"):
+                dlg._do_retry_tighter(run_ids=["run1"], results=[mock_result])
+
+        self.assertEqual(dlg.search_worker.input_mode, "keyword")
+        self.assertAlmostEqual(dlg.search_worker.override_min_threshold, 0.55, places=2)
+        self.assertEqual(dlg.search_worker.raw_text, "ApoB48\nLDL")
+        self.assertEqual(dlg.search_worker.base_deck_name, "BaseLipidi")
+        self.assertIn("Unità 1", dlg.search_worker.precomputed_concepts)
+        self.assertEqual(dlg.search_worker.precomputed_concepts["Unità 1"][0].source, "keyword")
+
+        col.conn.close()
+
+    def test_search_dialog_always_opens_on_keyword_tab(self):
+        """Item 32: SearchDialog always selects Keyword tab on open regardless of search_input_mode."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog
+
+        col = MockAnkiCol()
+        with patch.object(ConfigManager, "load", return_value=ConfigManager(search_input_mode="text")):
+            dlg = SearchDialog(col=col)
+            self.assertEqual(dlg.input_tabs.currentIndex(), 0)
+            self.assertEqual(dlg.last_search_mode, "text")
+        col.conn.close()
+
+    def test_keyword_translation_and_worker(self):
+        """Item 33: translate_keywords, concepts_from_keywords, worker keyword translation, fallback and single-call."""
+        from ankihub_searcher.search_pipeline import SmartSearchPipeline, concepts_from_keywords
+        from ankihub_searcher.text_utils import LectureUnit
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        mid = "model_kw_trans_test"
+        self.storage.save_embeddings_batch([
+            (9001, mid, "h9001", 2, [1.0, 0.0]),
+            (9002, mid, "h9002", 2, [0.0, 1.0]),
+        ])
+
+        # 1. Pipeline translate_keywords and concepts_from_keywords
+        cfg = ConfigManager()
+        cfg.chat_model = "test-chat"
+        cfg.embed_model = mid
+        cfg.keyword_translate = True
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.chat_completion_json.return_value = {
+            "translations": [
+                {"it": "ApoB48", "en": "ApoB-48"},
+                {"it": "Chilomicroni", "en": "Chylomicrons"},
+            ]
+        }
+        embedded_queries = []
+        mock_ai.get_embeddings.side_effect = lambda texts, **kwargs: (
+            embedded_queries.extend(texts) or [[1.0, 0.0] for _ in texts]
+        )
+
+        pipeline = SmartSearchPipeline(cfg, self.storage, mock_ai)
+        u1 = LectureUnit(unit_title="Lipidi", body_text="", deck_name="Deck1", keywords=["ApoB48"])
+        u2 = LectureUnit(unit_title="Metabolismo", body_text="", deck_name="Deck2", keywords=["Chilomicroni"])
+
+        trans = pipeline.translate_keywords([u1, u2])
+        self.assertEqual(trans, {"ApoB48": "ApoB-48", "Chilomicroni": "Chylomicrons"})
+        mock_ai.chat_completion_json.assert_called_once()
+
+        # concepts_from_keywords maps translations
+        concepts = concepts_from_keywords(["ApoB48"], translations=trans)
+        self.assertEqual(len(concepts), 1)
+        self.assertEqual(concepts[0].topic_it, "ApoB48")
+        self.assertEqual(concepts[0].quote_it, "ApoB48")
+        self.assertEqual(concepts[0].keywords_it, ["ApoB48"])
+        self.assertEqual(concepts[0].claim_en, "ApoB-48")
+        self.assertEqual(concepts[0].keywords_en, ["ApoB-48"])
+        self.assertEqual(concepts[0].source, "keyword")
+
+        # Vector retrieval uses claim_en
+        embedded_queries.clear()
+        pipeline.retrieve_for_concepts(concepts, candidate_nids=[9001])
+        self.assertIn("ApoB-48", embedded_queries[0])
+
+        # 2. Worker translates keywords in a single call for multiple units
+        mock_ai.chat_completion_json.reset_mock()
+        mock_ai.chat_completion_json.return_value = {
+            "translations": [
+                {"it": "ApoB48", "en": "ApoB-48"},
+                {"it": "Chilomicroni", "en": "Chylomicrons"},
+            ]
+        }
+        precomputed_data = {
+            "candidate_nids": {9001, 9002},
+            "suspended_nids": {9001, 9002},
+            "allowed_cids": {9001, 9002},
+            "parent_deck_prefix": None,
+            "precomputed_notes_data": None,
+        }
+        finished_payloads = []
+        worker = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Lipidi\n- ApoB48\n\n# Metabolismo\n- Chilomicroni\n",
+            base_deck_name="KwDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=lambda t: t(),
+            input_mode="keyword",
+        )
+        worker.finished_sig.connect(lambda res: finished_payloads.append(res))
+        worker.run()
+
+        # Single call for two units
+        self.assertEqual(mock_ai.chat_completion_json.call_count, 1)
+        self.assertEqual(len(finished_payloads), 1)
+        self.assertEqual(finished_payloads[0]["units_processed"], 2)
+        self.assertEqual(finished_payloads[0].get("warning"), "")
+
+        # 3. Fallback to original keywords on exception with warning
+        mock_ai.chat_completion_json.reset_mock()
+        mock_ai.chat_completion_json.side_effect = Exception("Chat model error")
+        finished_payloads.clear()
+
+        worker_fallback = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Lipidi\n- ApoB48\n",
+            base_deck_name="KwDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=lambda t: t(),
+            input_mode="keyword",
+        )
+        worker_fallback.finished_sig.connect(lambda res: finished_payloads.append(res))
+        worker_fallback.run()
+
+        self.assertEqual(len(finished_payloads), 1)
+        self.assertEqual(finished_payloads[0]["units_processed"], 1)
+        self.assertEqual(
+            finished_payloads[0].get("warning"),
+            "Traduzione non riuscita: keyword usate senza traduzione.",
+        )
+
+        # 4. No chat call with keyword_translate=False
+        cfg_no_trans = ConfigManager()
+        cfg_no_trans.chat_model = "test-chat"
+        cfg_no_trans.embed_model = mid
+        cfg_no_trans.keyword_translate = False
+        mock_ai.chat_completion_json.reset_mock()
+        finished_payloads.clear()
+
+        worker_no_trans = SearchBatchWorker(
+            col=col,
+            config=cfg_no_trans,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Lipidi\n- ApoB48\n",
+            base_deck_name="KwDeck",
+            precomputed_data=precomputed_data,
+            main_thread_runner=lambda t: t(),
+            input_mode="keyword",
+        )
+        worker_no_trans.finished_sig.connect(lambda res: finished_payloads.append(res))
+        worker_no_trans.run()
+
+        mock_ai.chat_completion_json.assert_not_called()
+        self.assertEqual(finished_payloads[0].get("warning"), "")
+
+        col.conn.close()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeywordTranslationAlignment(unittest.TestCase):
+    def test_positional_fallback_when_italian_side_rewritten(self):
+        from ankihub_searcher.search_pipeline import SmartSearchPipeline
+        from ankihub_searcher.config_manager import ConfigManager
+        from ankihub_searcher.text_utils import LectureUnit
+
+        class FakeAI:
+            def chat_completion_json(self, **kw):
+                return {"translations": [
+                    {"it": "chilomicroni", "en": "Chylomicrons"},
+                    {"it": "Proteina C reattiva", "en": "C-reactive protein"},
+                ]}
+
+        cfg = ConfigManager()
+        cfg.chat_model = "x"
+        pipe = SmartSearchPipeline(cfg, None, FakeAI())
+        unit = LectureUnit(unit_title="U", deck_name="U", body_text="", keywords=["Chilomicroni", "PCR"])
+        out = pipe.translate_keywords([unit])
+        self.assertEqual(out, {"Chilomicroni": "Chylomicrons", "PCR": "C-reactive protein"})

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import html
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -24,6 +24,7 @@ class LectureUnit:
     deck_name: str
     body_text: str
     breadcrumb: str = ""
+    keywords: List[str] = field(default_factory=list)
 
 
 # Prefixes or segments that invalidate subsequent segments in the same tag (e.g., #AK_Other::AnKing_Image::Marcos)
@@ -98,6 +99,7 @@ _RE_MULTILINE = re.compile(r"\n{3,}")
 _RE_HEADER = re.compile(r"^(#{1,6})\s+(.+)$")
 _RE_HR = re.compile(r"^[-=_*]{3,}$")
 _RE_RANDOM_CODE = re.compile(r"^[a-zA-Z0-9]{5,10}$")
+_RE_KEYWORD_BULLET = re.compile(r"^(?:[-*+•]|\d+[\.\)])\s*")
 
 
 def clean_html_and_cloze(raw_html: Optional[str]) -> str:
@@ -509,3 +511,59 @@ def normalize_inline_latex(raw_text: Optional[str]) -> str:
     text = _RE_PAREN_CLOSE.sub("", text)
 
     return text
+
+
+def parse_keyword_lines(text: Optional[str]) -> List[str]:
+    """Parses handwritten keywords from text, one per line.
+
+    - Strips leading bullet markers (-, *, +, •, 1., 1)).
+    - Strips whitespace and trailing commas or semicolons.
+    - Skips empty lines and Markdown header lines.
+    - Normalizes inline LaTeX (e.g. $\\beta$ -> β).
+    - Deduplicates case-insensitively while preserving original order and first casing.
+    """
+    if not text:
+        return []
+
+    keywords: List[str] = []
+    seen = set()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        kw = _RE_KEYWORD_BULLET.sub("", stripped).strip()
+        kw = kw.rstrip(" \t,;").strip()
+        if not kw:
+            continue
+
+        kw = normalize_inline_latex(kw).strip()
+        if not kw:
+            continue
+
+        key = kw.lower()
+        if key not in seen:
+            seen.add(key)
+            keywords.append(kw)
+
+    return keywords
+
+
+def parse_keyword_units(
+    raw_text: str, base_deck_name: str = "", naming_style: str = "dash"
+) -> List[LectureUnit]:
+    """Splits Markdown/plain text into LectureUnits populated with parsed keywords.
+
+    Uses parse_markdown_units to determine units, deck names, and breadcrumbs,
+    extracts keywords from each unit's body text via parse_keyword_lines, and
+    discards any units that have no valid keywords.
+    """
+    units = parse_markdown_units(raw_text, base_deck_name=base_deck_name, naming_style=naming_style)
+    result: List[LectureUnit] = []
+    for unit in units:
+        kws = parse_keyword_lines(unit.body_text)
+        if kws:
+            unit.keywords = kws
+            result.append(unit)
+    return result

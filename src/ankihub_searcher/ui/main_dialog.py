@@ -91,7 +91,49 @@ except ImportError:
 
         class _HeadlessWidget(metaclass=_HeadlessMeta):
             def __init__(self, *args, **kwargs):
-                pass
+                self._val = 0.0
+                self._idx = 0
+                self._text = ""
+                self._checked = False
+
+            def setValue(self, val):
+                self._val = val
+
+            def value(self):
+                return self._val if self._val is not None else 0.0
+
+            def setCurrentIndex(self, idx):
+                self._idx = idx
+
+            def currentIndex(self):
+                return self._idx
+
+            def toPlainText(self):
+                return self._text
+
+            def setPlainText(self, text):
+                self._text = text
+
+            def isChecked(self):
+                return self._checked
+
+            def setChecked(self, val):
+                self._checked = bool(val)
+
+            def text(self):
+                return self._text
+
+            def setText(self, val):
+                self._text = val
+
+            def currentText(self):
+                return self._text
+
+            def setCurrentText(self, val):
+                self._text = val
+
+            def currentData(self):
+                return ""
 
             def __getattr__(self, name):
                 return _HeadlessWidget()
@@ -146,7 +188,7 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.4.0"
+CURRENT_VERSION = "0.5.0"
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -159,6 +201,8 @@ def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, An
     partial = sum(1 for c in coverage_items if c.get("status") == "partial")
     uncovered = sum(1 for c in coverage_items if c.get("status") == "uncovered")
     pct = int(round((covered / total) * 100)) if total > 0 else 0
+    is_kw = any(c.get("source") == "keyword" for c in coverage_items)
+    title = "Copertura keyword" if is_kw else "Copertura concetti"
     return {
         "total": total,
         "covered": covered,
@@ -166,7 +210,7 @@ def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, An
         "uncovered": uncovered,
         "pct": pct,
         "summary_label": (
-            f"Copertura concetti: {covered} / {total} ({pct}%)  —  "
+            f"{title}: {covered} / {total} ({pct}%)  —  "
             f"Coperti: {covered}  |  Parziali: {partial}  |  Scoperti: {uncovered}"
         ),
         "history_str": f"{covered}/{total} ({pct}%)" if total > 0 else "-",
@@ -378,6 +422,9 @@ class SearchDialog(QDialog):
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
         self.indexer = DeckIndexer(self.config, self.storage, self.ai_client)
+        self.profile = _get_current_profile_name()
+        self.last_search_mode = getattr(self.config, "search_input_mode", "keyword")
+        self.last_search_text = ""
 
         self.setWindowTitle("Smart Search")
         self.resize(540, 410)
@@ -430,15 +477,23 @@ class SearchDialog(QDialog):
         self.txt_base_deck.setPlaceholderText("Es. Patologia Generale")
         layout.addWidget(self.txt_base_deck)
 
-        # 3. Lecture Text Input
-        lbl_text = QLabel("Testo della lezione:")
-        layout.addWidget(lbl_text)
+        # 3. Input Tabs (Keyword / Testo)
+        self.input_tabs = QTabWidget()
+
+        self.txt_keywords = QPlainTextEdit()
+        self.txt_keywords.setPlaceholderText("ApoB48\nChilomicroni\nRecettore LDL")
+        self.input_tabs.addTab(self.txt_keywords, "Keyword")
 
         self.txt_lecture = QPlainTextEdit()
         self.txt_lecture.setPlaceholderText(
             "Incolla qui il testo della lezione o appunti in Markdown..."
         )
-        layout.addWidget(self.txt_lecture)
+        self.input_tabs.addTab(self.txt_lecture, "Testo")
+
+        # Always open on the "Keyword" tab (index 0)
+        self.input_tabs.setCurrentIndex(0)
+
+        layout.addWidget(self.input_tabs)
 
         # 4. Minimal Progress Bar & Status (Hidden unless running)
         self.lbl_status = QLabel("")
@@ -503,15 +558,24 @@ class SearchDialog(QDialog):
             self.reject()
 
     def _start_search(self) -> None:
-        raw_text = self.txt_lecture.toPlainText().strip()
-        if not raw_text:
-            QMessageBox.warning(self, "Attenzione", "Inserisci il testo della lezione prima di avviare la ricerca.")
-            return
-
         query = self.combo_query.currentText().strip()
         if not query:
             QMessageBox.warning(self, "Attenzione", "Inserisci una query di ricerca valida.")
             return
+
+        current_tab_idx = self.input_tabs.currentIndex()
+        if current_tab_idx == 0:
+            active_mode = "keyword"
+            raw_text = self.txt_keywords.toPlainText().strip()
+            if not raw_text:
+                QMessageBox.warning(self, "Attenzione", "Inserisci almeno una keyword.")
+                return
+        else:
+            active_mode = "text"
+            raw_text = self.txt_lecture.toPlainText().strip()
+            if not raw_text:
+                QMessageBox.warning(self, "Attenzione", "Inserisci il testo della lezione.")
+                return
 
         if self.col:
             try:
@@ -529,10 +593,14 @@ class SearchDialog(QDialog):
 
         self.config.search_query = query
         self.config.add_query_to_history(query)
+        self.config.search_input_mode = active_mode
         extracted_decks = self.indexer.extract_deck_names_from_query(query)
         if extracted_decks:
             self.config.selected_decks = extracted_decks
         self.config.save()
+
+        self.last_search_mode = active_mode
+        self.last_search_text = raw_text
 
         self.btn_search.setEnabled(False)
         self.btn_cancel.setText("Interrompi")
@@ -559,7 +627,8 @@ class SearchDialog(QDialog):
             raw_text=raw_text,
             base_deck_name=self.txt_base_deck.text().strip(),
             precomputed_data=presearch_data,
-            profile=_get_current_profile_name(),
+            profile=self.profile,
+            input_mode=active_mode,
         )
         self.search_worker.progress_sig.connect(self._on_search_progress)
         self.search_worker.finished_sig.connect(self._on_search_finished)
@@ -598,8 +667,10 @@ class SearchDialog(QDialog):
         cov_stats = compute_coverage_stats(all_coverage)
         cov_line = ""
         if cov_stats["total"] > 0:
+            is_kw = self.last_search_mode == "keyword" or any(c.get("source") == "keyword" for c in all_coverage)
+            label = "Copertura keyword" if is_kw else "Copertura concetti"
             cov_line = (
-                f"\n\nCopertura concetti: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
+                f"\n\n{label}: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
                 f"• Coperti: {cov_stats['covered']}\n"
                 f"• Parziali: {cov_stats['partial']}\n"
                 f"• Scoperti: {cov_stats['uncovered']}"
@@ -616,6 +687,9 @@ class SearchDialog(QDialog):
                 + "\n\n"
             )
 
+        warning_msg = res.get("warning", "")
+        warn_section = f"⚠️ {warning_msg}\n\n" if warning_msg else ""
+
         # 2. Present clean post-search summary popup with Browser, Coverage Details, Undo & Retry buttons
         parent_widget = mw if mw else None
         msg_box = QMessageBox(parent_widget)
@@ -625,11 +699,18 @@ class SearchDialog(QDialog):
                 msg_box.setIcon(QMessageBox.Icon.Warning)
             except Exception:
                 pass
+        elif warning_msg:
+            msg_box.setWindowTitle("Ricerca completata con avvisi")
+            try:
+                msg_box.setIcon(QMessageBox.Icon.Warning)
+            except Exception:
+                pass
         else:
             msg_box.setWindowTitle("Ricerca completata")
 
         if total_added == 0 and total_already_active > 0:
             msg_box.setText(
+                f"{warn_section}"
                 f"{err_section}"
                 f"Nessuna nuova carta da riattivare.\n\n"
                 f"Carte correlate già attive in studio: {total_already_active}"
@@ -637,12 +718,14 @@ class SearchDialog(QDialog):
             )
         elif total_added == 0 and not total_already_active and err_units:
             msg_box.setText(
+                f"{warn_section}"
                 f"{err_section}"
                 f"Nessun mazzo filtrato creato a causa degli errori sopra indicati."
                 f"{cov_line}"
             )
         else:
             msg_box.setText(
+                f"{warn_section}"
                 f"{err_section}"
                 f"Mazzi filtrati creati: {decks_created}\n"
                 f"Nuove carte riattivate: {total_unsuspended}\n"
@@ -750,7 +833,12 @@ class SearchDialog(QDialog):
                 )
 
     def _do_retry_tighter(self, run_ids: List[str], results: List[Any]) -> None:
-        curr_thresh = self.config.get_min_similarity_threshold()
+        mode = self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
+        if mode == "keyword":
+            curr_thresh = self.config.get_keyword_min_similarity_threshold()
+        else:
+            curr_thresh = self.config.get_min_similarity_threshold()
+
         new_thresh = min(0.95, round(curr_thresh + 0.03, 4))
         curr_max = getattr(self.config, "max_notes_per_concept", 10)
         new_max = max(3, int(round(curr_max * 2.0 / 3.0)))
@@ -767,12 +855,22 @@ class SearchDialog(QDialog):
                         keywords_en=c.get("keywords_en", []),
                         keywords_it=c.get("keywords_it", []),
                         quote_it=c.get("quote_it", ""),
+                        source=str(c.get("source", "keyword" if mode == "keyword" else "llm")),
                     )
                     for c in cov
                     if c.get("claim_en") or c.get("topic_it")
                 ]
                 if c_list:
                     precomputed_concepts[u_title] = c_list
+
+        raw_text = self.last_search_text
+        if not raw_text:
+            if mode == "keyword":
+                raw_text = self.txt_keywords.toPlainText().strip()
+            else:
+                raw_text = self.txt_lecture.toPlainText().strip()
+
+        base_deck = self.txt_base_deck.text().strip()
 
         def _on_rollback_finished():
             self.btn_search.setEnabled(False)
@@ -785,23 +883,24 @@ class SearchDialog(QDialog):
                 f"Riprova più stretto: soglia {new_thresh:.2f} (+0.03), max {new_max} note/concetto..."
             )
 
-            self.worker = SearchBatchWorker(
+            self.search_worker = SearchBatchWorker(
                 col=self.col,
                 config=self.config,
                 storage=self.storage,
                 ai_client=self.ai_client,
-                raw_text=self.txt_lecture.toPlainText().strip(),
-                base_deck_name=self.txt_deck_name.text().strip(),
+                raw_text=raw_text,
+                base_deck_name=base_deck,
                 parent=self,
                 profile=self.profile,
+                input_mode=mode,
             )
-            self.worker.precomputed_concepts = precomputed_concepts
-            self.worker.override_min_threshold = new_thresh
-            self.worker.override_max_notes_per_concept = new_max
-            self.worker.progress_sig.connect(self._on_search_progress)
-            self.worker.finished_sig.connect(self._on_search_finished)
-            self.worker.error_sig.connect(self._on_search_error)
-            self.worker.start()
+            self.search_worker.precomputed_concepts = precomputed_concepts
+            self.search_worker.override_min_threshold = new_thresh
+            self.search_worker.override_max_notes_per_concept = new_max
+            self.search_worker.progress_sig.connect(self._on_search_progress)
+            self.search_worker.finished_sig.connect(self._on_search_finished)
+            self.search_worker.error_sig.connect(self._on_search_error)
+            self.search_worker.start()
 
         self._do_batch_rollback(run_ids, on_done=_on_rollback_finished)
 
@@ -1336,10 +1435,10 @@ class IndexDialog(QDialog):
 class SettingsDialog(QDialog):
     """Minimal dialog for configuring search sensitivity, AI endpoints, and note fields."""
 
-    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None):
+    def __init__(self, col: Optional[Any] = None, parent: Optional[QWidget] = None, config: Optional[ConfigManager] = None):
         super().__init__(parent)
         self.col = col or (mw.col if mw else None)
-        self.config = ConfigManager.load()
+        self.config = config or ConfigManager.load()
         self.ai_client = OpenAICompatibleClient()
 
         self.setWindowTitle("Smart Search — Impostazioni")
@@ -1390,6 +1489,21 @@ class SettingsDialog(QDialog):
         thresh_row.addWidget(self.slider_thresh)
         thresh_row.addWidget(QLabel("Preciso"))
         select_layout.addLayout(thresh_row)
+
+        row_kw_thresh = QHBoxLayout()
+        row_kw_thresh.addWidget(QLabel("Soglia keyword:"))
+        self.spin_kw_thresh = QDoubleSpinBox()
+        self.spin_kw_thresh.setRange(0.30, 0.90)
+        self.spin_kw_thresh.setSingleStep(0.01)
+        self.spin_kw_thresh.setDecimals(2)
+        self.spin_kw_thresh.setValue(getattr(self.config, "keyword_min_similarity", 0.55))
+        row_kw_thresh.addWidget(self.spin_kw_thresh)
+        row_kw_thresh.addSpacing(15)
+        self.chk_keyword_translate = QCheckBox("Traduci keyword in inglese")
+        self.chk_keyword_translate.setChecked(bool(getattr(self.config, "keyword_translate", True)))
+        row_kw_thresh.addWidget(self.chk_keyword_translate)
+        row_kw_thresh.addStretch()
+        select_layout.addLayout(row_kw_thresh)
 
         # max_notes_per_concept & relative_score_window
         row_params = QHBoxLayout()
@@ -1689,6 +1803,8 @@ class SettingsDialog(QDialog):
         current_thresh = self.config.get_min_similarity_threshold()
         self.slider_thresh.setValue(int(round(current_thresh * 100)))
         self.lbl_thresh_val.setText(f"{current_thresh:.2f}")
+        self.spin_kw_thresh.setValue(float(getattr(self.config, "keyword_min_similarity", 0.55)))
+        self.chk_keyword_translate.setChecked(bool(getattr(self.config, "keyword_translate", True)))
 
         self.spin_max_notes.setValue(getattr(self.config, "max_notes_per_concept", 10))
         self.spin_rel_window.setValue(getattr(self.config, "relative_score_window", 0.05))
@@ -1770,6 +1886,7 @@ class SettingsDialog(QDialog):
             return
 
         thresh = self.slider_thresh.value() / 100.0
+        kw_thresh = self.spin_kw_thresh.value()
         rel_window = self.spin_rel_window.value()
         max_notes_concept = self.spin_max_notes.value()
         max_cards_unit = self.spin_max_cards.value()
@@ -1797,6 +1914,7 @@ class SettingsDialog(QDialog):
                     keywords_en=c.get("keywords_en", []),
                     keywords_it=c.get("keywords_it", []),
                     quote_it=c.get("quote_it", ""),
+                    source=str(c.get("source", "llm")),
                 )
                 for c in run.concept_coverage
                 if c.get("claim_en") or c.get("topic_it")
@@ -1804,12 +1922,14 @@ class SettingsDialog(QDialog):
             if not concepts:
                 continue
 
+            eff_thresh = kw_thresh if any(c.source == "keyword" for c in concepts) else thresh
+
             try:
                 candidates = pipeline.retrieve_for_concepts(
                     concepts=concepts,
                     active_model_id=active_mid,
                     candidate_nids=candidate_nids,
-                    min_threshold=thresh,
+                    min_threshold=eff_thresh,
                     relative_score_window=rel_window,
                     max_notes_per_concept=max_notes_concept,
                     max_cards_per_unit=max_cards_unit,
@@ -1933,6 +2053,8 @@ class SettingsDialog(QDialog):
     def _save_settings(self) -> None:
         thresh = self.slider_thresh.value() / 100.0
         self.config.sensitivity = max(0.0, min(1.0, round((0.70 - thresh) / 0.20, 2)))
+        self.config.keyword_min_similarity = round(self.spin_kw_thresh.value(), 2)
+        self.config.keyword_translate = self.chk_keyword_translate.isChecked()
         self.config.max_notes_per_concept = self.spin_max_notes.value()
         self.config.relative_score_window = round(self.spin_rel_window.value(), 4)
         self.config.max_cards_per_unit = self.spin_max_cards.value()
