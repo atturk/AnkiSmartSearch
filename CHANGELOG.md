@@ -2,6 +2,25 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.4.0] - 2026-11-09
+
+### Novità
+- **Prompt Stage 1 atomico con citazione (`quote_it`):** Estrazione di un concetto distinto per ciascuna specifica entità medica (malattia, meccanismo, molecola, farmaco, segno clinico), con divieto di accorpamenti e ancoraggio testuale esplicito tramite il campo `quote_it` visualizzato nella finestra dei dettagli di copertura.
+- **Selezione per concetto con taglio relativo:** Sostituzione del top-k fisso con una finestra di punteggio relativo (`relative_score_window`, default 0.08) fino a `max_notes_per_concept` (30) e `max_cards_per_unit` (150), garantendo che le carte già attive non sottraggano slot a quelle da riattivare.
+- **Istruzione per query degli embedding:** Supporto all'opzione `embed_query_instruction` per guidare i modelli asimmetrici (come `qwen3-embedding`), applicata in modo trasparente solo alle query di ricerca e non all'indicizzazione delle note.
+- **Scritture sicure sul thread principale con Undo di Anki:** Spostamento di tutte le scritture alla collezione (riattivazione carte, creazione/ricostruzione mazzi filtrati, cancellazione e rollback) sul main thread tramite `CollectionOp` con punto di ripristino nativo "Smart Search", preservando la massima reattività dell'interfaccia.
+- **Risoluzione note condivise tra unità (Batch):** Assegnazione ottimale di ogni carta contesa all'unità didattica con il punteggio di similarità più alto, con registrazione della condivisione (`shared_with`) nella copertura delle altre unità.
+- **Isolamento cronologia per profilo Anki:** Associazione di ogni run al profilo utente aperto (`mw.pm.name`), con filtraggio della cronologia e protezione dal rollback accidentale di ricerche create in profili differenti.
+- **Riepilogo e copertura onesti:** Calcolo rigoroso della percentuale di copertura basato unicamente sui concetti coperti al 100% (con conteggio separato per parziali e scoperti), ed evidenziazione immediata in testa al riepilogo di eventuali unità con errori Stage 1.
+
+### Correzioni
+- **Robustezza Stage 1 & Escape LaTeX in JSON:** Normalizzazione del LaTeX inline prima dell'invio e riparazione automatica degli escape non validi o comandi greci/LaTeX (es. `\beta`, `\nu`, `\theta`) sia prima che dopo il parsing JSON, eliminando i fallback silenziosi a 0 carte e marcando chiaramente l'unità con `unit_error`. Supporto opzionale a `json_schema` strutturato e `max_tokens` configurabile.
+- **FTS5 con keyword composite e trattini:** Gestione corretta dei token con trattino (es. `IL-1`, `TNF-alpha`, `heparin-induced`) come frasi quotate per evitare errori di sintassi SQLite FTS5, con scarto delle stopword (italiano/inglese) e opzione per escludere keyword italiane su mazzi inglesi.
+- **Verifica Stage 3:** Invio del testo completo dell'unità e di `quote_it` al verificatore LLM, con scarto integrale del batch quando il modello restituisce una lista vuota valida.
+- **Rollback basato su `revlog`:** Riconoscimento delle carte ripassate tramite timestamp di revisione (`revlog.id >= created_at * 1000`) invece del generico contatore `reps > 0`, e prevenzione del riuso/sovrascrittura di mazzi filtrati appartenenti a ricerche attive.
+
+---
+
 ## [0.3.0] - 2026-11-08
 
 ### Added

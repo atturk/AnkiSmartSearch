@@ -52,13 +52,32 @@ def set_version(version: str) -> None:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
+    # 4. Update main_dialog.py
+    main_dlg_file = os.path.join(SRC_DIR, "ui", "main_dialog.py")
+    if os.path.exists(main_dlg_file):
+        with open(main_dlg_file, "r", encoding="utf-8") as f:
+            dlg_text = f.read()
+        dlg_text = re.sub(r'CURRENT_VERSION\s*=\s*"[^"]+"', f'CURRENT_VERSION = "{version}"', dlg_text)
+        with open(main_dlg_file, "w", encoding="utf-8") as f:
+            f.write(dlg_text)
+
+    # 5. Update updater.py
+    updater_file = os.path.join(SRC_DIR, "updater.py")
+    if os.path.exists(updater_file):
+        with open(updater_file, "r", encoding="utf-8") as f:
+            up_text = f.read()
+        up_text = re.sub(r'CURRENT_VERSION\s*=\s*"[^"]+"', f'CURRENT_VERSION = "{version}"', up_text)
+        with open(updater_file, "w", encoding="utf-8") as f:
+            f.write(up_text)
+
 
 def package_addon(version: str) -> tuple[str, str]:
     os.makedirs(DIST_DIR, exist_ok=True)
     versioned_out = os.path.join(DIST_DIR, f"AnkiHubSearcher-v{version}.ankiaddon")
+    smart_out = os.path.join(DIST_DIR, f"SmartSearch-v{version}.ankiaddon")
     latest_out = os.path.join(ROOT_DIR, "AnkiHubSearcher.ankiaddon")
 
-    for out_path in (versioned_out, latest_out):
+    for out_path in (versioned_out, smart_out, latest_out):
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(SRC_DIR):
                 dirs[:] = [d for d in dirs if d not in ("__pycache__", "user_files", ".git")]
