@@ -25,6 +25,7 @@ try:
 
     HAS_NUMPY = True
 except ImportError:
+    np = None  # type: ignore
     HAS_NUMPY = False
 
 
@@ -406,7 +407,8 @@ class SearchDatabase:
                 rows = cur.fetchall()
             else:
                 if not nids:
-                    return [], [] if not HAS_NUMPY else np.empty((0, 0), dtype=np.float32), 0
+                    empty_res = [] if (not HAS_NUMPY or np is None) else np.empty((0, 0), dtype=np.float32)
+                    return [], empty_res, 0
                 if len(nids) <= 900:
                     placeholders = ",".join("?" * len(nids))
                     cur.execute(
@@ -424,12 +426,13 @@ class SearchDatabase:
                     rows = [r for r in cur.fetchall() if r["nid"] in candidate_set]
 
         if not rows:
-            return [], [] if not HAS_NUMPY else np.empty((0, 0), dtype=np.float32), 0
+            empty_res = [] if (not HAS_NUMPY or np is None) else np.empty((0, 0), dtype=np.float32)
+            return [], empty_res, 0
 
         nid_list: List[int] = []
         dim = rows[0]["dim"]
 
-        if HAS_NUMPY:
+        if HAS_NUMPY and np is not None:
             n_rows = len(rows)
             matrix = np.empty((n_rows, dim), dtype=np.float32)
             for idx, r in enumerate(rows):
@@ -455,14 +458,14 @@ class SearchDatabase:
             return []
 
         norm_q = normalize_l2(query_vec)
-        use_np = HAS_NUMPY and not force_pure_python
+        use_np = HAS_NUMPY and np is not None and not force_pure_python
 
-        if use_np and isinstance(vecs, np.ndarray):
+        if use_np and isinstance(vecs, getattr(np, "ndarray", ())):
             q_arr = np.array(norm_q, dtype=np.float32)
             scores = np.dot(vecs, q_arr)
             results = [(nid_list[i], float(scores[i])) for i in range(len(nid_list))]
         else:
-            if HAS_NUMPY and isinstance(vecs, np.ndarray):
+            if HAS_NUMPY and np is not None and isinstance(vecs, getattr(np, "ndarray", ())):
                 vec_list = [v.tolist() for v in vecs]
             else:
                 vec_list = vecs

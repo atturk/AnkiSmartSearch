@@ -1,6 +1,7 @@
 """Comprehensive unit tests for storage, vector math, search pipeline, and deck operations."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -2667,6 +2668,114 @@ I should decompose this into atomic concepts.
             self.assertEqual(worker_empty.profile, "")
 
         col.conn.close()
+
+    def test_pure_python_fallback_without_numpy(self):
+        """Simulates complete absence of numpy (sys.modules['numpy'] = None in a subprocess).
+        Verifies:
+        1. 'import ankihub_searcher' succeeds without numpy.
+        2. find_similar_notes and retrieve_for_concepts return identical results to the numpy version.
+        """
+        import json
+        from ankihub_searcher.search_pipeline import SmartSearchPipeline, ExtractedConcept, find_similar_notes
+
+        mid = "test-numpy-comparison"
+        self.storage.save_embeddings_batch(
+            [
+                (101, mid, "h101", 3, [1.0, 0.0, 0.0]),
+                (102, mid, "h102", 3, [0.95, 0.05, 0.0]),
+                (103, mid, "h103", 3, [0.0, 1.0, 0.0]),
+                (104, mid, "h104", 3, [0.7071, 0.7071, 0.0]),
+            ]
+        )
+
+        cfg = ConfigManager()
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        pipeline = SmartSearchPipeline(cfg, self.storage, mock_ai)
+        concept = ExtractedConcept("TestTopic", "TestClaim", ["k1"], ["k1"])
+
+        # Reference results computed in current process (with numpy if available)
+        ref_similar_matched, ref_similar_missing = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[101, 103],
+            active_model_id=mid,
+            min_score=0.70,
+            max_notes=10,
+        )
+        ref_retrieved = pipeline.retrieve_for_concepts(
+            concepts=[concept],
+            active_model_id=mid,
+            min_threshold=0.50,
+            concept_vectors=[[1.0, 0.0, 0.0]],
+        )
+        ref_retrieved_data = [(r.nid, r.score) for r in ref_retrieved]
+
+        # Execute pure Python verification in a subprocess where numpy is completely blocked
+        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+        code = f"""
+import sys
+sys.path.insert(0, {repr(src_dir)})
+sys.modules['numpy'] = None
+
+import ankihub_searcher
+from ankihub_searcher.storage import SearchDatabase, HAS_NUMPY
+from ankihub_searcher.search_pipeline import SmartSearchPipeline, ExtractedConcept, find_similar_notes
+from ankihub_searcher.config_manager import ConfigManager
+from ankihub_searcher.ai_client import OpenAICompatibleClient
+from unittest.mock import MagicMock
+import json
+
+assert HAS_NUMPY is False, "HAS_NUMPY must be False when numpy is blocked"
+
+storage = SearchDatabase({repr(self.storage.db_path)})
+mid = {repr(mid)}
+
+# 1. find_similar_notes without numpy
+matched, missing = find_similar_notes(
+    storage=storage,
+    selected_nids=[101, 103],
+    active_model_id=mid,
+    min_score=0.70,
+    max_notes=10,
+)
+
+# 2. retrieve_for_concepts without numpy
+cfg = ConfigManager()
+mock_ai = MagicMock(spec=OpenAICompatibleClient)
+pipeline = SmartSearchPipeline(cfg, storage, mock_ai)
+concept = ExtractedConcept("TestTopic", "TestClaim", ["k1"], ["k1"])
+retrieved = pipeline.retrieve_for_concepts(
+    concepts=[concept],
+    active_model_id=mid,
+    min_threshold=0.50,
+    concept_vectors=[[1.0, 0.0, 0.0]],
+)
+retrieved_data = [(r.nid, r.score) for r in retrieved]
+
+output = {{
+    "similar_matched": matched,
+    "similar_missing": missing,
+    "retrieved": retrieved_data,
+}}
+print("__JSON_RESULT__" + json.dumps(output))
+"""
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"Subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+
+        output_line = [line for line in proc.stdout.splitlines() if line.startswith("__JSON_RESULT__")][0]
+        no_np_res = json.loads(output_line.replace("__JSON_RESULT__", ""))
+
+        # Compare find_similar_notes results
+        self.assertEqual(no_np_res["similar_missing"], ref_similar_missing)
+        self.assertEqual(len(no_np_res["similar_matched"]), len(ref_similar_matched))
+        for (nid_no, score_no), (nid_ref, score_ref) in zip(no_np_res["similar_matched"], ref_similar_matched):
+            self.assertEqual(nid_no, nid_ref)
+            self.assertAlmostEqual(score_no, score_ref, places=3)
+
+        # Compare retrieve_for_concepts results
+        self.assertEqual(len(no_np_res["retrieved"]), len(ref_retrieved_data))
+        for (nid_no, score_no), (nid_ref, score_ref) in zip(no_np_res["retrieved"], ref_retrieved_data):
+            self.assertEqual(nid_no, nid_ref)
+            self.assertAlmostEqual(score_no, score_ref, places=3)
 
 
 

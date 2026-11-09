@@ -11,9 +11,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+try:
+    import numpy as np  # type: ignore
+except ImportError:
+    np = None  # type: ignore
+
 from .ai_client import AIClientError, OpenAICompatibleClient
 from .config_manager import ConfigManager
-from .storage import HAS_NUMPY, SearchDatabase, normalize_l2, np
+from .storage import SearchDatabase, normalize_l2
 from .text_utils import LectureUnit, normalize_inline_latex
 
 
@@ -775,7 +780,7 @@ def find_similar_notes(
         return [], []
 
     # Compute normalized mean vector
-    if HAS_NUMPY and isinstance(sel_vecs, np.ndarray):
+    if np is not None and isinstance(sel_vecs, getattr(np, "ndarray", ())):
         mean_arr = np.mean(sel_vecs, axis=0)
         norm_mean = normalize_l2(mean_arr.tolist())
     else:
