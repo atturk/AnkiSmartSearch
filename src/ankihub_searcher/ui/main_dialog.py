@@ -127,7 +127,13 @@ except ImportError:
 
 from ..ai_client import OpenAICompatibleClient
 from ..config_manager import ConfigManager
-from ..deck_ops import _get_op_changes, delete_filtered_deck_only, delete_filtered_deck_only_op, resolve_notes_to_cards
+from ..deck_ops import (
+    _get_op_changes,
+    delete_filtered_deck_only,
+    delete_filtered_deck_only_op,
+    resolve_notes_to_cards,
+    rollback_search_batch_op,
+)
 from ..indexer import DeckIndexer, collect_presearch_data
 from ..search_pipeline import ExtractedConcept, SmartSearchPipeline
 from ..storage import SearchDatabase
@@ -596,10 +602,7 @@ class SearchDialog(QDialog):
                 + "\n\n"
             )
 
-        # 1. Automatically close the SearchDialog (CollectionOp handles UI refresh)
-        self.accept()
-
-        # 2. Present clean post-search summary popup with Browser & Coverage Details buttons
+        # 2. Present clean post-search summary popup with Browser, Coverage Details, Undo & Retry buttons
         parent_widget = mw if mw else None
         msg_box = QMessageBox(parent_widget)
         if err_units:
@@ -637,16 +640,31 @@ class SearchDialog(QDialog):
         msg_box.addButton(QMessageBox.StandardButton.Ok)
         btn_browser = None
         btn_coverage = None
+        btn_undo = None
+        btn_retry = None
+
         created_names = [r.deck_name for r in results if r.filtered_did and r.total_cards_count > 0]
+        created_run_ids = [r.run_id for r in results if getattr(r, "run_id", "")]
+        has_concepts = any(getattr(r, "concept_coverage", None) for r in results)
+
         if created_names:
             btn_browser = msg_box.addButton("Browser", QMessageBox.ButtonRole.ActionRole)
         if all_coverage:
             btn_coverage = msg_box.addButton("Dettagli copertura", QMessageBox.ButtonRole.ActionRole)
+        if created_run_ids:
+            btn_undo = msg_box.addButton("Annulla creazione", QMessageBox.ButtonRole.DestructiveRole)
+        if created_run_ids and has_concepts:
+            btn_retry = msg_box.addButton("Riprova più stretto", QMessageBox.ButtonRole.ActionRole)
 
         msg_box.exec()
         clicked = msg_box.clickedButton()
 
-        if btn_browser and clicked == btn_browser:
+        if btn_undo and clicked == btn_undo:
+            self._do_batch_rollback(created_run_ids)
+            self.accept()
+        elif btn_retry and clicked == btn_retry:
+            self._do_retry_tighter(created_run_ids, results)
+        elif btn_browser and clicked == btn_browser:
             try:
                 import aqt
                 if aqt.mw:
@@ -656,6 +674,7 @@ class SearchDialog(QDialog):
                         browser.search_for(query)
             except Exception as e:
                 print(f"[SmartSearch] Error opening browser: {e}")
+            self.accept()
         elif btn_coverage and clicked == btn_coverage:
             cov_dlg = CoverageDetailDialog(
                 coverage_items=all_coverage,
@@ -663,6 +682,114 @@ class SearchDialog(QDialog):
                 parent=parent_widget,
             )
             cov_dlg.exec()
+            self.accept()
+        else:
+            self.accept()
+
+    def _do_batch_rollback(self, run_ids: List[str], on_done=None) -> None:
+        parent_widget = mw if mw else None
+
+        def _batch_op(col: Any):
+            res, changes = rollback_search_batch_op(
+                col=col,
+                storage=self.storage,
+                run_ids=run_ids,
+                keep_reviewed=True,
+                current_profile=self.profile,
+            )
+            return _get_op_changes(changes)
+
+        try:
+            import aqt
+            from aqt.operations import CollectionOp  # type: ignore
+        except ImportError:
+            CollectionOp = None
+
+        if mw and CollectionOp is not None:
+            op = CollectionOp(parent=mw, op=_batch_op)
+            if on_done:
+                op.success(lambda _: on_done())
+            else:
+                op.success(
+                    lambda _: QMessageBox.information(
+                        parent_widget,
+                        "Creazione Annullata",
+                        "Tutti i mazzi creati sono stati rimossi e le carte ripristinate (keep_reviewed=True).",
+                    )
+                )
+            op.run_in_background()
+        else:
+            rollback_search_batch_op(
+                col=self.col,
+                storage=self.storage,
+                run_ids=run_ids,
+                keep_reviewed=True,
+                current_profile=self.profile,
+            )
+            if on_done:
+                on_done()
+            else:
+                QMessageBox.information(
+                    parent_widget,
+                    "Creazione Annullata",
+                    "Tutti i mazzi creati sono stati rimossi e le carte ripristinate.",
+                )
+
+    def _do_retry_tighter(self, run_ids: List[str], results: List[Any]) -> None:
+        curr_thresh = self.config.get_min_similarity_threshold()
+        new_thresh = min(0.95, round(curr_thresh + 0.03, 4))
+        curr_max = getattr(self.config, "max_notes_per_concept", 10)
+        new_max = max(3, int(round(curr_max * 2.0 / 3.0)))
+
+        precomputed_concepts: Dict[str, List[ExtractedConcept]] = {}
+        for r in results:
+            u_title = getattr(r, "unit_title", "")
+            cov = getattr(r, "concept_coverage", [])
+            if cov:
+                c_list = [
+                    ExtractedConcept(
+                        topic_it=c.get("topic_it", ""),
+                        claim_en=c.get("claim_en", ""),
+                        keywords_en=c.get("keywords_en", []),
+                        keywords_it=c.get("keywords_it", []),
+                        quote_it=c.get("quote_it", ""),
+                    )
+                    for c in cov
+                    if c.get("claim_en") or c.get("topic_it")
+                ]
+                if c_list:
+                    precomputed_concepts[u_title] = c_list
+
+        def _on_rollback_finished():
+            self.btn_search.setEnabled(False)
+            self.btn_cancel.setText("Interrompi")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setMaximum(0)
+            self.progress_bar.setValue(0)
+            self.lbl_status.setVisible(True)
+            self.lbl_status.setText(
+                f"Riprova più stretto: soglia {new_thresh:.2f} (+0.03), max {new_max} note/concetto..."
+            )
+
+            self.worker = SearchBatchWorker(
+                col=self.col,
+                config=self.config,
+                storage=self.storage,
+                ai_client=self.ai_client,
+                raw_text=self.txt_lecture.toPlainText().strip(),
+                base_deck_name=self.txt_deck_name.text().strip(),
+                parent=self,
+                profile=self.profile,
+            )
+            self.worker.precomputed_concepts = precomputed_concepts
+            self.worker.override_min_threshold = new_thresh
+            self.worker.override_max_notes_per_concept = new_max
+            self.worker.progress_sig.connect(self._on_search_progress)
+            self.worker.finished_sig.connect(self._on_search_finished)
+            self.worker.error_sig.connect(self._on_search_error)
+            self.worker.start()
+
+        self._do_batch_rollback(run_ids, on_done=_on_rollback_finished)
 
     def _on_search_error(self, err_msg: str) -> None:
         self.btn_search.setEnabled(True)

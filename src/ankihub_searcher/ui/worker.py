@@ -6,6 +6,8 @@ Prevents freezing Anki's main thread while communicating progress through Qt sig
 from __future__ import annotations
 
 import sys
+import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -254,6 +256,10 @@ class SearchBatchWorker(QThread):
             active_model_id = self.config.get_active_model_id()
             pipeline = SmartSearchPipeline(self.config, self.storage, self.ai_client)
 
+            search_id = getattr(self, "search_id", "") or f"search_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            self.search_id = search_id
+            precomputed = getattr(self, "precomputed_concepts", None)
+
             units_search_data: List[Dict[str, Any]] = []
 
             for idx, unit in enumerate(units, start=1):
@@ -266,14 +272,27 @@ class SearchBatchWorker(QThread):
                     f"[{idx}/{total_units}] Elaborazione IA: {unit.unit_title}...",
                 )
 
-                # Search pipeline (Stage 1, 2, 3)
-                scored_notes = pipeline.search_unit(
-                    unit=unit,
-                    candidate_nids=candidate_nids,
-                    active_model_id=active_model_id,
-                    suspended_nids=suspended_nids,
-                )
-                unit_error = getattr(pipeline, "last_unit_error", "")
+                # Search pipeline (re-use precomputed concepts if provided to skip Stage 1)
+                if precomputed and unit.unit_title in precomputed:
+                    concepts = precomputed[unit.unit_title]
+                    scored_notes = pipeline.retrieve_for_concepts(
+                        concepts=concepts,
+                        candidate_nids=candidate_nids,
+                        active_model_id=active_model_id,
+                        suspended_nids=suspended_nids,
+                        min_threshold=getattr(self, "override_min_threshold", None),
+                        max_notes_per_concept=getattr(self, "override_max_notes_per_concept", None),
+                    )
+                    unit_error = ""
+                else:
+                    scored_notes = pipeline.search_unit(
+                        unit=unit,
+                        candidate_nids=candidate_nids,
+                        active_model_id=active_model_id,
+                        suspended_nids=suspended_nids,
+                    )
+                    unit_error = getattr(pipeline, "last_unit_error", "")
+
                 matched_nids = [sn.nid for sn in scored_notes]
                 note_scores = {sn.nid: sn.score for sn in scored_notes}
                 cov_dicts = [c.to_dict() for c in pipeline.last_concept_coverage]
@@ -285,6 +304,7 @@ class SearchBatchWorker(QThread):
                         "note_scores": note_scores,
                         "concept_coverage": cov_dicts,
                         "unit_error": unit_error,
+                        "search_id": search_id,
                     }
                 )
 
@@ -332,6 +352,7 @@ class SearchBatchWorker(QThread):
                         parent_deck_prefix=parent_deck_prefix,
                         allowed_cids=allowed_cids,
                         profile=self.profile,
+                        search_id=getattr(self, "search_id", ""),
                     )
                     self.progress_sig.emit(total_units, total_units, "Completato con successo!")
                     self.finished_sig.emit(
@@ -371,6 +392,7 @@ class SearchBatchWorker(QThread):
                                 parent_deck_prefix=parent_deck_prefix,
                                 allowed_cids=allowed_cids,
                                 profile=self.profile,
+                                search_id=getattr(self, "search_id", ""),
                             )
                             op_results.extend(res)
                             return _get_op_changes(changes)

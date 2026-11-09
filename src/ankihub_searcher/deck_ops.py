@@ -32,6 +32,8 @@ class RunResult:
     already_active_cids: List[int] = field(default_factory=list)
     concept_coverage: List[Dict[str, Any]] = field(default_factory=list)
     unit_error: str = ""
+    unit_title: str = ""
+    search_id: str = ""
 
 
 @dataclass
@@ -135,6 +137,7 @@ def execute_unit_deck_creation(
     allowed_cids: Optional[Set[int]] = None,
     unit_error: str = "",
     profile: str = "",
+    search_id: str = "",
 ) -> RunResult:
     """Unsuspends matching cards and builds a clean Filtered Deck with cid: search query."""
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -157,6 +160,7 @@ def execute_unit_deck_creation(
             concept_coverage=[],
             unit_error=unit_error,
             profile=profile,
+            search_id=search_id,
         )
         storage.save_run(record)
         return RunResult(
@@ -170,6 +174,8 @@ def execute_unit_deck_creation(
             already_active_cids=[],
             concept_coverage=[],
             unit_error=unit_error,
+            unit_title=unit.unit_title,
+            search_id=search_id,
         )
 
     if not matched_nids:
@@ -182,6 +188,8 @@ def execute_unit_deck_creation(
             newly_unsuspended_cids=[],
             concept_coverage=coverage_list,
             unit_error="",
+            unit_title=unit.unit_title,
+            search_id=search_id,
         )
 
     suspended_cids, active_cids = resolve_notes_to_cards(
@@ -215,6 +223,7 @@ def execute_unit_deck_creation(
                 already_active_cids=active_cids,
                 concept_coverage=coverage_list,
                 profile=profile,
+                search_id=search_id,
             )
             storage.save_run(record)
         return RunResult(
@@ -227,6 +236,8 @@ def execute_unit_deck_creation(
             already_active_count=len(active_cids),
             already_active_cids=active_cids,
             concept_coverage=coverage_list,
+            unit_title=unit.unit_title,
+            search_id=search_id,
         )
 
     # 1. Unsuspend only cards that were suspended prior to this run
@@ -307,6 +318,7 @@ def execute_unit_deck_creation(
         already_active_cids=active_cids,
         concept_coverage=coverage_list,
         profile=profile,
+        search_id=search_id,
     )
     storage.save_run(record)
 
@@ -320,6 +332,8 @@ def execute_unit_deck_creation(
         already_active_count=len(active_cids),
         already_active_cids=active_cids,
         concept_coverage=coverage_list,
+        unit_title=unit.unit_title,
+        search_id=search_id,
     )
 
 
@@ -547,6 +561,7 @@ def create_batch_filtered_decks_op(
     parent_deck_prefix: Optional[str] = None,
     allowed_cids: Optional[Set[int]] = None,
     profile: str = "",
+    search_id: str = "",
 ) -> Tuple[List[RunResult], Any]:
     """Applies deck creation and card unsuspension for multiple units in a single custom undo entry.
 
@@ -574,8 +589,48 @@ def create_batch_filtered_decks_op(
             allowed_cids=allowed_cids,
             unit_error=item.get("unit_error", ""),
             profile=item.get("profile", profile),
+            search_id=item.get("search_id", search_id),
         )
         results.append(run_res)
+
+    changes = None
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            changes = col.merge_undo_entries(undo_pos)
+        except Exception:
+            changes = None
+
+    return results, changes
+
+
+def rollback_search_batch_op(
+    col: Any,
+    storage: SearchDatabase,
+    run_ids: Sequence[str],
+    keep_reviewed: bool = True,
+    current_profile: str = "",
+) -> Tuple[List[RollbackResult], Any]:
+    """Rolls back multiple runs in a single custom undo entry.
+
+    Returns (results, op_changes).
+    """
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Smart Search Rollback")
+        except Exception:
+            undo_pos = None
+
+    results: List[RollbackResult] = []
+    for rid in run_ids:
+        res = rollback_run(
+            col=col,
+            storage=storage,
+            run_id=rid,
+            keep_reviewed=keep_reviewed,
+            current_profile=current_profile,
+        )
+        results.append(res)
 
     changes = None
     if undo_pos is not None and hasattr(col, "merge_undo_entries"):

@@ -20,6 +20,7 @@ from ankihub_searcher.deck_ops import (
     resolve_notes_to_cards,
     rollback_run,
     rollback_run_op,
+    rollback_search_batch_op,
 )
 from ankihub_searcher.ui.worker import RollbackWorker, SearchBatchWorker
 from ankihub_searcher.search_pipeline import (
@@ -2259,6 +2260,93 @@ I should decompose this into atomic concepts.
         )
         self.assertTrue(len(preview_res) >= 1)
         mock_ai.chat_completion_json.assert_not_called()
+
+    def test_batch_rollback_and_retry_tighter(self):
+        col = MockAnkiCol()
+        # Create 2 suspended cards across 2 notes
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, type, reps) VALUES (7001, 701, 100, 0, -1, 0, 0)")
+        col.conn.execute("INSERT INTO cards (id, nid, did, odid, queue, type, reps) VALUES (7002, 702, 100, 0, -1, 0, 0)")
+        col.conn.execute("INSERT INTO notes (id, mid, mod, flds, tags) VALUES (701, 1, 1000, 'Note 1', '')")
+        col.conn.execute("INSERT INTO notes (id, mid, mod, flds, tags) VALUES (702, 1, 1000, 'Note 2', '')")
+        col.conn.commit()
+
+        cfg = ConfigManager()
+        # Save two runs in a batch
+        u1 = LectureUnit("Unit 1", "U1", "Text 1")
+        u2 = LectureUnit("Unit 2", "U2", "Text 2")
+        units_data = [
+            {"unit": u1, "matched_nids": [701], "note_scores": {701: 0.90}, "concept_coverage": []},
+            {"unit": u2, "matched_nids": [702], "note_scores": {702: 0.85}, "concept_coverage": []},
+        ]
+        results, _ = create_batch_filtered_decks_op(
+            col=col,
+            units_data=units_data,
+            config=cfg,
+            storage=self.storage,
+            search_id="batch_retry_test",
+        )
+        self.assertEqual(len(results), 2)
+        r_ids = [r.run_id for r in results]
+        self.assertEqual(len(r_ids), 2)
+        # Verify unsuspend was called for both cards
+        unsuspended = set()
+        for call_arg in col.sched.unsuspend_cards.call_args_list:
+            unsuspended.update(call_arg[0][0])
+        self.assertEqual(unsuspended, {7001, 7002})
+
+        # 1. Rollback entire batch with rollback_search_batch_op
+        rb_results, changes = rollback_search_batch_op(
+            col=col,
+            storage=self.storage,
+            run_ids=r_ids,
+            keep_reviewed=True,
+        )
+        self.assertEqual(len(rb_results), 2)
+        suspended = set()
+        for call_arg in col.sched.suspend_cards.call_args_list:
+            suspended.update(call_arg[0][0])
+        self.assertEqual(suspended, {7001, 7002})
+
+        # 2. Test retry parameter calculation
+        curr_thresh = cfg.get_min_similarity_threshold()  # 0.60
+        new_thresh = min(0.95, round(curr_thresh + 0.03, 4))
+        self.assertEqual(new_thresh, 0.63)
+
+        curr_max = cfg.max_notes_per_concept  # 10
+        new_max = max(3, int(round(curr_max * 2.0 / 3.0)))  # 7
+        self.assertEqual(new_max, 7)
+
+        # 3. Test worker execution with precomputed_concepts
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.return_value = [[1.0, 0.0]]
+        concept_u1 = ExtractedConcept("U1", "Claim U1", ["u1"], ["u1"], "quote 1")
+        precomputed = {"Unit 1": [concept_u1]}
+
+        worker = SearchBatchWorker(
+            col=col,
+            config=cfg,
+            storage=self.storage,
+            ai_client=mock_ai,
+            raw_text="# Unit 1\nText 1",
+            base_deck_name="Retry Deck",
+            main_thread_runner=lambda task: task(),
+        )
+        worker.precomputed_concepts = precomputed
+        worker.override_min_threshold = new_thresh
+        worker.override_max_notes_per_concept = new_max
+
+        finished_box = []
+        worker.finished_sig.connect(lambda r: finished_box.append(r))
+        worker.start()
+        worker.wait(timeout=5.0)
+
+        self.assertEqual(len(finished_box), 1)
+        # Stage 1 chat LLM should NOT have been called!
+        mock_ai.chat_completion_json.assert_not_called()
+        # Default config should NOT have been modified!
+        self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
+        self.assertEqual(cfg.max_notes_per_concept, 10)
+
 
 
 
