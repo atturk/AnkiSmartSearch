@@ -209,8 +209,6 @@ class ConfigManager:
     @classmethod
     def load(cls, addon_name: str = "ankihub_searcher", config_path: Optional[str] = None) -> ConfigManager:
         """Loads configuration from Anki addonManager or fallback JSON file."""
-        merged: Dict[str, Any] = dict(DEFAULT_CONFIG)
-
         # 1. Try reading from Anki mw if available
         try:
             from aqt import mw  # type: ignore
@@ -223,10 +221,12 @@ class ConfigManager:
                         resolved_name = mod_addon
                 except Exception:
                     pass
-                anki_cfg = mw.addonManager.getConfig(resolved_name)
-                if isinstance(anki_cfg, dict):
-                    migrated, was_migrated = cls.migrate_dict(dict(anki_cfg))
-                    merged.update(migrated)
+                raw_cfg = mw.addonManager.getConfig(resolved_name)
+                if isinstance(raw_cfg, dict):
+                    # Migrate raw config BEFORE merging with DEFAULT_CONFIG
+                    migrated_raw, was_migrated = cls.migrate_dict(dict(raw_cfg))
+                    merged = dict(DEFAULT_CONFIG)
+                    merged.update(migrated_raw)
                     instance = cls()
                     instance.update(merged)
                     if was_migrated:
@@ -244,14 +244,16 @@ class ConfigManager:
 
         was_file_migrated = False
         target_migrated_path = None
+        migrated_file_cfg: Optional[Dict[str, Any]] = None
+
         for path in search_paths:
             if os.path.exists(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         file_cfg = json.load(f)
                     if isinstance(file_cfg, dict):
-                        migrated, was_migrated = cls.migrate_dict(dict(file_cfg))
-                        merged.update(migrated)
+                        migrated_raw, was_migrated = cls.migrate_dict(dict(file_cfg))
+                        migrated_file_cfg = migrated_raw
                         if was_migrated:
                             was_file_migrated = True
                             target_migrated_path = path
@@ -259,9 +261,13 @@ class ConfigManager:
                 except Exception:
                     pass
 
+        merged = dict(DEFAULT_CONFIG)
+        if migrated_file_cfg is not None:
+            merged.update(migrated_file_cfg)
+
         instance = cls()
         instance.update(merged)
-        if was_file_migrated and target_migrated_path:
+        if was_file_migrated and target_migrated_path and config_path and target_migrated_path == config_path:
             instance.save(config_path=target_migrated_path)
         return instance
 

@@ -5,7 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
@@ -2046,6 +2046,63 @@ I should decompose this into atomic concepts.
             "Allopurinol inhibits xanthine oxidase, decreasing uric acid | allopurinol, xanthine oxidase, gout",
             qwen3_sent_queries[0],
         )
+
+    def test_config_v4_migration_with_real_030_user_config(self):
+        # Dict identical to real 0.3.0 user config in meta.json (without config_version)
+        user_030_config = {
+            "selected_decks": ["AnKing Step Deck"],
+            "search_query": '"deck:AnKing Step Deck" OR "deck:Custom"',
+            "chat_provider": "lm_studio",
+            "chat_base_url": "http://127.0.0.1:1234/v1",
+            "chat_model": "mistral-nemo-it",
+            "sensitivity": 0.55,
+            "top_k_per_concept": 8,
+            "max_cards_per_unit": 80,
+            "embed_model": "text-embedding-3-small",
+        }
+        stored_in_anki = dict(user_030_config)
+
+        mock_mw = MagicMock()
+        mock_addon_mgr = MagicMock()
+        mock_mw.addonManager = mock_addon_mgr
+        mock_addon_mgr.addonFromModule.return_value = "ankihub_searcher"
+        mock_addon_mgr.getConfig.side_effect = lambda addon: dict(stored_in_anki)
+
+        def fake_write_config(addon, data):
+            stored_in_anki.clear()
+            stored_in_anki.update(data)
+
+        mock_addon_mgr.writeConfig.side_effect = fake_write_config
+
+        with patch.dict("sys.modules", {"aqt": MagicMock(mw=mock_mw)}):
+            # First load: migration should trigger
+            cfg = ConfigManager.load()
+            self.assertEqual(cfg.sensitivity, 0.5)
+            self.assertEqual(cfg.get_min_similarity_threshold(), 0.60)
+            self.assertEqual(cfg.max_notes_per_concept, 10)
+            self.assertEqual(cfg.max_cards_per_unit, 150)
+            self.assertEqual(cfg.config_version, 4)
+            self.assertIsNone(cfg.top_k_per_concept)
+
+            # Check that user custom settings remain preserved
+            self.assertEqual(cfg.chat_model, "mistral-nemo-it")
+            self.assertEqual(cfg.search_query, '"deck:AnKing Step Deck" OR "deck:Custom"')
+            self.assertEqual(cfg.embed_model, "text-embedding-3-small")
+
+            # Check that writeConfig was called and stored_in_anki was updated with config_version 4
+            mock_addon_mgr.writeConfig.assert_called_once()
+            self.assertEqual(stored_in_anki.get("config_version"), 4)
+            self.assertEqual(stored_in_anki.get("sensitivity"), 0.5)
+            self.assertNotIn("top_k_per_concept", stored_in_anki)
+
+            # Second load: no migration should trigger, writeConfig must NOT be called again
+            mock_addon_mgr.writeConfig.reset_mock()
+            cfg2 = ConfigManager.load()
+            self.assertEqual(cfg2.sensitivity, 0.5)
+            self.assertEqual(cfg2.config_version, 4)
+            self.assertEqual(cfg2.chat_model, "mistral-nemo-it")
+            mock_addon_mgr.writeConfig.assert_not_called()
+
 
 
 if __name__ == "__main__":
