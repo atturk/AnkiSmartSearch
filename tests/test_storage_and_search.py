@@ -3367,6 +3367,66 @@ print("__JSON_RESULT__" + json.dumps(output))
 
         col.conn.close()
 
+    def test_search_batch_worker_search_only_mode(self):
+        """v0.5.2: create_deck=False returns relevance-ordered matches and writes nothing."""
+        from ankihub_searcher.ui.worker import SearchBatchWorker
+
+        col = MockAnkiCol()
+        cfg = ConfigManager.load()
+        cfg.embed_model = "model_browse_test"
+        mid = cfg.get_active_model_id()
+        self.storage.save_embeddings_batch([
+            (8101, mid, "h8101", 2, [1.0, 0.0]),
+            (8102, mid, "h8102", 2, [0.97, 0.2431]),
+        ])
+        cfg.keyword_translate = False
+        cfg.keyword_min_similarity = 0.5
+
+        mock_ai = MagicMock(spec=OpenAICompatibleClient)
+        mock_ai.get_embeddings.side_effect = lambda texts, **kwargs: [[1.0, 0.0] for _ in texts]
+
+        precomputed_data = {
+            "candidate_nids": {8101, 8102},
+            "suspended_nids": {8101, 8102},
+            "allowed_cids": {8101, 8102},
+            "parent_deck_prefix": None,
+            "precomputed_notes_data": None,
+        }
+        finished = []
+        with patch("ankihub_searcher.ui.worker.create_batch_filtered_decks_op") as deck_op:
+            worker = SearchBatchWorker(
+                col=col, config=cfg, storage=self.storage, ai_client=mock_ai,
+                raw_text="# A\nApoB48\n# B\nVLDL\n", base_deck_name="X",
+                precomputed_data=precomputed_data,
+                main_thread_runner=lambda task: task(),
+                input_mode="keyword", create_deck=False,
+            )
+            worker.finished_sig.connect(lambda res: finished.append(res))
+            worker.run()
+            deck_op.assert_not_called()
+
+        self.assertEqual(len(finished), 1)
+        res = finished[0]
+        self.assertTrue(res["browse_only"])
+        self.assertEqual([nid for nid, _ in res["matched"]], [8101, 8102])
+        self.assertEqual(res["results"], [])
+        mock_ai.chat_completion_json.assert_not_called()
+        col.conn.close()
+
+    def test_build_browse_result_keeps_best_score(self):
+        from ankihub_searcher.ui.worker import build_browse_result
+        from ankihub_searcher.text_utils import LectureUnit
+
+        u1 = LectureUnit(unit_title="U1", deck_name="U1", body_text="")
+        u2 = LectureUnit(unit_title="U2", deck_name="U2", body_text="")
+        res = build_browse_result([
+            {"unit": u1, "matched_nids": [1, 2], "note_scores": {1: 0.6, 2: 0.7}, "unit_error": ""},
+            {"unit": u2, "matched_nids": [1], "note_scores": {1: 0.9}, "unit_error": "boom"},
+        ], warning="w")
+        self.assertEqual(res["matched"], [(1, 0.9), (2, 0.7)])
+        self.assertEqual(res["unit_errors"], [{"unit_title": "U2", "error": "boom"}])
+        self.assertEqual(res["warning"], "w")
+
     def test_config_version_5_migration_and_settings_dialog(self):
         """Item 29: config v5 migration, keyword threshold in settings dialog and preview."""
         from ankihub_searcher.config_manager import ConfigManager, DEFAULT_CONFIG

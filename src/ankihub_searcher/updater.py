@@ -35,7 +35,7 @@ GITHUB_REPO = "atturk/AnkiSmartSearch"
 try:
     from . import __version__ as CURRENT_VERSION
 except Exception:
-    CURRENT_VERSION = "0.5.1"
+    CURRENT_VERSION = "0.5.2"
 
 
 def parse_version(v: str) -> Tuple[int, ...]:
