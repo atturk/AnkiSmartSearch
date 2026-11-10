@@ -103,7 +103,11 @@ def init_addon() -> None:
         if not mw or not hasattr(mw, "form") or not mw.form:
             return
 
-        from .browser_menu import populate_smart_search_menu, setup_browser_menu
+        from .browser_menu import (
+            populate_smart_search_menu,
+            run_find_similar,
+            setup_browser_menu,
+        )
 
         config = ConfigManager.load()
         menu_loc = getattr(config, "menu_location", "tools")

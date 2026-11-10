@@ -3764,3 +3764,229 @@ class TestIndexDialogQueryField(unittest.TestCase):
         finally:
             if orig_cfg_text is not None and os.path.exists(cfg_path):
                 Path(cfg_path).write_text(orig_cfg_text, encoding="utf-8")
+
+
+class TestFindSimilarReviewMode(unittest.TestCase):
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.storage = SearchDatabase(db_path=self.temp_db.name)
+
+    def tearDown(self):
+        try:
+            os.remove(self.temp_db.name)
+        except OSError:
+            pass
+
+    def test_find_similar_review_mode_and_enabling(self):
+        """Item 37: 'Trova carte simili' during review (enabling, review path with browser opening, hooks)."""
+        from ankihub_searcher.browser_menu import (
+            populate_smart_search_menu,
+            on_find_similar_cards_clicked,
+            on_find_similar_cards_review_clicked,
+            _update_mw_similar_action_state,
+            _on_state_did_change,
+            _on_reviewer_did_show_question,
+            setup_main_window_hooks,
+        )
+        from ankihub_searcher.config_manager import ConfigManager
+
+        mid = "test-review-mid"
+        self.storage.save_embeddings_batch(
+            [
+                (701, mid, "h701", 2, [1.0, 0.0]),
+                (702, mid, "h702", 2, [0.95, 0.05]),
+                (703, mid, "h703", 2, [0.92, 0.08]),
+            ]
+        )
+
+        class MockAction:
+            def __init__(self, text=""):
+                self.text = text
+                self.enabled = True
+                self.shortcut = ""
+                self.callbacks = []
+
+            def setEnabled(self, val):
+                self.enabled = bool(val)
+
+            def setShortcut(self, sc):
+                self.shortcut = sc
+
+            @property
+            def triggered(self):
+                act_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        act_self.callbacks.append(fn)
+                return _Sig()
+
+            def trigger(self):
+                for cb in self.callbacks:
+                    cb()
+
+        class MockMenu:
+            def __init__(self, title="", parent=None):
+                self.title = title
+                self.parent = parent
+                self.actions = []
+                self._about_to_show_cbs = []
+
+            def addAction(self, text):
+                act = MockAction(text)
+                self.actions.append(act)
+                return act
+
+            def addSeparator(self):
+                pass
+
+            def setDefaultAction(self, act):
+                pass
+
+            @property
+            def aboutToShow(self):
+                menu_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        menu_self._about_to_show_cbs.append(fn)
+                return _Sig()
+
+            def emit_about_to_show(self):
+                for cb in self._about_to_show_cbs:
+                    cb()
+
+        class MockCard:
+            def __init__(self, nid):
+                self.nid = nid
+
+        class MockReviewer:
+            def __init__(self, card=None):
+                self.card = card
+
+        class MockMW:
+            def __init__(self, col=None):
+                self.state = "deckBrowser"
+                self.reviewer = MockReviewer(card=None)
+                self.col = col
+
+        col = MockAnkiCol()
+        fake_mw = MockMW(col=col)
+        mw_menu = MockMenu("Smart Search", parent=fake_mw)
+
+        # 1. Populate main window menu (browser=None)
+        acts = populate_smart_search_menu(mw_menu, parent_window=fake_mw, browser=None)
+        act_similar = acts["find_similar"]
+
+        # Initial state: deckBrowser -> disabled
+        self.assertFalse(act_similar.enabled)
+
+        # 2. State change to review, but card is None -> still disabled
+        fake_mw.state = "review"
+        fake_mw.reviewer.card = None
+        _update_mw_similar_action_state(fake_mw)
+        self.assertFalse(act_similar.enabled)
+
+        # 3. Card becomes active in review -> enabled
+        fake_mw.reviewer.card = MockCard(nid=701)
+        _update_mw_similar_action_state(fake_mw)
+        self.assertTrue(act_similar.enabled)
+
+        # 4. aboutToShow updates state
+        fake_mw.state = "overview"
+        mw_menu.emit_about_to_show()
+        self.assertFalse(act_similar.enabled)
+
+        fake_mw.state = "review"
+        mw_menu.emit_about_to_show()
+        self.assertTrue(act_similar.enabled)
+
+        # 5. Hook callbacks update state via mw reference
+        with patch("ankihub_searcher.browser_menu.mw", fake_mw):
+            fake_mw.state = "deckBrowser"
+            _on_state_did_change()
+            self.assertFalse(act_similar.enabled)
+
+            fake_mw.state = "review"
+            _on_reviewer_did_show_question()
+            self.assertTrue(act_similar.enabled)
+
+        # 6. Execute review path when similar cards are found:
+        # Should open browser via aqt.dialogs.open and set query
+        fake_browser = MagicMock()
+        fake_browser.executed_searches = []
+        fake_browser.search_for = lambda q: fake_browser.executed_searches.append(q)
+        fake_browser.col = col
+
+        mock_dialogs = MagicMock()
+        mock_dialogs.open.return_value = fake_browser
+
+        tooltips = []
+        infos = []
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.70,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: mid
+
+        fake_aqt = MagicMock()
+        fake_aqt.dialogs = mock_dialogs
+        fake_aqt.mw = fake_mw
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))), \
+             patch.dict(sys.modules, {"aqt": fake_aqt}), \
+             patch("ankihub_searcher.browser_menu.mw", fake_mw):
+
+            act_similar.trigger()
+
+            # Browser was opened
+            mock_dialogs.open.assert_called_once_with("Browser", fake_mw)
+            # Search query was applied to browser
+            self.assertIn("nid:702,703", fake_browser.executed_searches)
+            # Tooltip shown on browser
+            self.assertTrue(any("Trovate 2 note simili" in t[1] for t in tooltips))
+
+        # 7. Execute review path when NO similar cards found:
+        # Browser must NOT open; tooltip shown on mw
+        mock_dialogs.open.reset_mock()
+        tooltips.clear()
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))), \
+             patch.dict(sys.modules, {"aqt": fake_aqt}), \
+             patch("ankihub_searcher.browser_menu.mw", fake_mw):
+
+            act_similar.trigger()
+
+            mock_dialogs.open.assert_not_called()
+            self.assertTrue(any("Nessuna carta simile trovata" in t[1] for t in tooltips))
+            # Tooltip target is fake_mw, not browser
+            self.assertEqual(tooltips[0][0], fake_mw)
+
+        # 8. Execute review path when note is not indexed:
+        # Browser must NOT open; info modal shown on mw
+        mock_dialogs.open.reset_mock()
+        infos.clear()
+        fake_mw.reviewer.card = MockCard(nid=99999)  # Not in storage
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))), \
+             patch.dict(sys.modules, {"aqt": fake_aqt}), \
+             patch("ankihub_searcher.browser_menu.mw", fake_mw):
+
+            act_similar.trigger()
+
+            mock_dialogs.open.assert_not_called()
+            self.assertTrue(any("Nota non indicizzata" in m[1] for m in infos))
+            self.assertEqual(infos[0][0], fake_mw)
+
+        col.conn.close()
