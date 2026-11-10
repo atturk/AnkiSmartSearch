@@ -2567,8 +2567,8 @@ I should decompose this into atomic concepts.
 
         self.assertEqual(act_similar.text, "Trova carte simili")
         self.assertEqual(act_similar.shortcut, "Ctrl+Alt+M")
-        self.assertEqual(act_history.text, "Cronologia & rollback")
-        self.assertEqual(act_index.text, "Indice")
+        self.assertEqual(act_history.text, "Cronologia")
+        self.assertEqual(act_index.text, "Indicizzazione")
         self.assertEqual(act_settings.text, "Impostazioni")
         self.assertEqual(act_updates.text, "Verifica aggiornamenti")
 
@@ -3044,8 +3044,8 @@ print("__JSON_RESULT__" + json.dumps(output))
             "Nuova ricerca…",
             "Cerca con la query corrente…",
             "Trova carte simili",
-            "Cronologia & rollback",
-            "Indice",
+            "Cronologia",
+            "Indicizzazione",
             "Impostazioni",
             "Verifica aggiornamenti",
         ]

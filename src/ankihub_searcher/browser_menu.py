@@ -497,8 +497,8 @@ def populate_smart_search_menu(
     2. Cerca con la query corrente… (disabled outside browser)
     3. Trova carte simili (Ctrl+Alt+M, disabled outside browser or without selection)
     -- Separator --
-    4. Cronologia & rollback
-    5. Indice
+    4. Cronologia
+    5. Indicizzazione
     6. Impostazioni
     -- Separator --
     7. Verifica aggiornamenti
@@ -555,15 +555,15 @@ def populate_smart_search_menu(
 
     menu.addSeparator()
 
-    # 4. Cronologia & rollback
-    act_history = menu.addAction("Cronologia & rollback")
+    # 4. Cronologia
+    act_history = menu.addAction("Cronologia")
     act_history.triggered.connect(
         lambda _checked=False: _open_history_dialog(browser or parent_window)
     )
     actions["history"] = act_history
 
-    # 5. Indice
-    act_index = menu.addAction("Indice")
+    # 5. Indicizzazione
+    act_index = menu.addAction("Indicizzazione")
     act_index.triggered.connect(
         lambda _checked=False: _open_index_dialog(browser or parent_window)
     )
