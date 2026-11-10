@@ -225,7 +225,7 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.5.0"
+CURRENT_VERSION = "0.5.1"
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:

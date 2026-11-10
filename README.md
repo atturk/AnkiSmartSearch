@@ -23,18 +23,21 @@ Paste your Italian lecture unit (or an entire Markdown document with multiple un
 - **🛡️ 100% Safe for Your Collection & AnkiHub:**
   - **Zero Note Tag Pollution:** Builds Filtered Decks using native `cid:` queries (`resched = True`), never touching Note tags or triggering unnecessary AnkiHub syncs.
   - **Active Card Protection:** Only unsuspends cards that were suspended prior to the run; cards you are already studying are never accidentally suspended.
-  - **1-Click Safe Rollback:** Undo any run from the *Cronologia & Rollback* tab (with an option to keep cards active if you already reviewed them), or delete just the Filtered Deck once you finish reviewing so kept cards return to their main deck.
+  - **1-Click Safe Rollback:** Undo any run from the *Cronologia* tab (with an option to keep cards active if you already reviewed them), or delete just the Filtered Deck once you finish reviewing so kept cards return to their main deck.
 - **⚡ Incremental Model-Scoped Indexer:**
+  - Supporto per query di ricerca Browser personalizzate con cronologia e calcolo live della copertura.
   - Caches embeddings in a local WAL SQLite database scoped by `provider::model`.
   - Instant commit after every 32-note batch — pause and resume anytime with 0% progress lost.
   - Includes a **Smart Tag Cleaner** (strips `#AK_Step1_v12`, `AnKing_Image`, `AMBOSS` hashes, etc.) and per-Note-Type field selection.
+- **🔍 Trova carte simili ovunque (`Ctrl+Alt+M`):**
+  - Nel Browser e durante la revisione delle carte (`review`), trova istantaneamente le carte simili alla nota corrente aprendo il Browser con ordinamento per similarità decrescente.
 
 ---
 
 ## 📦 Installation
 
 ### Option A: Install from Release `.ankiaddon`
-1. Download the latest **`AnkiHubSearcher.ankiaddon`** (or `dist/AnkiHubSearcher-v0.1.0.ankiaddon`) from the [Releases page](https://github.com/atturk/AnkiSmartSearch/releases).
+1. Download the latest **`AnkiHubSearcher.ankiaddon`** (or `dist/AnkiHubSearcher-v0.5.1.ankiaddon`) from the [Releases page](https://github.com/atturk/AnkiSmartSearch/releases).
 2. In Anki, go to **Tools → Add-ons → Install from file...** and select the `.ankiaddon` file.
 3. Restart Anki and open **Tools → AnkiHub Smart Searcher...** (`Ctrl+Shift+F` / `Cmd+Shift+F`).
 

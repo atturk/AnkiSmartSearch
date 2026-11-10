@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .ai_client import OpenAICompatibleClient
 from .config_manager import ConfigManager
