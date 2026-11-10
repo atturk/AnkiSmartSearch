@@ -8,6 +8,7 @@ Paste your Italian lecture unit (or an entire Markdown document with multiple un
 
 ## ✨ Key Features
 
+- **🔎 Solo ricerca o mazzo filtrato:** di default la ricerca apre il Browser con le carte trovate ordinate per pertinenza, senza modificare nulla. Spunta "Rimuovi la sospensione e crea il mazzo filtrato" per riattivare le carte e creare il mazzo filtrato.
 - **⚡ Modalità "Keyword" (Lite / Veloce):**
   - Cerca rapidamente inserendo una lista di keyword mediche, **una per riga**. Il popup di ricerca si apre **sempre sulla scheda "Keyword"** come predefinita.
   - **Traduzione automatica con LLM (opzionale, attiva di default):** Se hai configurato un modello chat, le keyword (anche in italiano) vengono tradotte nei termini medici standard in inglese USMLE / AnKing con una sola chiamata chat iniziale (`keyword_translate: true`). Le keyword vengono raggruppate per titolo di unità per disambiguare le sigle dal contesto (es. "PCR" = *C-reactive protein*). Se il modello chat non è configurato o la chiamata fallisce, il sistema usa in automatico le keyword originali con avviso nel riepilogo.

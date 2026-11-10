@@ -77,6 +77,36 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units, parse_keyword_units
 
 
+def build_browse_result(units_search_data: List[Dict[str, Any]], warning: str = "") -> Dict[str, Any]:
+    """Merges per-unit matches into one relevance-ordered list for a search-only run.
+
+    Each note keeps its best score across units. Nothing is written to the collection.
+    """
+    best: Dict[int, float] = {}
+    unit_errors: List[Dict[str, str]] = []
+    for data in units_search_data:
+        scores = data.get("note_scores", {}) or {}
+        for nid in data.get("matched_nids", []) or []:
+            sc = float(scores.get(nid, 0.0))
+            if nid not in best or sc > best[nid]:
+                best[nid] = sc
+        if data.get("unit_error"):
+            unit = data.get("unit")
+            unit_errors.append(
+                {"unit_title": getattr(unit, "unit_title", ""), "error": str(data["unit_error"])}
+            )
+    matched = sorted(best.items(), key=lambda x: x[1], reverse=True)
+    return {
+        "status": "done",
+        "browse_only": True,
+        "matched": matched,
+        "unit_errors": unit_errors,
+        "warning": warning,
+        "units_processed": len(units_search_data),
+        "results": [],
+    }
+
+
 class IndexWorker(QThread):
     """Background worker for incremental note and embedding indexing."""
 
@@ -181,6 +211,7 @@ class SearchBatchWorker(QThread):
         main_thread_runner: Optional[Callable[[Callable[[], Any]], Any]] = None,
         profile: str = "",
         input_mode: str = "text",
+        create_deck: bool = True,
     ):
         super().__init__(parent)
         self.col = col
@@ -192,6 +223,9 @@ class SearchBatchWorker(QThread):
         self.precomputed_data = precomputed_data
         self.main_thread_runner = main_thread_runner
         self.input_mode = input_mode
+        # False = search only: no unsuspension, no filtered deck, no history entry;
+        # the dialog shows the matches in the Browser ordered by relevance.
+        self.create_deck = create_deck
         self.last_warning: str = ""
         if not profile:
             try:
@@ -459,6 +493,10 @@ class SearchBatchWorker(QThread):
 
             if self._is_cancelled:
                 self.finished_sig.emit({"status": "cancelled", "units_processed": 0, "results": []})
+                return
+
+            if not self.create_deck:
+                self.finished_sig.emit(build_browse_result(units_search_data, self.last_warning))
                 return
 
             # Disambiguate notes across units: assign each note exclusively to the unit where it scored highest

@@ -286,6 +286,56 @@ def on_browser_did_search(context: Any) -> None:
         context.ids = [cid for _, cid in indexed]
 
 
+def show_scored_notes_in_browser(
+    browser: Any,
+    matched: Sequence[Tuple[int, float]],
+    message: str = "",
+    parent: Any = None,
+) -> None:
+    """Shows the given notes in the Browser, ordered by descending score.
+
+    The scores feed the similarity column and the one-shot custom ordering applied
+    by on_browser_did_search.
+    """
+    global _last_similar_query, _similar_custom_order_active
+    if not browser or not matched:
+        return
+
+    _last_similar_scores.clear()
+    _last_similar_scores.update({nid: score for nid, score in matched})
+
+    col = getattr(browser, "col", None) or getattr(parent, "col", None) or (mw.col if mw else None)
+    if col:
+        try:
+            nids_tuple = tuple(int(nid) for nid, _ in matched)
+            if len(nids_tuple) == 1:
+                q = f"SELECT id, nid FROM cards WHERE nid = {nids_tuple[0]}"
+            else:
+                q = f"SELECT id, nid FROM cards WHERE nid IN {nids_tuple}"
+            if hasattr(col.db, "all"):
+                rows = col.db.all(q)
+            else:
+                rows = col.db.execute(q).fetchall()
+            for row in rows:
+                _cid_to_nid_cache[row[0]] = row[1]
+        except Exception:
+            pass
+
+    nids_csv = ",".join(str(nid) for nid, _ in matched)
+    _last_similar_query = f"nid:{nids_csv}"
+    _similar_custom_order_active = True
+
+    set_browser_search(browser, _last_similar_query)
+    if message:
+        show_browser_tooltip(browser, message)
+
+    if hasattr(browser, "table") and hasattr(browser.table, "redraw_cells"):
+        try:
+            browser.table.redraw_cells()
+        except Exception:
+            pass
+
+
 def run_find_similar(
     selected_nids: Sequence[int],
     parent: Any,
@@ -368,42 +418,9 @@ def run_find_similar(
         if not browser:
             return
 
-        global _last_similar_query, _similar_custom_order_active
-
-        # Update similarity column caches
-        _last_similar_scores.clear()
-        _last_similar_scores.update({nid: score for nid, score in matched})
-
-        col = getattr(browser, "col", None) or getattr(parent, "col", None) or (mw.col if mw else None)
-        if col and matched:
-            try:
-                nids_tuple = tuple(nid for nid, _ in matched)
-                if len(nids_tuple) == 1:
-                    q = f"SELECT id, nid FROM cards WHERE nid = {nids_tuple[0]}"
-                else:
-                    q = f"SELECT id, nid FROM cards WHERE nid IN {nids_tuple}"
-                if hasattr(col.db, "all"):
-                    rows = col.db.all(q)
-                else:
-                    rows = col.db.execute(q).fetchall()
-                for row in rows:
-                    _cid_to_nid_cache[row[0]] = row[1]
-            except Exception:
-                pass
-
-        nids_csv = ",".join(str(nid) for nid, _ in matched)
-        _last_similar_query = f"nid:{nids_csv}"
-        _similar_custom_order_active = True
-
-        set_browser_search(browser, _last_similar_query)
-        show_browser_tooltip(browser, f"Trovate {len(matched)} note simili")
-
-        # Redraw browser table cells to refresh similarity column
-        if hasattr(browser, "table") and hasattr(browser.table, "redraw_cells"):
-            try:
-                browser.table.redraw_cells()
-            except Exception:
-                pass
+        show_scored_notes_in_browser(
+            browser, matched, f"Trovate {len(matched)} note simili", parent=parent
+        )
 
     # In Anki: use QueryOp with background thread and progress spinner
     if QueryOp is not None:

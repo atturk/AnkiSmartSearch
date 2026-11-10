@@ -225,7 +225,7 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.5.1"
+CURRENT_VERSION = "0.5.2"
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -532,6 +532,11 @@ class SearchDialog(QDialog):
 
         layout.addWidget(self.input_tabs)
 
+        # Off by default: search only, results shown in the Browser by relevance
+        self.chk_create_deck = QCheckBox("Rimuovi la sospensione e crea il mazzo filtrato")
+        self.chk_create_deck.setChecked(False)
+        layout.addWidget(self.chk_create_deck)
+
         # 4. Minimal Progress Bar & Status (Hidden unless running)
         self.lbl_status = QLabel("")
         self.lbl_status.setVisible(False)
@@ -666,6 +671,7 @@ class SearchDialog(QDialog):
             precomputed_data=presearch_data,
             profile=self.profile,
             input_mode=active_mode,
+            create_deck=self.chk_create_deck.isChecked(),
         )
         self.search_worker.progress_sig.connect(self._on_search_progress)
         self.search_worker.finished_sig.connect(self._on_search_finished)
@@ -677,6 +683,30 @@ class SearchDialog(QDialog):
             self.progress_bar.setMaximum(total)
             self.progress_bar.setValue(current)
         self.lbl_status.setText(msg)
+
+    def _on_browse_results(self, res: Dict[str, Any]) -> None:
+        """Search-only run: close the panel and show matches in the Browser by relevance."""
+        matched = res.get("matched", []) or []
+        unit_errors = res.get("unit_errors", []) or []
+        warning = res.get("warning", "")
+
+        if not matched:
+            if unit_errors:
+                lines = "\n".join(f"• {e['unit_title']}: {e['error']}" for e in unit_errors)
+                QMessageBox.warning(self, "Ricerca non riuscita", lines)
+            else:
+                QMessageBox.information(self, "Nessuna carta trovata", "Nessuna carta trovata.")
+            return
+
+        accepted_code = getattr(getattr(QDialog, "DialogCode", None), "Accepted", getattr(QDialog, "Accepted", 1))
+        self.done(accepted_code)
+
+        msg = f"Trovate {len(matched)} note"
+        if unit_errors:
+            msg += f" — {len(unit_errors)} unità con errori"
+        if warning:
+            msg += f" — {warning}"
+        QTimer.singleShot(0, lambda: open_browser_with_results(matched, msg))
 
     def _get_search_context(self) -> Dict[str, Any]:
         mode = self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
@@ -711,6 +741,10 @@ class SearchDialog(QDialog):
         status = res.get("status", "done")
         if status == "cancelled":
             QMessageBox.information(self, "Annullato", "Ricerca interrotta dall'utente.")
+            return
+
+        if res.get("browse_only"):
+            self._on_browse_results(res)
             return
 
         context = self._get_search_context()
@@ -809,6 +843,19 @@ class SearchDialog(QDialog):
         self.progress_bar.setVisible(False)
         self.lbl_status.setVisible(False)
         QMessageBox.critical(self, "Errore Ricerca", f"Si è verificato un errore:\n\n{err_msg}")
+
+
+def open_browser_with_results(matched: List[Any], message: str = "") -> None:
+    """Opens the Anki Browser showing the given (nid, score) pairs ordered by score."""
+    try:
+        import aqt
+        from ..browser_menu import show_scored_notes_in_browser
+
+        if aqt.mw:
+            browser = aqt.dialogs.open("Browser", aqt.mw)
+            show_scored_notes_in_browser(browser, matched, message, parent=aqt.mw)
+    except Exception as e:
+        print(f"[SmartSearch] Error opening browser with results: {e}")
 
 
 def _do_batch_rollback_standalone(

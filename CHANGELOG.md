@@ -2,6 +2,13 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.5.2] - 2026-11-10
+
+### Novità
+- **Ricerca senza mazzo filtrato (predefinita):** nel pannello di ricerca la spunta "Rimuovi la sospensione e crea il mazzo filtrato" è disattivata di default. Senza spunta la ricerca (Keyword o Testo) non tocca la collezione: il pannello si chiude e si apre il Browser con le carte trovate, nel loro stato originale, ordinate per pertinenza. Con la spunta attiva il flusso è quello di prima (riattivazione, mazzo filtrato, riepilogo, cronologia e annullamento).
+
+---
+
 ## [0.5.1] - 2026-11-10
 
 ### Novità
