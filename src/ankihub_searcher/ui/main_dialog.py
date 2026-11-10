@@ -94,7 +94,10 @@ except ImportError:
                 self._val = 0.0
                 self._idx = 0
                 self._text = ""
+                self._placeholder = ""
                 self._checked = False
+                self._enabled = True
+                self._line_edit = None
 
             def setValue(self, val):
                 self._val = val
@@ -120,6 +123,12 @@ except ImportError:
             def setChecked(self, val):
                 self._checked = bool(val)
 
+            def setEnabled(self, val):
+                self._enabled = bool(val)
+
+            def isEnabled(self):
+                return self._enabled
+
             def text(self):
                 return self._text
 
@@ -134,6 +143,17 @@ except ImportError:
 
             def currentData(self):
                 return ""
+
+            def lineEdit(self):
+                if self._line_edit is None:
+                    self._line_edit = _HeadlessWidget()
+                return self._line_edit
+
+            def setPlaceholderText(self, text):
+                self._placeholder = text
+
+            def placeholderText(self):
+                return self._placeholder
 
             def __getattr__(self, name):
                 return _HeadlessWidget()
@@ -1204,11 +1224,17 @@ class IndexDialog(QDialog):
         self.config = ConfigManager.load()
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
+        self.indexer = DeckIndexer(self.config, self.storage, self.ai_client)
 
         self.setWindowTitle("Smart Search — Indicizzazione")
         self.resize(620, 420)
 
         self.index_worker: Optional[IndexWorker] = None
+        self._query_timer = QTimer(self)
+        self._query_timer.setSingleShot(True)
+        self._query_timer.setInterval(250)
+        self._query_timer.timeout.connect(self._update_query_stats)
+
         self._init_ui()
         self._refresh_status()
 
@@ -1219,10 +1245,29 @@ class IndexDialog(QDialog):
         status_group = QGroupBox("Stato Modello Attivo")
         status_layout = QVBoxLayout(status_group)
 
+        lbl_query = QLabel("Mazzi / Query da indicizzare (sintassi Browser Anki):")
+        status_layout.addWidget(lbl_query)
+
+        self.combo_query = QComboBox()
+        self.combo_query.setEditable(True)
+        self.combo_query.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if self.config.search_query_history:
+            self.combo_query.addItems(self.config.search_query_history)
+        eff_init = self.config.get_effective_search_query()
+        if eff_init and self.combo_query.findText(eff_init) == -1:
+            self.combo_query.insertItem(0, eff_init)
+        self.combo_query.setCurrentText(eff_init)
+        if self.combo_query.lineEdit():
+            self.combo_query.lineEdit().setPlaceholderText(
+                'Es. "deck:AnKing Step Deck" oppure "deck:AnKing Step Deck" OR "deck:Mastering Radiology"'
+            )
+        self.combo_query.currentTextChanged.connect(self._on_query_text_changed)
+        status_layout.addWidget(self.combo_query)
+
         self.lbl_active_model = QLabel("Modello Attivo: -")
         status_layout.addWidget(self.lbl_active_model)
 
-        self.lbl_coverage = QLabel("Copertura mazzi selezionati: -")
+        self.lbl_coverage = QLabel("Indicizzate: -")
         status_layout.addWidget(self.lbl_coverage)
 
         self.progress_bar = QProgressBar()
@@ -1281,6 +1326,35 @@ class IndexDialog(QDialog):
 
         layout.addLayout(bottom_layout)
 
+    def _on_query_text_changed(self, _text: str) -> None:
+        self._query_timer.start()
+
+    def _update_query_stats(self) -> None:
+        if not self.col:
+            self.lbl_coverage.setText("0 note")
+            return
+
+        query = self.combo_query.currentText().strip()
+        if not query:
+            self.lbl_coverage.setText("0 note")
+            return
+
+        try:
+            target_nids = self.indexer.get_notes_for_query(self.col, query)
+        except Exception:
+            self.lbl_coverage.setText("Query incompleta o sintassi non valida.")
+            return
+
+        total_notes = len(target_nids)
+        if total_notes == 0:
+            self.lbl_coverage.setText("0 note")
+            return
+
+        active_id = self.config.get_active_model_id()
+        indexed_count = self.storage.count_embeddings_for_notes(target_nids, active_id)
+        pct = int(round((indexed_count / total_notes) * 100)) if total_notes > 0 else 0
+        self.lbl_coverage.setText(f"Indicizzate: {indexed_count} / {total_notes} note ({pct}%)")
+
     def _refresh_status(self) -> None:
         active_id = self.config.get_active_model_id()
         self.lbl_active_model.setText(f"Modello Attivo: {active_id}")
@@ -1295,24 +1369,38 @@ class IndexDialog(QDialog):
             if s["model_id"] == active_id:
                 active_count = s["note_count"]
 
-        if self.col:
-            indexer = DeckIndexer(self.config, self.storage, self.ai_client)
-            active_query = self.config.get_effective_search_query()
-            try:
-                target_nids = indexer.get_notes_for_query(self.col, active_query)
-            except Exception:
-                target_nids = []
-            total_notes = len(target_nids)
-            deck_active_count = self.storage.count_embeddings_for_notes(target_nids, active_id) if target_nids else 0
-            pct = int(deck_active_count / total_notes * 100) if total_notes > 0 else 0
-            self.lbl_coverage.setText(
-                f"Copertura query attiva ({active_query}): {deck_active_count} / {total_notes} note ({pct}%)"
-            )
+        self._update_query_stats()
 
     def _start_indexing(self) -> None:
         if not self.col:
             return
 
+        query = self.combo_query.currentText().strip()
+        if not query:
+            QMessageBox.warning(self, "Attenzione", "Inserisci una query valida.")
+            return
+
+        try:
+            target_nids = self.indexer.get_notes_for_query(self.col, query)
+            if not target_nids:
+                QMessageBox.warning(
+                    self,
+                    "Nessuna nota trovata",
+                    f"La query '{query}' non restituisce alcuna nota nella tua collezione.",
+                )
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "Query non valida", f"Errore nella query:\n{e}")
+            return
+
+        self.config.search_query = query
+        self.config.add_query_to_history(query)
+        extracted_decks = self.indexer.extract_deck_names_from_query(query)
+        if extracted_decks:
+            self.config.selected_decks = extracted_decks
+        self.config.save()
+
+        self.combo_query.setEnabled(False)
         self.btn_run.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress_bar.setVisible(True)
@@ -1321,14 +1409,7 @@ class IndexDialog(QDialog):
         self.lbl_progress_msg.setText("Avvio indicizzazione...")
 
         # Scan note metadata on the main thread before launching background embedding worker
-        indexer = DeckIndexer(self.config, self.storage, self.ai_client)
-        active_query = self.config.get_effective_search_query()
-        if active_query:
-            nids = indexer.get_notes_for_query(self.col, active_query)
-        else:
-            dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
-            nids = indexer.get_notes_in_decks(self.col, dids)
-        precomputed_notes = indexer.scan_notes_metadata(self.col, nids)
+        precomputed_notes = self.indexer.scan_notes_metadata(self.col, target_nids)
 
         self.index_worker = IndexWorker(
             col=self.col,
@@ -1337,6 +1418,7 @@ class IndexDialog(QDialog):
             ai_client=self.ai_client,
             selected_decks=None,
             precomputed_notes_data=precomputed_notes,
+            search_query=query,
         )
         self.index_worker.progress_sig.connect(self._on_progress)
         self.index_worker.finished_sig.connect(self._on_finished)
@@ -1355,6 +1437,7 @@ class IndexDialog(QDialog):
         self.lbl_progress_msg.setText(msg)
 
     def _on_finished(self, res: Dict[str, Any]) -> None:
+        self.combo_query.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.progress_bar.setVisible(False)
@@ -1371,8 +1454,12 @@ class IndexDialog(QDialog):
         )
 
     def _on_error(self, err: str) -> None:
+        self.combo_query.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.lbl_progress_msg.setVisible(False)
+        self._refresh_status()
         self.progress_bar.setVisible(False)
         self.lbl_progress_msg.setVisible(False)
         QMessageBox.critical(self, "Errore Indicizzazione", f"Errore:\n{err}")

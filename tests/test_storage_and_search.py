@@ -3662,3 +3662,105 @@ class TestKeywordTranslationAlignment(unittest.TestCase):
         unit = LectureUnit(unit_title="U", deck_name="U", body_text="", keywords=["Chilomicroni", "PCR"])
         out = pipe.translate_keywords([unit])
         self.assertEqual(out, {"Chilomicroni": "Chylomicrons", "PCR": "C-reactive protein"})
+
+
+class TestIndexDialogQueryField(unittest.TestCase):
+    def test_index_dialog_query_field_and_coverage(self):
+        """Item 35: Query field in IndexDialog, live coverage updates, validation, and history."""
+        from ankihub_searcher.ui.main_dialog import IndexDialog, QMessageBox
+        from ankihub_searcher.config_manager import ConfigManager
+
+        col = MockAnkiCol()
+        col.find_notes = MagicMock(return_value=[101, 102])
+
+        import ankihub_searcher.config_manager as cm_mod
+        from pathlib import Path
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(cm_mod.__file__)), "config.json")
+        orig_cfg_text = Path(cfg_path).read_text(encoding="utf-8") if os.path.exists(cfg_path) else None
+        try:
+            cfg = ConfigManager.load()
+            cfg.search_query = 'deck:"AnKing Step Deck"'
+            cfg.search_query_history = ['deck:"AnKing Step Deck"', "deck:Other"]
+            cfg.save()
+
+            dlg = IndexDialog(col=col)
+
+            # 1. Combo query is editable, has history, effective initial query, and placeholder
+            self.assertIsNotNone(dlg.combo_query)
+            self.assertEqual(dlg.combo_query.currentText(), 'deck:"AnKing Step Deck"')
+            self.assertEqual(
+                dlg.combo_query.lineEdit().placeholderText(),
+                'Es. "deck:AnKing Step Deck" oppure "deck:AnKing Step Deck" OR "deck:Mastering Radiology"',
+            )
+
+            # 2. Coverage calculation on valid query
+            with patch.object(dlg.storage, "count_embeddings_for_notes", return_value=1):
+                dlg._update_query_stats()
+                self.assertEqual(dlg.lbl_coverage.text(), "Indicizzate: 1 / 2 note (50%)")
+
+            # 3. Invalid query syntax
+            col.find_notes.side_effect = Exception("Syntax error")
+            dlg.combo_query.setCurrentText("deck:invalid(")
+            dlg._update_query_stats()
+            self.assertEqual(dlg.lbl_coverage.text(), "Query incompleta o sintassi non valida.")
+
+            # 4. Empty query or 0 notes
+            col.find_notes.side_effect = None
+            col.find_notes.return_value = []
+            dlg.combo_query.setCurrentText("")
+            dlg._update_query_stats()
+            self.assertEqual(dlg.lbl_coverage.text(), "0 note")
+
+            dlg.combo_query.setCurrentText("deck:EmptyDeck")
+            dlg._update_query_stats()
+            self.assertEqual(dlg.lbl_coverage.text(), "0 note")
+
+            # 5. _start_indexing validation: empty query
+            dlg.combo_query.setCurrentText("")
+            warns = []
+            with patch.object(QMessageBox, "warning", side_effect=lambda p, t, m: warns.append(m)):
+                dlg._start_indexing()
+            self.assertTrue(any("query valida" in m for m in warns))
+            self.assertIsNone(dlg.index_worker)
+
+            # 6. _start_indexing validation: 0 notes
+            dlg.combo_query.setCurrentText("deck:EmptyDeck")
+            warns.clear()
+            with patch.object(QMessageBox, "warning", side_effect=lambda p, t, m: warns.append(m)):
+                dlg._start_indexing()
+            self.assertTrue(any("non restituisce alcuna nota" in m for m in warns))
+            self.assertIsNone(dlg.index_worker)
+
+            # 7. _start_indexing success: updates history, selected_decks, disables field, launches worker
+            col.find_notes.return_value = [101, 102]
+            dlg.combo_query.setCurrentText('deck:"Mastering Radiology"')
+            with patch("ankihub_searcher.ui.main_dialog.IndexWorker") as MockWorkerClass:
+                mock_inst = MagicMock()
+                MockWorkerClass.return_value = mock_inst
+                dlg._start_indexing()
+
+                self.assertFalse(dlg.combo_query.isEnabled())
+                loaded_cfg = ConfigManager.load()
+                self.assertEqual(loaded_cfg.search_query, 'deck:"Mastering Radiology"')
+                self.assertIn('deck:"Mastering Radiology"', loaded_cfg.search_query_history)
+                self.assertIn("Mastering Radiology", loaded_cfg.selected_decks)
+                mock_inst.start.assert_called_once()
+                # IndexWorker received search_query
+                call_kwargs = MockWorkerClass.call_args[1]
+                self.assertEqual(call_kwargs.get("search_query"), 'deck:"Mastering Radiology"')
+
+            # 8. Finished re-enables combo_query
+            with patch.object(QMessageBox, "information"):
+                dlg._on_finished({"text_indexed": 2, "embeddings_indexed": 2, "cancelled": False})
+            self.assertTrue(dlg.combo_query.isEnabled())
+
+            # 9. Error re-enables combo_query
+            dlg.combo_query.setEnabled(False)
+            with patch.object(QMessageBox, "critical"):
+                dlg._on_error("Test error")
+            self.assertTrue(dlg.combo_query.isEnabled())
+
+            col.conn.close()
+        finally:
+            if orig_cfg_text is not None and os.path.exists(cfg_path):
+                Path(cfg_path).write_text(orig_cfg_text, encoding="utf-8")
