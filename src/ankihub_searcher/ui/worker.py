@@ -94,6 +94,7 @@ class IndexWorker(QThread):
         parent: Optional[Any] = None,
         precomputed_notes_data: Optional[Any] = None,
         main_thread_runner: Optional[Callable[[Callable[[], Any]], Any]] = None,
+        search_query: Optional[str] = None,
     ):
         super().__init__(parent)
         self.col = col
@@ -103,6 +104,7 @@ class IndexWorker(QThread):
         self.selected_decks = selected_decks
         self.precomputed_notes_data = precomputed_notes_data
         self.main_thread_runner = main_thread_runner
+        self.search_query = search_query
         self._is_cancelled = False
         self.indexer = DeckIndexer(self.config, self.storage, self.ai_client)
 
@@ -119,13 +121,17 @@ class IndexWorker(QThread):
                 return self._is_cancelled
 
             notes_data = self.precomputed_notes_data
+            effective_q = (
+                self.search_query
+                if self.search_query is not None
+                else (self.config.get_effective_search_query() if self.selected_decks is None else None)
+            )
             if notes_data is None and self.main_thread_runner is not None:
                 box: Dict[str, Any] = {}
 
                 def _do_scan():
-                    q = self.config.get_effective_search_query() if self.selected_decks is None else None
-                    if q:
-                        nids = self.indexer.get_notes_for_query(self.col, q)
+                    if effective_q:
+                        nids = self.indexer.get_notes_for_query(self.col, effective_q)
                     else:
                         dids = self.indexer.find_target_deck_ids(
                             self.col, self.selected_decks or self.config.selected_decks
@@ -141,7 +147,7 @@ class IndexWorker(QThread):
                 selected_deck_names=self.selected_decks,
                 progress_callback=_on_progress,
                 cancel_check=_check_cancel,
-                search_query=self.config.get_effective_search_query() if self.selected_decks is None else None,
+                search_query=effective_q,
                 precomputed_notes_data=notes_data,
             )
             self.finished_sig.emit(res)

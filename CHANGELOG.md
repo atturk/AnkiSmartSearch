@@ -2,6 +2,16 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.5.1] - 2026-11-10
+
+### Novità
+- **Campo query nella finestra Indicizzazione:** Possibilità di specificare direttamente la query del Browser Anki da indicizzare con cronologia delle query precedenti, aggiornamento in tempo reale della copertura delle note mentre si digita (timer 250 ms) e validazione automatica della sintassi.
+- **"Trova carte simili" durante la revisione:** L'azione "Trova carte simili" (`Ctrl+Alt+M`) è ora attiva e utilizzabile anche dalla finestra principale di Anki durante lo studio delle carte (`review`), aprendo direttamente il Browser ordinato per similarità decrescente rispetto alla nota della carta corrente.
+- **Chiusura del pannello di ricerca prima del riepilogo:** La finestra di ricerca si chiude automaticamente prima di mostrare il riepilogo finale, garantendo fluidità e stabilità nell'apertura del Browser e permettendo a "Riprova più stretto" di riaprire una sessione pulita.
+- **Uniformazione nomi di menu:** Aggiornate le voci del menu "Smart Search" in "Cronologia" e "Indicizzazione".
+
+---
+
 ## [0.5.0] - 2026-11-09
 
 ### Novità

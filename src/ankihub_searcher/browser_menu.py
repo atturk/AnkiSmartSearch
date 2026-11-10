@@ -13,7 +13,7 @@ Registers the "Smart Search" menu inside Anki's Browser window:
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     from aqt import gui_hooks, mw  # type: ignore
@@ -286,15 +286,12 @@ def on_browser_did_search(context: Any) -> None:
         context.ids = [cid for _, cid in indexed]
 
 
-def on_find_similar_cards_clicked(browser: Any) -> None:
-    """Executes similarity retrieval for the selected cards in background via QueryOp."""
-    selected_nids: List[int] = []
-    if hasattr(browser, "selected_notes"):
-        try:
-            selected_nids = list(browser.selected_notes() or [])
-        except Exception:
-            selected_nids = []
-
+def run_find_similar(
+    selected_nids: Sequence[int],
+    parent: Any,
+    get_browser: Callable[[], Any],
+) -> None:
+    """Executes similarity retrieval for selected notes and applies results to a browser window."""
     if not selected_nids:
         return
 
@@ -302,29 +299,30 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
     active_mid = config.get_active_model_id()
     if not active_mid:
         show_browser_info(
-            browser,
+            parent,
             "Nessun modello di embedding configurato nelle Impostazioni di Smart Search.",
         )
         return
 
     def _background_op(col: Any) -> Dict[str, Any]:
+        c = col or getattr(parent, "col", None) or (mw.col if mw else None)
         storage = SearchDatabase()
         scope = getattr(config, "similar_scope", "all")
         candidate_nids: Optional[Set[int]] = None
 
         if scope == "query":
             q = config.get_effective_search_query()
-            if q and col and hasattr(col, "find_notes"):
-                candidate_nids = set(col.find_notes(q))
+            if q and c and hasattr(c, "find_notes"):
+                candidate_nids = set(c.find_notes(q))
         elif scope == "custom":
             q = getattr(config, "similar_custom_query", "").strip()
-            if q and col and hasattr(col, "find_notes"):
-                candidate_nids = set(col.find_notes(q))
+            if q and c and hasattr(c, "find_notes"):
+                candidate_nids = set(c.find_notes(q))
         # if scope == "all": candidate_nids remains None (all indexed notes for active model)
 
         matched, missing = find_similar_notes(
             storage=storage,
-            selected_nids=selected_nids,
+            selected_nids=list(selected_nids),
             active_model_id=active_mid,
             candidate_nids=candidate_nids,
             min_score=getattr(config, "similar_min_score", 0.65),
@@ -332,7 +330,7 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
         )
 
         if missing:
-            deck_name = get_deck_name_for_note(col, missing[0]) if col else ""
+            deck_name = get_deck_name_for_note(c, missing[0]) if c else ""
             if deck_name:
                 msg = f"Nota non indicizzata: indicizza il mazzo '{deck_name}'."
             else:
@@ -354,17 +352,20 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
 
     def _on_success(res: Dict[str, Any]) -> None:
         if "error" in res:
-            show_browser_info(browser, res["error"])
+            show_browser_info(parent, res["error"])
             return
 
         matched = res.get("matched", [])
         min_score = res.get("min_score", 0.65)
-        note_previews = res.get("note_previews", {})
 
         if not matched:
             show_browser_tooltip(
-                browser, f"Nessuna carta simile trovata con similarità ≥ {min_score:.2f}"
+                parent, f"Nessuna carta simile trovata con similarità ≥ {min_score:.2f}"
             )
+            return
+
+        browser = get_browser()
+        if not browser:
             return
 
         global _last_similar_query, _similar_custom_order_active
@@ -373,7 +374,7 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
         _last_similar_scores.clear()
         _last_similar_scores.update({nid: score for nid, score in matched})
 
-        col = getattr(browser, "col", None) or (mw.col if mw else None)
+        col = getattr(browser, "col", None) or getattr(parent, "col", None) or (mw.col if mw else None)
         if col and matched:
             try:
                 nids_tuple = tuple(nid for nid, _ in matched)
@@ -407,15 +408,61 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
     # In Anki: use QueryOp with background thread and progress spinner
     if QueryOp is not None:
         QueryOp(
-            parent=browser,
+            parent=parent,
             op=_background_op,
             success=_on_success,
         ).with_progress(label="Ricerca carte simili...").run_in_background()
     else:
         # Standalone / test fallback
-        col = getattr(browser, "col", None) or (mw.col if mw else None)
+        col = getattr(parent, "col", None) or (mw.col if mw else None)
         res = _background_op(col)
         _on_success(res)
+
+
+def on_find_similar_cards_clicked(browser: Any) -> None:
+    """Executes similarity retrieval for the selected cards in background via QueryOp."""
+    selected_nids: List[int] = []
+    if hasattr(browser, "selected_notes"):
+        try:
+            selected_nids = list(browser.selected_notes() or [])
+        except Exception:
+            selected_nids = []
+
+    if not selected_nids:
+        return
+
+    run_find_similar(
+        selected_nids=selected_nids,
+        parent=browser,
+        get_browser=lambda: browser,
+    )
+
+
+def on_find_similar_cards_review_clicked(parent_window: Any = None) -> None:
+    """Executes similarity retrieval for the currently reviewed card in Anki reviewer."""
+    target_mw = parent_window or mw
+    if not target_mw:
+        return
+    reviewer = getattr(target_mw, "reviewer", None)
+    card = getattr(reviewer, "card", None)
+    nid = getattr(card, "nid", None)
+    if not nid:
+        return
+
+    def _open_or_get_browser() -> Any:
+        try:
+            import aqt
+            if hasattr(aqt, "dialogs") and hasattr(aqt.dialogs, "open"):
+                return aqt.dialogs.open("Browser", target_mw)
+        except Exception as e:
+            print(f"[SmartSearch] Error opening browser dialog: {e}")
+        return None
+
+    run_find_similar(
+        selected_nids=[nid],
+        parent=target_mw,
+        get_browser=_open_or_get_browser,
+    )
 
 
 def _open_search_dialog(parent: Any, initial_query: Optional[str] = None) -> None:
@@ -487,6 +534,43 @@ def _update_similar_action_state(browser: Any) -> None:
             pass
 
 
+def _update_mw_similar_action_state(
+    target_mw: Any = None, action: Optional[Any] = None
+) -> None:
+    """Enables 'Trova carte simili' on the main window only when reviewing a card."""
+    m = target_mw or mw
+    act = action or (getattr(m, "_smart_search_similar_action_mw", None) if m else None)
+    if act is None:
+        return
+    try:
+        is_review = getattr(m, "state", None) == "review"
+        has_card = bool(getattr(getattr(m, "reviewer", None), "card", None))
+        act.setEnabled(is_review and has_card)
+    except Exception:
+        act.setEnabled(False)
+
+
+def _on_state_did_change(*args: Any, **kwargs: Any) -> None:
+    _update_mw_similar_action_state()
+
+
+def _on_reviewer_did_show_question(*args: Any, **kwargs: Any) -> None:
+    _update_mw_similar_action_state()
+
+
+def setup_main_window_hooks() -> None:
+    """Registers hooks to keep the main window 'Trova carte simili' action updated."""
+    if gui_hooks is None:
+        return
+    try:
+        if hasattr(gui_hooks, "state_did_change"):
+            gui_hooks.state_did_change.append(_on_state_did_change)
+        if hasattr(gui_hooks, "reviewer_did_show_question"):
+            gui_hooks.reviewer_did_show_question.append(_on_reviewer_did_show_question)
+    except Exception as e:
+        print(f"[SmartSearch] Error registering main window hooks: {e}")
+
+
 def populate_smart_search_menu(
     menu: Any, parent_window: Any, browser: Optional[Any] = None
 ) -> Dict[str, Any]:
@@ -497,8 +581,8 @@ def populate_smart_search_menu(
     2. Cerca con la query corrente… (disabled outside browser)
     3. Trova carte simili (Ctrl+Alt+M, disabled outside browser or without selection)
     -- Separator --
-    4. Cronologia & rollback
-    5. Indice
+    4. Cronologia
+    5. Indicizzazione
     6. Impostazioni
     -- Separator --
     7. Verifica aggiornamenti
@@ -550,20 +634,28 @@ def populate_smart_search_menu(
         if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):
             menu.aboutToShow.connect(lambda: _update_similar_action_state(browser))
     else:
-        act_similar.setEnabled(False)
+        target_mw = parent_window or mw
+        act_similar.triggered.connect(
+            lambda _checked=False: on_find_similar_cards_review_clicked(target_mw)
+        )
+        if target_mw:
+            setattr(target_mw, "_smart_search_similar_action_mw", act_similar)
+        _update_mw_similar_action_state(target_mw, act_similar)
+        if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):
+            menu.aboutToShow.connect(lambda: _update_mw_similar_action_state(target_mw, act_similar))
     actions["find_similar"] = act_similar
 
     menu.addSeparator()
 
-    # 4. Cronologia & rollback
-    act_history = menu.addAction("Cronologia & rollback")
+    # 4. Cronologia
+    act_history = menu.addAction("Cronologia")
     act_history.triggered.connect(
         lambda _checked=False: _open_history_dialog(browser or parent_window)
     )
     actions["history"] = act_history
 
-    # 5. Indice
-    act_index = menu.addAction("Indice")
+    # 5. Indicizzazione
+    act_index = menu.addAction("Indicizzazione")
     act_index.triggered.connect(
         lambda _checked=False: _open_index_dialog(browser or parent_window)
     )
@@ -677,6 +769,7 @@ def on_browser_did_fetch_row(
 
 def setup_browser_menu() -> None:
     """Hooks the Smart Search menu, context menu, and similarity column into Anki's browser window."""
+    setup_main_window_hooks()
     if gui_hooks is None:
         return
     try:

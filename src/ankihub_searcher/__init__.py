@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .ai_client import OpenAICompatibleClient
 from .config_manager import ConfigManager
@@ -30,6 +30,7 @@ from .ui.main_dialog import (
     IndexDialog,
     SearchDialog,
     SettingsDialog,
+    show_search_summary,
 )
 from .updater import run_update_check_ui
 
@@ -103,7 +104,11 @@ def init_addon() -> None:
         if not mw or not hasattr(mw, "form") or not mw.form:
             return
 
-        from .browser_menu import populate_smart_search_menu, setup_browser_menu
+        from .browser_menu import (
+            populate_smart_search_menu,
+            run_find_similar,
+            setup_browser_menu,
+        )
 
         config = ConfigManager.load()
         menu_loc = getattr(config, "menu_location", "tools")

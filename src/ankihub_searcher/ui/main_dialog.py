@@ -90,11 +90,31 @@ except ImportError:
                 return _HeadlessWidget()
 
         class _HeadlessWidget(metaclass=_HeadlessMeta):
+            Accepted = 1
+            Rejected = 0
+
             def __init__(self, *args, **kwargs):
                 self._val = 0.0
                 self._idx = 0
                 self._text = ""
+                self._placeholder = ""
                 self._checked = False
+                self._enabled = True
+                self._line_edit = None
+                self._done_code = None
+
+            def done(self, code):
+                self._done_code = code
+
+            def accept(self):
+                self.done(1)
+
+            def reject(self):
+                self.done(0)
+
+            @classmethod
+            def singleShot(cls, msec, fn):
+                fn()
 
             def setValue(self, val):
                 self._val = val
@@ -120,6 +140,12 @@ except ImportError:
             def setChecked(self, val):
                 self._checked = bool(val)
 
+            def setEnabled(self, val):
+                self._enabled = bool(val)
+
+            def isEnabled(self):
+                return self._enabled
+
             def text(self):
                 return self._text
 
@@ -134,6 +160,17 @@ except ImportError:
 
             def currentData(self):
                 return ""
+
+            def lineEdit(self):
+                if self._line_edit is None:
+                    self._line_edit = _HeadlessWidget()
+                return self._line_edit
+
+            def setPlaceholderText(self, text):
+                self._placeholder = text
+
+            def placeholderText(self):
+                return self._placeholder
 
             def __getattr__(self, name):
                 return _HeadlessWidget()
@@ -188,7 +225,7 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.5.0"
+CURRENT_VERSION = "0.5.1"
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -641,6 +678,30 @@ class SearchDialog(QDialog):
             self.progress_bar.setValue(current)
         self.lbl_status.setText(msg)
 
+    def _get_search_context(self) -> Dict[str, Any]:
+        mode = self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
+        raw_text = self.last_search_text
+        if not raw_text:
+            if mode == "keyword":
+                raw_text = self.txt_keywords.toPlainText().strip()
+            else:
+                raw_text = self.txt_lecture.toPlainText().strip()
+        query = self.combo_query.currentText().strip()
+        base_deck_name = self.txt_base_deck.text().strip()
+
+        return {
+            "mode": mode,
+            "text": raw_text,
+            "raw_text": raw_text,
+            "query": query,
+            "base_deck_name": base_deck_name,
+            "col": self.col,
+            "profile": self.profile,
+            "config": self.config,
+            "storage": self.storage,
+            "ai_client": self.ai_client,
+        }
+
     def _on_search_finished(self, res: Dict[str, Any]) -> None:
         self.btn_search.setEnabled(True)
         self.btn_cancel.setText("Annulla")
@@ -648,192 +709,30 @@ class SearchDialog(QDialog):
         self.lbl_status.setVisible(False)
 
         status = res.get("status", "done")
-        results = res.get("results", [])
-
         if status == "cancelled":
             QMessageBox.information(self, "Annullato", "Ricerca interrotta dall'utente.")
             return
 
-        total_added = sum(r.total_cards_count for r in results)
-        total_unsuspended = sum(r.newly_unsuspended_count for r in results)
-        total_already_active = sum(len(r.already_active_cids) for r in results)
-        decks_created = len([r for r in results if r.total_cards_count > 0])
+        context = self._get_search_context()
+        self.last_search_result = res
+        self.search_summary_context = context
 
-        all_coverage: List[Dict[str, Any]] = []
-        for r in results:
-            if getattr(r, "concept_coverage", None):
-                all_coverage.extend(r.concept_coverage)
+        accepted_code = getattr(getattr(QDialog, "DialogCode", None), "Accepted", getattr(QDialog, "Accepted", 1))
+        self.done(accepted_code)
 
-        cov_stats = compute_coverage_stats(all_coverage)
-        cov_line = ""
-        if cov_stats["total"] > 0:
-            is_kw = self.last_search_mode == "keyword" or any(c.get("source") == "keyword" for c in all_coverage)
-            label = "Copertura keyword" if is_kw else "Copertura concetti"
-            cov_line = (
-                f"\n\n{label}: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
-                f"• Coperti: {cov_stats['covered']}\n"
-                f"• Parziali: {cov_stats['partial']}\n"
-                f"• Scoperti: {cov_stats['uncovered']}"
-            )
-
-        err_units = [r for r in results if getattr(r, "unit_error", "")]
-        err_section = ""
-        if err_units:
-            err_lines = [f"• {r.unit_title}: {r.unit_error}" for r in err_units]
-            err_section = (
-                "⚠️ ATTENZIONE — Errori Stage 1:\n"
-                "Nessuna carta riattivata per le seguenti unità a causa di errori nel testo/parsing:\n"
-                + "\n".join(err_lines)
-                + "\n\n"
-            )
-
-        warning_msg = res.get("warning", "")
-        warn_section = f"⚠️ {warning_msg}\n\n" if warning_msg else ""
-
-        # 2. Present clean post-search summary popup with Browser, Coverage Details, Undo & Retry buttons
-        parent_widget = mw if mw else None
-        msg_box = QMessageBox(parent_widget)
-        if err_units:
-            msg_box.setWindowTitle("Ricerca completata con errori")
-            try:
-                msg_box.setIcon(QMessageBox.Icon.Warning)
-            except Exception:
-                pass
-        elif warning_msg:
-            msg_box.setWindowTitle("Ricerca completata con avvisi")
-            try:
-                msg_box.setIcon(QMessageBox.Icon.Warning)
-            except Exception:
-                pass
-        else:
-            msg_box.setWindowTitle("Ricerca completata")
-
-        if total_added == 0 and total_already_active > 0:
-            msg_box.setText(
-                f"{warn_section}"
-                f"{err_section}"
-                f"Nessuna nuova carta da riattivare.\n\n"
-                f"Carte correlate già attive in studio: {total_already_active}"
-                f"{cov_line}"
-            )
-        elif total_added == 0 and not total_already_active and err_units:
-            msg_box.setText(
-                f"{warn_section}"
-                f"{err_section}"
-                f"Nessun mazzo filtrato creato a causa degli errori sopra indicati."
-                f"{cov_line}"
-            )
-        else:
-            msg_box.setText(
-                f"{warn_section}"
-                f"{err_section}"
-                f"Mazzi filtrati creati: {decks_created}\n"
-                f"Nuove carte riattivate: {total_unsuspended}\n"
-                f"Carte correlate già attive: {total_already_active}\n"
-                f"Carte totali nel mazzo filtrato: {total_added}"
-                f"{cov_line}"
-            )
-
-        msg_box.addButton(QMessageBox.StandardButton.Ok)
-        btn_browser = None
-        btn_coverage = None
-        btn_undo = None
-        btn_retry = None
-
-        created_names = [r.deck_name for r in results if r.filtered_did and r.total_cards_count > 0]
-        created_run_ids = [r.run_id for r in results if getattr(r, "run_id", "")]
-        has_concepts = any(getattr(r, "concept_coverage", None) for r in results)
-
-        if created_names:
-            btn_browser = msg_box.addButton("Browser", QMessageBox.ButtonRole.ActionRole)
-        if all_coverage:
-            btn_coverage = msg_box.addButton("Dettagli copertura", QMessageBox.ButtonRole.ActionRole)
-        if created_run_ids:
-            btn_undo = msg_box.addButton("Annulla creazione", QMessageBox.ButtonRole.DestructiveRole)
-        if created_run_ids and has_concepts:
-            btn_retry = msg_box.addButton("Riprova più stretto", QMessageBox.ButtonRole.ActionRole)
-
-        msg_box.exec()
-        clicked = msg_box.clickedButton()
-
-        if btn_undo and clicked == btn_undo:
-            self._do_batch_rollback(created_run_ids)
-            self.accept()
-        elif btn_retry and clicked == btn_retry:
-            self._do_retry_tighter(created_run_ids, results)
-        elif btn_browser and clicked == btn_browser:
-            try:
-                import aqt
-                if aqt.mw:
-                    query = " OR ".join(f'"deck:{name}"' for name in created_names)
-                    browser = aqt.dialogs.open("Browser", aqt.mw)
-                    if browser and hasattr(browser, "search_for"):
-                        browser.search_for(query)
-            except Exception as e:
-                print(f"[SmartSearch] Error opening browser: {e}")
-            self.accept()
-        elif btn_coverage and clicked == btn_coverage:
-            cov_dlg = CoverageDetailDialog(
-                coverage_items=all_coverage,
-                created_deck_names=created_names,
-                parent=parent_widget,
-            )
-            cov_dlg.exec()
-            self.accept()
-        else:
-            self.accept()
+        QTimer.singleShot(0, lambda: show_search_summary(res, context))
 
     def _do_batch_rollback(self, run_ids: List[str], on_done=None) -> None:
-        parent_widget = mw if mw else None
+        _do_batch_rollback_standalone(run_ids, self._get_search_context(), on_done=on_done)
 
-        def _batch_op(col: Any):
-            res, changes = rollback_search_batch_op(
-                col=col,
-                storage=self.storage,
-                run_ids=run_ids,
-                keep_reviewed=True,
-                current_profile=self.profile,
-            )
-            return _get_op_changes(changes)
-
-        try:
-            import aqt
-            from aqt.operations import CollectionOp  # type: ignore
-        except ImportError:
-            CollectionOp = None
-
-        if mw and CollectionOp is not None:
-            op = CollectionOp(parent=mw, op=_batch_op)
-            if on_done:
-                op.success(lambda _: on_done())
-            else:
-                op.success(
-                    lambda _: QMessageBox.information(
-                        parent_widget,
-                        "Creazione Annullata",
-                        "Tutti i mazzi creati sono stati rimossi e le carte ripristinate (keep_reviewed=True).",
-                    )
-                )
-            op.run_in_background()
-        else:
-            rollback_search_batch_op(
-                col=self.col,
-                storage=self.storage,
-                run_ids=run_ids,
-                keep_reviewed=True,
-                current_profile=self.profile,
-            )
-            if on_done:
-                on_done()
-            else:
-                QMessageBox.information(
-                    parent_widget,
-                    "Creazione Annullata",
-                    "Tutti i mazzi creati sono stati rimossi e le carte ripristinate.",
-                )
-
-    def _do_retry_tighter(self, run_ids: List[str], results: List[Any]) -> None:
-        mode = self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
+    def _do_retry_tighter(
+        self,
+        run_ids: List[str],
+        results: List[Any],
+        retry_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ctx = retry_context or self._get_search_context()
+        mode = ctx.get("mode") or self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
         if mode == "keyword":
             curr_thresh = self.config.get_keyword_min_similarity_threshold()
         else:
@@ -863,14 +762,14 @@ class SearchDialog(QDialog):
                 if c_list:
                     precomputed_concepts[u_title] = c_list
 
-        raw_text = self.last_search_text
+        raw_text = ctx.get("raw_text") or ctx.get("text") or self.last_search_text
         if not raw_text:
             if mode == "keyword":
                 raw_text = self.txt_keywords.toPlainText().strip()
             else:
                 raw_text = self.txt_lecture.toPlainText().strip()
 
-        base_deck = self.txt_base_deck.text().strip()
+        base_deck = ctx.get("base_deck_name") if "base_deck_name" in ctx else self.txt_base_deck.text().strip()
 
         def _on_rollback_finished():
             self.btn_search.setEnabled(False)
@@ -910,6 +809,224 @@ class SearchDialog(QDialog):
         self.progress_bar.setVisible(False)
         self.lbl_status.setVisible(False)
         QMessageBox.critical(self, "Errore Ricerca", f"Si è verificato un errore:\n\n{err_msg}")
+
+
+def _do_batch_rollback_standalone(
+    run_ids: List[str], context: Dict[str, Any], on_done=None
+) -> None:
+    """Executes batch rollback outside SearchDialog, safe to run with mw as parent."""
+    parent_widget = mw if mw else None
+    col = context.get("col") or (mw.col if mw else None)
+    storage = context.get("storage") or SearchDatabase()
+    profile = context.get("profile", "")
+
+    def _batch_op(col_op: Any):
+        c = col_op or col
+        res, changes = rollback_search_batch_op(
+            col=c,
+            storage=storage,
+            run_ids=run_ids,
+            keep_reviewed=True,
+            current_profile=profile,
+        )
+        return _get_op_changes(changes)
+
+    try:
+        import aqt
+        from aqt.operations import CollectionOp  # type: ignore
+    except ImportError:
+        CollectionOp = None
+
+    if mw and CollectionOp is not None:
+        op = CollectionOp(parent=mw, op=_batch_op)
+        if on_done:
+            op.success(lambda _: on_done())
+        else:
+            op.success(
+                lambda _: QMessageBox.information(
+                    parent_widget,
+                    "Creazione Annullata",
+                    "Tutti i mazzi creati sono stati rimossi e le carte ripristinate (keep_reviewed=True).",
+                )
+            )
+        op.run_in_background()
+    else:
+        rollback_search_batch_op(
+            col=col,
+            storage=storage,
+            run_ids=run_ids,
+            keep_reviewed=True,
+            current_profile=profile,
+        )
+        if on_done:
+            on_done()
+        else:
+            QMessageBox.information(
+                parent_widget,
+                "Creazione Annullata",
+                "Tutti i mazzi creati sono stati rimossi e le carte ripristinate.",
+            )
+
+
+def _launch_retry_tighter(
+    run_ids: List[str], results: List[Any], context: Dict[str, Any]
+) -> None:
+    """Reopens a new SearchDialog with identical query, deck name, tab, and text, then runs tighter retry."""
+    parent_widget = mw if mw else None
+    col = context.get("col") or (mw.col if mw else None)
+    query = context.get("query", "")
+    mode = context.get("mode", "keyword")
+    raw_text = context.get("raw_text") or context.get("text", "")
+    base_deck = context.get("base_deck_name", "")
+
+    new_dlg = SearchDialog(
+        col=col,
+        parent=parent_widget,
+        initial_query=query,
+    )
+    new_dlg.txt_base_deck.setText(base_deck)
+    new_dlg.combo_query.setCurrentText(query)
+    if mode == "text":
+        new_dlg.input_tabs.setCurrentIndex(1)
+        new_dlg.txt_lecture.setPlainText(raw_text)
+    else:
+        new_dlg.input_tabs.setCurrentIndex(0)
+        new_dlg.txt_keywords.setPlainText(raw_text)
+
+    new_dlg.last_search_mode = mode
+    new_dlg.last_search_text = raw_text
+
+    new_dlg._do_retry_tighter(run_ids=run_ids, results=results, retry_context=context)
+    new_dlg.exec()
+
+
+def show_search_summary(res: Dict[str, Any], context: Dict[str, Any]) -> None:
+    """Displays post-search summary popup with parent mw after SearchDialog has closed."""
+    results = res.get("results", [])
+
+    total_added = sum(r.total_cards_count for r in results)
+    total_unsuspended = sum(r.newly_unsuspended_count for r in results)
+    total_already_active = sum(len(r.already_active_cids) for r in results)
+    decks_created = len([r for r in results if r.total_cards_count > 0])
+
+    all_coverage: List[Dict[str, Any]] = []
+    for r in results:
+        if getattr(r, "concept_coverage", None):
+            all_coverage.extend(r.concept_coverage)
+
+    cov_stats = compute_coverage_stats(all_coverage)
+    cov_line = ""
+    if cov_stats["total"] > 0:
+        mode = context.get("mode", "keyword")
+        is_kw = mode == "keyword" or any(c.get("source") == "keyword" for c in all_coverage)
+        label = "Copertura keyword" if is_kw else "Copertura concetti"
+        cov_line = (
+            f"\n\n{label}: {cov_stats['covered']} / {cov_stats['total']} ({cov_stats['pct']}% coperti al 100%)\n"
+            f"• Coperti: {cov_stats['covered']}\n"
+            f"• Parziali: {cov_stats['partial']}\n"
+            f"• Scoperti: {cov_stats['uncovered']}"
+        )
+
+    err_units = [r for r in results if getattr(r, "unit_error", "")]
+    err_section = ""
+    if err_units:
+        err_lines = [f"• {r.unit_title}: {r.unit_error}" for r in err_units]
+        err_section = (
+            "⚠️ ATTENZIONE — Errori Stage 1:\n"
+            "Nessuna carta riattivata per le seguenti unità a causa di errori nel testo/parsing:\n"
+            + "\n".join(err_lines)
+            + "\n\n"
+        )
+
+    warning_msg = res.get("warning", "")
+    warn_section = f"⚠️ {warning_msg}\n\n" if warning_msg else ""
+
+    parent_widget = mw if mw else None
+    msg_box = QMessageBox(parent_widget)
+    if err_units:
+        msg_box.setWindowTitle("Ricerca completata con errori")
+        try:
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+        except Exception:
+            pass
+    elif warning_msg:
+        msg_box.setWindowTitle("Ricerca completata con avvisi")
+        try:
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+        except Exception:
+            pass
+    else:
+        msg_box.setWindowTitle("Ricerca completata")
+
+    if total_added == 0 and total_already_active > 0:
+        msg_box.setText(
+            f"{warn_section}"
+            f"{err_section}"
+            f"Nessuna nuova carta da riattivare.\n\n"
+            f"Carte correlate già attive in studio: {total_already_active}"
+            f"{cov_line}"
+        )
+    elif total_added == 0 and not total_already_active and err_units:
+        msg_box.setText(
+            f"{warn_section}"
+            f"{err_section}"
+            f"Nessun mazzo filtrato creato a causa degli errori sopra indicati."
+            f"{cov_line}"
+        )
+    else:
+        msg_box.setText(
+            f"{warn_section}"
+            f"{err_section}"
+            f"Mazzi filtrati creati: {decks_created}\n"
+            f"Nuove carte riattivate: {total_unsuspended}\n"
+            f"Carte correlate già attive: {total_already_active}\n"
+            f"Carte totali nel mazzo filtrato: {total_added}"
+            f"{cov_line}"
+        )
+
+    msg_box.addButton(QMessageBox.StandardButton.Ok)
+    btn_browser = None
+    btn_coverage = None
+    btn_undo = None
+    btn_retry = None
+
+    created_names = [r.deck_name for r in results if r.filtered_did and r.total_cards_count > 0]
+    created_run_ids = [r.run_id for r in results if getattr(r, "run_id", "")]
+    has_concepts = any(getattr(r, "concept_coverage", None) for r in results)
+
+    if created_names:
+        btn_browser = msg_box.addButton("Browser", QMessageBox.ButtonRole.ActionRole)
+    if all_coverage:
+        btn_coverage = msg_box.addButton("Dettagli copertura", QMessageBox.ButtonRole.ActionRole)
+    if created_run_ids:
+        btn_undo = msg_box.addButton("Annulla creazione", QMessageBox.ButtonRole.DestructiveRole)
+    if created_run_ids and has_concepts:
+        btn_retry = msg_box.addButton("Riprova più stretto", QMessageBox.ButtonRole.ActionRole)
+
+    msg_box.exec()
+    clicked = msg_box.clickedButton()
+
+    if btn_undo and clicked == btn_undo:
+        _do_batch_rollback_standalone(created_run_ids, context)
+    elif btn_retry and clicked == btn_retry:
+        _launch_retry_tighter(created_run_ids, results, context)
+    elif btn_browser and clicked == btn_browser:
+        try:
+            import aqt
+            if aqt.mw:
+                query = " OR ".join(f'"deck:{name}"' for name in created_names)
+                browser = aqt.dialogs.open("Browser", aqt.mw)
+                if browser and hasattr(browser, "search_for"):
+                    browser.search_for(query)
+        except Exception as e:
+            print(f"[SmartSearch] Error opening browser: {e}")
+    elif btn_coverage and clicked == btn_coverage:
+        cov_dlg = CoverageDetailDialog(
+            coverage_items=all_coverage,
+            created_deck_names=created_names,
+            parent=parent_widget,
+        )
+        cov_dlg.exec()
 
 
 # Backwards compatibility alias for imports
@@ -1204,11 +1321,17 @@ class IndexDialog(QDialog):
         self.config = ConfigManager.load()
         self.storage = SearchDatabase()
         self.ai_client = OpenAICompatibleClient()
+        self.indexer = DeckIndexer(self.config, self.storage, self.ai_client)
 
         self.setWindowTitle("Smart Search — Indicizzazione")
         self.resize(620, 420)
 
         self.index_worker: Optional[IndexWorker] = None
+        self._query_timer = QTimer(self)
+        self._query_timer.setSingleShot(True)
+        self._query_timer.setInterval(250)
+        self._query_timer.timeout.connect(self._update_query_stats)
+
         self._init_ui()
         self._refresh_status()
 
@@ -1219,10 +1342,29 @@ class IndexDialog(QDialog):
         status_group = QGroupBox("Stato Modello Attivo")
         status_layout = QVBoxLayout(status_group)
 
+        lbl_query = QLabel("Mazzi / Query da indicizzare (sintassi Browser Anki):")
+        status_layout.addWidget(lbl_query)
+
+        self.combo_query = QComboBox()
+        self.combo_query.setEditable(True)
+        self.combo_query.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if self.config.search_query_history:
+            self.combo_query.addItems(self.config.search_query_history)
+        eff_init = self.config.get_effective_search_query()
+        if eff_init and self.combo_query.findText(eff_init) == -1:
+            self.combo_query.insertItem(0, eff_init)
+        self.combo_query.setCurrentText(eff_init)
+        if self.combo_query.lineEdit():
+            self.combo_query.lineEdit().setPlaceholderText(
+                'Es. "deck:AnKing Step Deck" oppure "deck:AnKing Step Deck" OR "deck:Mastering Radiology"'
+            )
+        self.combo_query.currentTextChanged.connect(self._on_query_text_changed)
+        status_layout.addWidget(self.combo_query)
+
         self.lbl_active_model = QLabel("Modello Attivo: -")
         status_layout.addWidget(self.lbl_active_model)
 
-        self.lbl_coverage = QLabel("Copertura mazzi selezionati: -")
+        self.lbl_coverage = QLabel("Indicizzate: -")
         status_layout.addWidget(self.lbl_coverage)
 
         self.progress_bar = QProgressBar()
@@ -1281,6 +1423,35 @@ class IndexDialog(QDialog):
 
         layout.addLayout(bottom_layout)
 
+    def _on_query_text_changed(self, _text: str) -> None:
+        self._query_timer.start()
+
+    def _update_query_stats(self) -> None:
+        if not self.col:
+            self.lbl_coverage.setText("0 note")
+            return
+
+        query = self.combo_query.currentText().strip()
+        if not query:
+            self.lbl_coverage.setText("0 note")
+            return
+
+        try:
+            target_nids = self.indexer.get_notes_for_query(self.col, query)
+        except Exception:
+            self.lbl_coverage.setText("Query incompleta o sintassi non valida.")
+            return
+
+        total_notes = len(target_nids)
+        if total_notes == 0:
+            self.lbl_coverage.setText("0 note")
+            return
+
+        active_id = self.config.get_active_model_id()
+        indexed_count = self.storage.count_embeddings_for_notes(target_nids, active_id)
+        pct = int(round((indexed_count / total_notes) * 100)) if total_notes > 0 else 0
+        self.lbl_coverage.setText(f"Indicizzate: {indexed_count} / {total_notes} note ({pct}%)")
+
     def _refresh_status(self) -> None:
         active_id = self.config.get_active_model_id()
         self.lbl_active_model.setText(f"Modello Attivo: {active_id}")
@@ -1295,24 +1466,38 @@ class IndexDialog(QDialog):
             if s["model_id"] == active_id:
                 active_count = s["note_count"]
 
-        if self.col:
-            indexer = DeckIndexer(self.config, self.storage, self.ai_client)
-            active_query = self.config.get_effective_search_query()
-            try:
-                target_nids = indexer.get_notes_for_query(self.col, active_query)
-            except Exception:
-                target_nids = []
-            total_notes = len(target_nids)
-            deck_active_count = self.storage.count_embeddings_for_notes(target_nids, active_id) if target_nids else 0
-            pct = int(deck_active_count / total_notes * 100) if total_notes > 0 else 0
-            self.lbl_coverage.setText(
-                f"Copertura query attiva ({active_query}): {deck_active_count} / {total_notes} note ({pct}%)"
-            )
+        self._update_query_stats()
 
     def _start_indexing(self) -> None:
         if not self.col:
             return
 
+        query = self.combo_query.currentText().strip()
+        if not query:
+            QMessageBox.warning(self, "Attenzione", "Inserisci una query valida.")
+            return
+
+        try:
+            target_nids = self.indexer.get_notes_for_query(self.col, query)
+            if not target_nids:
+                QMessageBox.warning(
+                    self,
+                    "Nessuna nota trovata",
+                    f"La query '{query}' non restituisce alcuna nota nella tua collezione.",
+                )
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "Query non valida", f"Errore nella query:\n{e}")
+            return
+
+        self.config.search_query = query
+        self.config.add_query_to_history(query)
+        extracted_decks = self.indexer.extract_deck_names_from_query(query)
+        if extracted_decks:
+            self.config.selected_decks = extracted_decks
+        self.config.save()
+
+        self.combo_query.setEnabled(False)
         self.btn_run.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress_bar.setVisible(True)
@@ -1321,14 +1506,7 @@ class IndexDialog(QDialog):
         self.lbl_progress_msg.setText("Avvio indicizzazione...")
 
         # Scan note metadata on the main thread before launching background embedding worker
-        indexer = DeckIndexer(self.config, self.storage, self.ai_client)
-        active_query = self.config.get_effective_search_query()
-        if active_query:
-            nids = indexer.get_notes_for_query(self.col, active_query)
-        else:
-            dids = indexer.find_target_deck_ids(self.col, self.config.selected_decks)
-            nids = indexer.get_notes_in_decks(self.col, dids)
-        precomputed_notes = indexer.scan_notes_metadata(self.col, nids)
+        precomputed_notes = self.indexer.scan_notes_metadata(self.col, target_nids)
 
         self.index_worker = IndexWorker(
             col=self.col,
@@ -1337,6 +1515,7 @@ class IndexDialog(QDialog):
             ai_client=self.ai_client,
             selected_decks=None,
             precomputed_notes_data=precomputed_notes,
+            search_query=query,
         )
         self.index_worker.progress_sig.connect(self._on_progress)
         self.index_worker.finished_sig.connect(self._on_finished)
@@ -1355,6 +1534,7 @@ class IndexDialog(QDialog):
         self.lbl_progress_msg.setText(msg)
 
     def _on_finished(self, res: Dict[str, Any]) -> None:
+        self.combo_query.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.progress_bar.setVisible(False)
@@ -1371,8 +1551,12 @@ class IndexDialog(QDialog):
         )
 
     def _on_error(self, err: str) -> None:
+        self.combo_query.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.lbl_progress_msg.setVisible(False)
+        self._refresh_status()
         self.progress_bar.setVisible(False)
         self.lbl_progress_msg.setVisible(False)
         QMessageBox.critical(self, "Errore Indicizzazione", f"Errore:\n{err}")

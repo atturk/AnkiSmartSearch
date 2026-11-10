@@ -2567,8 +2567,8 @@ I should decompose this into atomic concepts.
 
         self.assertEqual(act_similar.text, "Trova carte simili")
         self.assertEqual(act_similar.shortcut, "Ctrl+Alt+M")
-        self.assertEqual(act_history.text, "Cronologia & rollback")
-        self.assertEqual(act_index.text, "Indice")
+        self.assertEqual(act_history.text, "Cronologia")
+        self.assertEqual(act_index.text, "Indicizzazione")
         self.assertEqual(act_settings.text, "Impostazioni")
         self.assertEqual(act_updates.text, "Verifica aggiornamenti")
 
@@ -3044,8 +3044,8 @@ print("__JSON_RESULT__" + json.dumps(output))
             "Nuova ricerca…",
             "Cerca con la query corrente…",
             "Trova carte simili",
-            "Cronologia & rollback",
-            "Indice",
+            "Cronologia",
+            "Indicizzazione",
             "Impostazioni",
             "Verifica aggiornamenti",
         ]
@@ -3662,3 +3662,433 @@ class TestKeywordTranslationAlignment(unittest.TestCase):
         unit = LectureUnit(unit_title="U", deck_name="U", body_text="", keywords=["Chilomicroni", "PCR"])
         out = pipe.translate_keywords([unit])
         self.assertEqual(out, {"Chilomicroni": "Chylomicrons", "PCR": "C-reactive protein"})
+
+
+class TestIndexDialogQueryField(unittest.TestCase):
+    def test_index_dialog_query_field_and_coverage(self):
+        """Item 35: Query field in IndexDialog, live coverage updates, validation, and history."""
+        from ankihub_searcher.ui.main_dialog import IndexDialog, QMessageBox
+        from ankihub_searcher.config_manager import ConfigManager
+
+        col = MockAnkiCol()
+        col.find_notes = MagicMock(return_value=[101, 102])
+
+        import ankihub_searcher.config_manager as cm_mod
+        from pathlib import Path
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(cm_mod.__file__)), "config.json")
+        orig_cfg_text = Path(cfg_path).read_text(encoding="utf-8") if os.path.exists(cfg_path) else None
+        try:
+            cfg = ConfigManager.load()
+            cfg.search_query = 'deck:"AnKing Step Deck"'
+            cfg.search_query_history = ['deck:"AnKing Step Deck"', "deck:Other"]
+            cfg.save()
+
+            dlg = IndexDialog(col=col)
+
+            # 1. Combo query is editable, has history, effective initial query, and placeholder
+            self.assertIsNotNone(dlg.combo_query)
+            self.assertEqual(dlg.combo_query.currentText(), 'deck:"AnKing Step Deck"')
+            self.assertEqual(
+                dlg.combo_query.lineEdit().placeholderText(),
+                'Es. "deck:AnKing Step Deck" oppure "deck:AnKing Step Deck" OR "deck:Mastering Radiology"',
+            )
+
+            # 2. Coverage calculation on valid query
+            with patch.object(dlg.storage, "count_embeddings_for_notes", return_value=1):
+                dlg._update_query_stats()
+                self.assertEqual(dlg.lbl_coverage.text(), "Indicizzate: 1 / 2 note (50%)")
+
+            # 3. Invalid query syntax
+            col.find_notes.side_effect = Exception("Syntax error")
+            dlg.combo_query.setCurrentText("deck:invalid(")
+            dlg._update_query_stats()
+            self.assertEqual(dlg.lbl_coverage.text(), "Query incompleta o sintassi non valida.")
+
+            # 4. Empty query or 0 notes
+            col.find_notes.side_effect = None
+            col.find_notes.return_value = []
+            dlg.combo_query.setCurrentText("")
+            dlg._update_query_stats()
+            self.assertEqual(dlg.lbl_coverage.text(), "0 note")
+
+            dlg.combo_query.setCurrentText("deck:EmptyDeck")
+            dlg._update_query_stats()
+            self.assertEqual(dlg.lbl_coverage.text(), "0 note")
+
+            # 5. _start_indexing validation: empty query
+            dlg.combo_query.setCurrentText("")
+            warns = []
+            with patch.object(QMessageBox, "warning", side_effect=lambda p, t, m: warns.append(m)):
+                dlg._start_indexing()
+            self.assertTrue(any("query valida" in m for m in warns))
+            self.assertIsNone(dlg.index_worker)
+
+            # 6. _start_indexing validation: 0 notes
+            dlg.combo_query.setCurrentText("deck:EmptyDeck")
+            warns.clear()
+            with patch.object(QMessageBox, "warning", side_effect=lambda p, t, m: warns.append(m)):
+                dlg._start_indexing()
+            self.assertTrue(any("non restituisce alcuna nota" in m for m in warns))
+            self.assertIsNone(dlg.index_worker)
+
+            # 7. _start_indexing success: updates history, selected_decks, disables field, launches worker
+            col.find_notes.return_value = [101, 102]
+            dlg.combo_query.setCurrentText('deck:"Mastering Radiology"')
+            with patch("ankihub_searcher.ui.main_dialog.IndexWorker") as MockWorkerClass:
+                mock_inst = MagicMock()
+                MockWorkerClass.return_value = mock_inst
+                dlg._start_indexing()
+
+                self.assertFalse(dlg.combo_query.isEnabled())
+                loaded_cfg = ConfigManager.load()
+                self.assertEqual(loaded_cfg.search_query, 'deck:"Mastering Radiology"')
+                self.assertIn('deck:"Mastering Radiology"', loaded_cfg.search_query_history)
+                self.assertIn("Mastering Radiology", loaded_cfg.selected_decks)
+                mock_inst.start.assert_called_once()
+                # IndexWorker received search_query
+                call_kwargs = MockWorkerClass.call_args[1]
+                self.assertEqual(call_kwargs.get("search_query"), 'deck:"Mastering Radiology"')
+
+            # 8. Finished re-enables combo_query
+            with patch.object(QMessageBox, "information"):
+                dlg._on_finished({"text_indexed": 2, "embeddings_indexed": 2, "cancelled": False})
+            self.assertTrue(dlg.combo_query.isEnabled())
+
+            # 9. Error re-enables combo_query
+            dlg.combo_query.setEnabled(False)
+            with patch.object(QMessageBox, "critical"):
+                dlg._on_error("Test error")
+            self.assertTrue(dlg.combo_query.isEnabled())
+
+            col.conn.close()
+        finally:
+            if orig_cfg_text is not None and os.path.exists(cfg_path):
+                Path(cfg_path).write_text(orig_cfg_text, encoding="utf-8")
+
+
+class TestFindSimilarReviewMode(unittest.TestCase):
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.storage = SearchDatabase(db_path=self.temp_db.name)
+
+    def tearDown(self):
+        try:
+            os.remove(self.temp_db.name)
+        except OSError:
+            pass
+
+    def test_find_similar_review_mode_and_enabling(self):
+        """Item 37: 'Trova carte simili' during review (enabling, review path with browser opening, hooks)."""
+        from ankihub_searcher.browser_menu import (
+            populate_smart_search_menu,
+            on_find_similar_cards_clicked,
+            on_find_similar_cards_review_clicked,
+            _update_mw_similar_action_state,
+            _on_state_did_change,
+            _on_reviewer_did_show_question,
+            setup_main_window_hooks,
+        )
+        from ankihub_searcher.config_manager import ConfigManager
+
+        mid = "test-review-mid"
+        self.storage.save_embeddings_batch(
+            [
+                (701, mid, "h701", 2, [1.0, 0.0]),
+                (702, mid, "h702", 2, [0.95, 0.05]),
+                (703, mid, "h703", 2, [0.92, 0.08]),
+            ]
+        )
+
+        class MockAction:
+            def __init__(self, text=""):
+                self.text = text
+                self.enabled = True
+                self.shortcut = ""
+                self.callbacks = []
+
+            def setEnabled(self, val):
+                self.enabled = bool(val)
+
+            def setShortcut(self, sc):
+                self.shortcut = sc
+
+            @property
+            def triggered(self):
+                act_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        act_self.callbacks.append(fn)
+                return _Sig()
+
+            def trigger(self):
+                for cb in self.callbacks:
+                    cb()
+
+        class MockMenu:
+            def __init__(self, title="", parent=None):
+                self.title = title
+                self.parent = parent
+                self.actions = []
+                self._about_to_show_cbs = []
+
+            def addAction(self, text):
+                act = MockAction(text)
+                self.actions.append(act)
+                return act
+
+            def addSeparator(self):
+                pass
+
+            def setDefaultAction(self, act):
+                pass
+
+            @property
+            def aboutToShow(self):
+                menu_self = self
+                class _Sig:
+                    def connect(self, fn):
+                        menu_self._about_to_show_cbs.append(fn)
+                return _Sig()
+
+            def emit_about_to_show(self):
+                for cb in self._about_to_show_cbs:
+                    cb()
+
+        class MockCard:
+            def __init__(self, nid):
+                self.nid = nid
+
+        class MockReviewer:
+            def __init__(self, card=None):
+                self.card = card
+
+        class MockMW:
+            def __init__(self, col=None):
+                self.state = "deckBrowser"
+                self.reviewer = MockReviewer(card=None)
+                self.col = col
+
+        col = MockAnkiCol()
+        fake_mw = MockMW(col=col)
+        mw_menu = MockMenu("Smart Search", parent=fake_mw)
+
+        # 1. Populate main window menu (browser=None)
+        acts = populate_smart_search_menu(mw_menu, parent_window=fake_mw, browser=None)
+        act_similar = acts["find_similar"]
+
+        # Initial state: deckBrowser -> disabled
+        self.assertFalse(act_similar.enabled)
+
+        # 2. State change to review, but card is None -> still disabled
+        fake_mw.state = "review"
+        fake_mw.reviewer.card = None
+        _update_mw_similar_action_state(fake_mw)
+        self.assertFalse(act_similar.enabled)
+
+        # 3. Card becomes active in review -> enabled
+        fake_mw.reviewer.card = MockCard(nid=701)
+        _update_mw_similar_action_state(fake_mw)
+        self.assertTrue(act_similar.enabled)
+
+        # 4. aboutToShow updates state
+        fake_mw.state = "overview"
+        mw_menu.emit_about_to_show()
+        self.assertFalse(act_similar.enabled)
+
+        fake_mw.state = "review"
+        mw_menu.emit_about_to_show()
+        self.assertTrue(act_similar.enabled)
+
+        # 5. Hook callbacks update state via mw reference
+        with patch("ankihub_searcher.browser_menu.mw", fake_mw):
+            fake_mw.state = "deckBrowser"
+            _on_state_did_change()
+            self.assertFalse(act_similar.enabled)
+
+            fake_mw.state = "review"
+            _on_reviewer_did_show_question()
+            self.assertTrue(act_similar.enabled)
+
+        # 6. Execute review path when similar cards are found:
+        # Should open browser via aqt.dialogs.open and set query
+        fake_browser = MagicMock()
+        fake_browser.executed_searches = []
+        fake_browser.search_for = lambda q: fake_browser.executed_searches.append(q)
+        fake_browser.col = col
+
+        mock_dialogs = MagicMock()
+        mock_dialogs.open.return_value = fake_browser
+
+        tooltips = []
+        infos = []
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.70,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: mid
+
+        fake_aqt = MagicMock()
+        fake_aqt.dialogs = mock_dialogs
+        fake_aqt.mw = fake_mw
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))), \
+             patch.dict(sys.modules, {"aqt": fake_aqt}), \
+             patch("ankihub_searcher.browser_menu.mw", fake_mw):
+
+            act_similar.trigger()
+
+            # Browser was opened
+            mock_dialogs.open.assert_called_once_with("Browser", fake_mw)
+            # Search query was applied to browser
+            self.assertIn("nid:702,703", fake_browser.executed_searches)
+            # Tooltip shown on browser
+            self.assertTrue(any("Trovate 2 note simili" in t[1] for t in tooltips))
+
+        # 7. Execute review path when NO similar cards found:
+        # Browser must NOT open; tooltip shown on mw
+        mock_dialogs.open.reset_mock()
+        tooltips.clear()
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))), \
+             patch.dict(sys.modules, {"aqt": fake_aqt}), \
+             patch("ankihub_searcher.browser_menu.mw", fake_mw):
+
+            act_similar.trigger()
+
+            mock_dialogs.open.assert_not_called()
+            self.assertTrue(any("Nessuna carta simile trovata" in t[1] for t in tooltips))
+            # Tooltip target is fake_mw, not browser
+            self.assertEqual(tooltips[0][0], fake_mw)
+
+        # 8. Execute review path when note is not indexed:
+        # Browser must NOT open; info modal shown on mw
+        mock_dialogs.open.reset_mock()
+        infos.clear()
+        fake_mw.reviewer.card = MockCard(nid=99999)  # Not in storage
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))), \
+             patch.dict(sys.modules, {"aqt": fake_aqt}), \
+             patch("ankihub_searcher.browser_menu.mw", fake_mw):
+
+            act_similar.trigger()
+
+            mock_dialogs.open.assert_not_called()
+            self.assertTrue(any("Nota non indicizzata" in m[1] for m in infos))
+            self.assertEqual(infos[0][0], fake_mw)
+
+        col.conn.close()
+
+
+class TestSearchDialogCloseBeforeSummary(unittest.TestCase):
+    def test_search_finished_closes_dialog_before_summary_and_retry_context(self):
+        """Item 38: SearchDialog closes (done) before showing summary; context contains mode, text, query, deck."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog, show_search_summary, _launch_retry_tighter
+        from ankihub_searcher.config_manager import ConfigManager
+
+        col = MockAnkiCol()
+        dlg = SearchDialog(col=col)
+        dlg.combo_query.setCurrentText('deck:"AnKing"')
+        dlg.txt_base_deck.setText("FilteredDeckTest")
+        dlg.input_tabs.setCurrentIndex(0)
+        dlg.txt_keywords.setPlainText("Lipidi\nApoB")
+        dlg.last_search_mode = "keyword"
+        dlg.last_search_text = "Lipidi\nApoB"
+
+        events = []
+        orig_done = dlg.done
+        def mock_done(code):
+            events.append(("done", code))
+            orig_done(code)
+
+        dlg.done = mock_done
+
+        mock_res = {
+            "status": "done",
+            "results": [
+                MagicMock(
+                    deck_name="SmartSearch - Lipidi",
+                    filtered_did=1001,
+                    total_cards_count=5,
+                    newly_unsuspended_count=3,
+                    already_active_cids=[1, 2],
+                    run_id="run_test_123",
+                    concept_coverage=[{"source": "keyword", "status": "covered", "topic_it": "Lipidi"}],
+                    unit_title="Lipidi",
+                    unit_error="",
+                )
+            ],
+            "warning": "",
+        }
+
+        with patch("ankihub_searcher.ui.main_dialog.show_search_summary", side_effect=lambda r, c: events.append(("summary", r, c))):
+            dlg._on_search_finished(mock_res)
+
+        # 1. done was called BEFORE summary
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0][0], "done")
+        self.assertEqual(events[1][0], "summary")
+
+        # 2. Context contains required keys: mode, text (and raw_text), query, base_deck_name
+        passed_res, passed_ctx = events[1][1], events[1][2]
+        self.assertEqual(passed_ctx.get("mode"), "keyword")
+        self.assertEqual(passed_ctx.get("text"), "Lipidi\nApoB")
+        self.assertEqual(passed_ctx.get("query"), 'deck:"AnKing"')
+        self.assertEqual(passed_ctx.get("base_deck_name"), "FilteredDeckTest")
+
+        # 3. Cancelled search does NOT close dialog and does NOT show summary
+        events.clear()
+        with patch("ankihub_searcher.ui.main_dialog.QMessageBox.information") as mock_info:
+            dlg._on_search_finished({"status": "cancelled"})
+            self.assertEqual(len(events), 0)
+            mock_info.assert_called_once()
+
+        # 4. Search error does NOT close dialog
+        events.clear()
+        with patch("ankihub_searcher.ui.main_dialog.QMessageBox.critical") as mock_crit:
+            dlg._on_search_error("Fatal index error")
+            self.assertEqual(len(events), 0)
+            mock_crit.assert_called_once()
+
+        # 5. Retry receives the same data in the new SearchDialog
+        with patch("ankihub_searcher.ui.main_dialog.SearchDialog") as MockSearchDialogClass:
+            mock_new_dlg = MagicMock()
+            MockSearchDialogClass.return_value = mock_new_dlg
+
+            _launch_retry_tighter(
+                run_ids=["run_test_123"],
+                results=mock_res["results"],
+                context=passed_ctx,
+            )
+
+            # Instantiated with same col and query
+            MockSearchDialogClass.assert_called_once_with(
+                col=col,
+                parent=None,
+                initial_query='deck:"AnKing"',
+            )
+            mock_new_dlg.txt_base_deck.setText.assert_called_once_with("FilteredDeckTest")
+            mock_new_dlg.combo_query.setCurrentText.assert_called_once_with('deck:"AnKing"')
+            mock_new_dlg.txt_keywords.setPlainText.assert_called_once_with("Lipidi\nApoB")
+            self.assertEqual(mock_new_dlg.last_search_mode, "keyword")
+            self.assertEqual(mock_new_dlg.last_search_text, "Lipidi\nApoB")
+            mock_new_dlg._do_retry_tighter.assert_called_once_with(
+                run_ids=["run_test_123"],
+                results=mock_res["results"],
+                retry_context=passed_ctx,
+            )
+            mock_new_dlg.exec.assert_called_once()
+
+        col.conn.close()
