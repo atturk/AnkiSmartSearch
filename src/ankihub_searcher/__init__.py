@@ -30,6 +30,7 @@ from .ui.main_dialog import (
     IndexDialog,
     SearchDialog,
     SettingsDialog,
+    show_search_summary,
 )
 from .updater import run_update_check_ui
 

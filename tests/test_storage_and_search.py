@@ -3990,3 +3990,105 @@ class TestFindSimilarReviewMode(unittest.TestCase):
             self.assertEqual(infos[0][0], fake_mw)
 
         col.conn.close()
+
+
+class TestSearchDialogCloseBeforeSummary(unittest.TestCase):
+    def test_search_finished_closes_dialog_before_summary_and_retry_context(self):
+        """Item 38: SearchDialog closes (done) before showing summary; context contains mode, text, query, deck."""
+        from ankihub_searcher.ui.main_dialog import SearchDialog, show_search_summary, _launch_retry_tighter
+        from ankihub_searcher.config_manager import ConfigManager
+
+        col = MockAnkiCol()
+        dlg = SearchDialog(col=col)
+        dlg.combo_query.setCurrentText('deck:"AnKing"')
+        dlg.txt_base_deck.setText("FilteredDeckTest")
+        dlg.input_tabs.setCurrentIndex(0)
+        dlg.txt_keywords.setPlainText("Lipidi\nApoB")
+        dlg.last_search_mode = "keyword"
+        dlg.last_search_text = "Lipidi\nApoB"
+
+        events = []
+        orig_done = dlg.done
+        def mock_done(code):
+            events.append(("done", code))
+            orig_done(code)
+
+        dlg.done = mock_done
+
+        mock_res = {
+            "status": "done",
+            "results": [
+                MagicMock(
+                    deck_name="SmartSearch - Lipidi",
+                    filtered_did=1001,
+                    total_cards_count=5,
+                    newly_unsuspended_count=3,
+                    already_active_cids=[1, 2],
+                    run_id="run_test_123",
+                    concept_coverage=[{"source": "keyword", "status": "covered", "topic_it": "Lipidi"}],
+                    unit_title="Lipidi",
+                    unit_error="",
+                )
+            ],
+            "warning": "",
+        }
+
+        with patch("ankihub_searcher.ui.main_dialog.show_search_summary", side_effect=lambda r, c: events.append(("summary", r, c))):
+            dlg._on_search_finished(mock_res)
+
+        # 1. done was called BEFORE summary
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0][0], "done")
+        self.assertEqual(events[1][0], "summary")
+
+        # 2. Context contains required keys: mode, text (and raw_text), query, base_deck_name
+        passed_res, passed_ctx = events[1][1], events[1][2]
+        self.assertEqual(passed_ctx.get("mode"), "keyword")
+        self.assertEqual(passed_ctx.get("text"), "Lipidi\nApoB")
+        self.assertEqual(passed_ctx.get("query"), 'deck:"AnKing"')
+        self.assertEqual(passed_ctx.get("base_deck_name"), "FilteredDeckTest")
+
+        # 3. Cancelled search does NOT close dialog and does NOT show summary
+        events.clear()
+        with patch("ankihub_searcher.ui.main_dialog.QMessageBox.information") as mock_info:
+            dlg._on_search_finished({"status": "cancelled"})
+            self.assertEqual(len(events), 0)
+            mock_info.assert_called_once()
+
+        # 4. Search error does NOT close dialog
+        events.clear()
+        with patch("ankihub_searcher.ui.main_dialog.QMessageBox.critical") as mock_crit:
+            dlg._on_search_error("Fatal index error")
+            self.assertEqual(len(events), 0)
+            mock_crit.assert_called_once()
+
+        # 5. Retry receives the same data in the new SearchDialog
+        with patch("ankihub_searcher.ui.main_dialog.SearchDialog") as MockSearchDialogClass:
+            mock_new_dlg = MagicMock()
+            MockSearchDialogClass.return_value = mock_new_dlg
+
+            _launch_retry_tighter(
+                run_ids=["run_test_123"],
+                results=mock_res["results"],
+                context=passed_ctx,
+            )
+
+            # Instantiated with same col and query
+            MockSearchDialogClass.assert_called_once_with(
+                col=col,
+                parent=None,
+                initial_query='deck:"AnKing"',
+            )
+            mock_new_dlg.txt_base_deck.setText.assert_called_once_with("FilteredDeckTest")
+            mock_new_dlg.combo_query.setCurrentText.assert_called_once_with('deck:"AnKing"')
+            mock_new_dlg.txt_keywords.setPlainText.assert_called_once_with("Lipidi\nApoB")
+            self.assertEqual(mock_new_dlg.last_search_mode, "keyword")
+            self.assertEqual(mock_new_dlg.last_search_text, "Lipidi\nApoB")
+            mock_new_dlg._do_retry_tighter.assert_called_once_with(
+                run_ids=["run_test_123"],
+                results=mock_res["results"],
+                retry_context=passed_ctx,
+            )
+            mock_new_dlg.exec.assert_called_once()
+
+        col.conn.close()
