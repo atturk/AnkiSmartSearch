@@ -94,7 +94,12 @@ def open_new_browser(mw: Any) -> Any:
         qapp = getattr(aqt.qt, "QApplication", None)
         if qapp and hasattr(qapp, "activeWindow"):
             app_active = qapp.activeWindow()
-            if app_active and app_active is not instance and _is_alive(app_active):
+            if (
+                app_active
+                and app_active is not instance
+                and isinstance(app_active, browser_cls)
+                and _is_alive(app_active)
+            ):
                 active_b = app_active
     except Exception:
         pass
