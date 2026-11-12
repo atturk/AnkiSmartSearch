@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 from .ai_client import OpenAICompatibleClient
 from .config_manager import ConfigManager
@@ -125,6 +125,12 @@ def init_addon() -> None:
 
         # Register Smart Search Browser menu hooks
         setup_browser_menu()
+
+        try:
+            from .browser_windows import install as install_browser_windows
+            install_browser_windows()
+        except Exception as e:
+            print(f"[SmartSearch] Error installing browser window management: {e}")
 
     except ImportError:
         # Running in standalone test environment outside Anki

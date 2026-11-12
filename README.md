@@ -31,7 +31,7 @@ Paste your Italian lecture unit (or an entire Markdown document with multiple un
   - Instant commit after every 32-note batch — pause and resume anytime with 0% progress lost.
   - Includes a **Smart Tag Cleaner** (strips `#AK_Step1_v12`, `AnKing_Image`, `AMBOSS` hashes, etc.) and per-Note-Type field selection.
 - **🔍 Trova carte simili ovunque (`Ctrl+Alt+M`):**
-  - Nel Browser e durante la revisione delle carte (`review`), trova istantaneamente le carte simili alla nota corrente aprendo il Browser con ordinamento per similarità decrescente.
+  - Nel Browser e durante la revisione delle carte (`review`), trova istantaneamente le carte simili alla nota corrente aprendo una nuova finestra del Browser con ordinamento per similarità decrescente, conservando la ricerca e la selezione della finestra di partenza.
 
 ---
 

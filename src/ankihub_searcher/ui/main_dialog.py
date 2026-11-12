@@ -225,7 +225,7 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.5.2"
+CURRENT_VERSION = "0.5.3"
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -850,10 +850,12 @@ def open_browser_with_results(matched: List[Any], message: str = "") -> None:
     try:
         import aqt
         from ..browser_menu import show_scored_notes_in_browser
+        from ..browser_windows import get_browser_for_results
 
         if aqt.mw:
-            browser = aqt.dialogs.open("Browser", aqt.mw)
-            show_scored_notes_in_browser(browser, matched, message, parent=aqt.mw)
+            browser = get_browser_for_results(aqt.mw)
+            if browser:
+                show_scored_notes_in_browser(browser, matched, message, parent=aqt.mw)
     except Exception as e:
         print(f"[SmartSearch] Error opening browser with results: {e}")
 
