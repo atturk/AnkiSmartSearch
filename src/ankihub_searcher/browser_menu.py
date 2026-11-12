@@ -448,10 +448,13 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
     if not selected_nids:
         return
 
+    from .browser_windows import open_new_browser
+
+    target_mw = getattr(browser, "mw", None) or mw
     run_find_similar(
         selected_nids=selected_nids,
         parent=browser,
-        get_browser=lambda: browser,
+        get_browser=lambda: open_new_browser(target_mw),
     )
 
 

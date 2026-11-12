@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from ankihub_searcher import browser_windows
+from ankihub_searcher import browser_menu, browser_windows
 
 
 class FakePoint:
@@ -34,6 +34,16 @@ class MockBrowserWindow:
         self.closed = False
         self._pos = FakePoint(100, 100)
         self.close_with_cb_called = False
+        self.executed_searches = []
+        self._selected_notes = []
+        self.search_query = ""
+
+    def selected_notes(self):
+        return list(self._selected_notes)
+
+    def search_for(self, query: str):
+        self.executed_searches.append(query)
+        self.search_query = query
 
     def pos(self):
         return self._pos
@@ -234,6 +244,159 @@ class TestBrowserWindows(unittest.TestCase):
         # Second call must not wrap again
         self.assertTrue(browser_windows.install())
         self.assertIs(self.fake_dialogs.closeAll, wrapped_close_all)
+
+    def test_find_similar_from_browser_opens_new_window_only_on_results(self):
+        from ankihub_searcher import browser_menu
+        from ankihub_searcher.config_manager import ConfigManager
+
+        starting_browser = MockBrowserWindow(self.fake_mw)
+        starting_browser.search_query = "deck:OriginalDeck"
+        starting_browser._selected_notes = [101]
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.70,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: "test-mid"
+
+        tooltips = []
+        infos = []
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([(201, 0.95), (202, 0.85)], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))):
+
+            browser_menu.on_find_similar_cards_clicked(starting_browser)
+
+        # 1. Starting browser untouched
+        self.assertEqual(starting_browser.executed_searches, [])
+        self.assertEqual(starting_browser.search_query, "deck:OriginalDeck")
+        self.assertEqual(starting_browser.selected_notes(), [101])
+
+        # 2. A new browser window was created and added to extra browsers
+        self.assertEqual(len(browser_windows._extra_browsers), 1)
+        new_b = browser_windows._extra_browsers[0]
+        self.assertIsNot(new_b, starting_browser)
+        self.assertIn("nid:201,202", new_b.executed_searches)
+        self.assertTrue(any("Trovate 2 note simili" in t[1] for t in tooltips))
+        # Tooltip is shown on the new browser
+        self.assertEqual(tooltips[0][0], new_b)
+
+    def test_find_similar_no_results_or_unindexed_does_not_open_window(self):
+        from ankihub_searcher import browser_menu
+        from ankihub_searcher.config_manager import ConfigManager
+
+        starting_browser = MockBrowserWindow(self.fake_mw)
+        starting_browser.search_query = "deck:OriginalDeck"
+        starting_browser._selected_notes = [101]
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.70,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: "test-mid"
+
+        tooltips = []
+        infos = []
+
+        # A: No results
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))):
+
+            browser_menu.on_find_similar_cards_clicked(starting_browser)
+
+        self.assertEqual(len(browser_windows._extra_browsers), 0)
+        self.assertEqual(starting_browser.executed_searches, [])
+        self.assertTrue(any("Nessuna carta simile" in t[1] for t in tooltips))
+        # Tooltip on starting window
+        self.assertEqual(tooltips[0][0], starting_browser)
+
+        # B: Unindexed note
+        tooltips.clear()
+        infos.clear()
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([], [101])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))):
+
+            browser_menu.on_find_similar_cards_clicked(starting_browser)
+
+        self.assertEqual(len(browser_windows._extra_browsers), 0)
+        self.assertEqual(starting_browser.executed_searches, [])
+        self.assertTrue(any("Nota non indicizzata" in m[1] for m in infos))
+        # Info modal on starting window
+        self.assertEqual(infos[0][0], starting_browser)
+
+    def test_initial_search_does_not_consume_similarity_sort_order(self):
+        from ankihub_searcher import browser_menu
+
+        browser = MockBrowserWindow(self.fake_mw)
+        matched = [(301, 0.99), (302, 0.75)]
+        browser_menu.show_scored_notes_in_browser(browser, matched)
+
+        self.assertTrue(browser_menu._similar_custom_order_active)
+        self.assertEqual(browser_menu._last_similar_query, "nid:301,302")
+
+        # Simulate Browser.__init__ running an initial search (e.g. deck:current or empty)
+        ctx_init = types.SimpleNamespace(search="deck:current", ids=[999, 888], order=True, browser=browser)
+        browser_menu.on_browser_will_search(ctx_init)
+        browser_menu.on_browser_did_search(ctx_init)
+
+        # Ordering must still be active and order flag not modified
+        self.assertTrue(browser_menu._similar_custom_order_active)
+        self.assertTrue(ctx_init.order)
+
+        # Now simulate the similarity search query
+        ctx_sim = types.SimpleNamespace(search="nid:301,302", ids=[302, 301], order=True, browser=browser)
+        # Pretend browser is in notes mode
+        browser.is_notes_mode = lambda: True
+        browser_menu.on_browser_will_search(ctx_sim)
+        browser_menu.on_browser_did_search(ctx_sim)
+
+        # Custom ordering applied (301 with 0.99 before 302 with 0.75) and flag deactivated
+        self.assertEqual(ctx_sim.ids, [301, 302])
+        self.assertFalse(browser_menu._similar_custom_order_active)
+
+    def test_find_similar_from_extra_browser_opens_another_browser(self):
+        from ankihub_searcher import browser_menu
+        from ankihub_searcher.config_manager import ConfigManager
+
+        extra1 = browser_windows.open_new_browser(self.fake_mw)
+        self.assertEqual(len(browser_windows._extra_browsers), 1)
+        extra1.search_query = "nid:101,102"
+        extra1._selected_notes = [102]
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.70,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: "test-mid"
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([(401, 0.91)], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip"):
+
+            browser_menu.on_find_similar_cards_clicked(extra1)
+
+        # A second extra browser is opened
+        self.assertEqual(len(browser_windows._extra_browsers), 2)
+        extra2 = browser_windows._extra_browsers[1]
+        self.assertIsNot(extra2, extra1)
+        self.assertIn("nid:401", extra2.executed_searches)
+        # extra1 search remains unchanged
+        self.assertEqual(extra1.search_query, "nid:101,102")
 
 
 if __name__ == "__main__":

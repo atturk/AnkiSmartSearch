@@ -2589,6 +2589,7 @@ I should decompose this into atomic concepts.
 
         # 4. Test "Trova carte simili" execution
         browser._selected = [501]
+        new_browser = MockBrowser(col=col, selected_nids=[], current_search_str="")
         with patch.object(ConfigManager, "load") as mock_load:
             cfg = ConfigManager(
                 embed_model="test-embed-model",
@@ -2601,11 +2602,15 @@ I should decompose this into atomic concepts.
             cfg.get_active_model_id = lambda: mid
             mock_load.return_value = cfg
 
-            with patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage):
+            with patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage), \
+                 patch("ankihub_searcher.browser_windows.open_new_browser", return_value=new_browser):
                 act_similar.trigger()
 
-        # Browser search should have been updated with comma-separated "nid:502,503"
-        self.assertIn("nid:502,503", browser.executed_searches)
+        # Originating browser search is untouched
+        self.assertEqual(browser.executed_searches, [])
+        self.assertEqual(browser.current_search(), '"deck:AnKing"')
+        # New browser window received the similarity search query
+        self.assertIn("nid:502,503", new_browser.executed_searches)
 
         # 5. Test context menu hook (Item 20d)
         from ankihub_searcher.browser_menu import (
