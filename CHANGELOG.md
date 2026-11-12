@@ -2,6 +2,13 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.5.3] - 2026-11-12
+
+### Novità
+- **Nuova finestra del Browser per "Trova carte simili" e risultati:** L'azione "Trova carte simili" dal Browser e dalla revisione, così come l'apertura dei risultati della ricerca senza mazzo filtrato, aprono una nuova finestra del Browser nativo di Anki se ne esiste già una aperta, preservando la ricerca e la selezione della finestra di partenza. Chiusura ordinata di tutte le finestre extra prima della sincronizzazione o del cambio profilo, con compatibilità garantita anche in presenza dell'addon "Opening the same window multiple time".
+
+---
+
 ## [0.5.2] - 2026-11-10
 
 ### Novità
