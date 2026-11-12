@@ -398,6 +398,89 @@ class TestBrowserWindows(unittest.TestCase):
         # extra1 search remains unchanged
         self.assertEqual(extra1.search_query, "nid:101,102")
 
+    def test_find_similar_review_clicked_with_and_without_open_browser(self):
+        from ankihub_searcher import browser_menu
+        from ankihub_searcher.config_manager import ConfigManager
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.70,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: "test-mid"
+
+        self.fake_mw.state = "review"
+        self.fake_mw.reviewer = types.SimpleNamespace(card=types.SimpleNamespace(nid=801))
+
+        # Case 1: Primary browser is open
+        main_browser = MockBrowserWindow(self.fake_mw)
+        main_browser.search_query = "deck:Original"
+        self.fake_dialogs._dialogs["Browser"][1] = main_browser
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([(802, 0.95)], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip"):
+
+            browser_menu.on_find_similar_cards_review_clicked(self.fake_mw)
+
+        # Primary browser slot remains main_browser, and main_browser search is untouched
+        self.assertIs(self.fake_dialogs._dialogs["Browser"][1], main_browser)
+        self.assertEqual(main_browser.executed_searches, [])
+        # A new extra browser window was opened
+        self.assertEqual(len(browser_windows._extra_browsers), 1)
+        extra_b = browser_windows._extra_browsers[0]
+        self.assertIn("nid:802", extra_b.executed_searches)
+
+        # Case 2: No primary browser is open
+        browser_windows._extra_browsers.clear()
+        self.fake_dialogs._dialogs["Browser"][1] = None
+
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([(803, 0.92)], [])), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip"):
+
+            browser_menu.on_find_similar_cards_review_clicked(self.fake_mw)
+
+        # No extra window opened
+        self.assertEqual(len(browser_windows._extra_browsers), 0)
+        # Opened via dialogs.open, which sets the primary browser slot
+        primary_b = self.fake_dialogs._dialogs["Browser"][1]
+        self.assertIsNotNone(primary_b)
+        self.assertIn("nid:803", primary_b.executed_searches)
+
+    def test_open_browser_with_results_with_and_without_open_browser(self):
+        from ankihub_searcher.ui.main_dialog import open_browser_with_results
+
+        # Case 1: Primary browser is open
+        main_browser = MockBrowserWindow(self.fake_mw)
+        main_browser.search_query = "deck:Original"
+        self.fake_dialogs._dialogs["Browser"][1] = main_browser
+
+        open_browser_with_results([(901, 0.9), (902, 0.8)], "Test results")
+
+        # Primary browser untouched
+        self.assertIs(self.fake_dialogs._dialogs["Browser"][1], main_browser)
+        self.assertEqual(main_browser.executed_searches, [])
+        # Extra browser opened
+        self.assertEqual(len(browser_windows._extra_browsers), 1)
+        extra_b = browser_windows._extra_browsers[0]
+        self.assertIn("nid:901,902", extra_b.executed_searches)
+
+        # Case 2: No primary browser is open
+        browser_windows._extra_browsers.clear()
+        self.fake_dialogs._dialogs["Browser"][1] = None
+
+        open_browser_with_results([(903, 0.95)], "Test results 2")
+
+        # No extra browser
+        self.assertEqual(len(browser_windows._extra_browsers), 0)
+        # Primary browser opened via dialogs.open
+        primary_b = self.fake_dialogs._dialogs["Browser"][1]
+        self.assertIsNotNone(primary_b)
+        self.assertIn("nid:903", primary_b.executed_searches)
+
 
 if __name__ == "__main__":
     unittest.main()

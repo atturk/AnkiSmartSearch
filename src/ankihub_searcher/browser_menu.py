@@ -469,19 +469,12 @@ def on_find_similar_cards_review_clicked(parent_window: Any = None) -> None:
     if not nid:
         return
 
-    def _open_or_get_browser() -> Any:
-        try:
-            import aqt
-            if hasattr(aqt, "dialogs") and hasattr(aqt.dialogs, "open"):
-                return aqt.dialogs.open("Browser", target_mw)
-        except Exception as e:
-            print(f"[SmartSearch] Error opening browser dialog: {e}")
-        return None
+    from .browser_windows import get_browser_for_results
 
     run_find_similar(
         selected_nids=[nid],
         parent=target_mw,
-        get_browser=_open_or_get_browser,
+        get_browser=lambda: get_browser_for_results(target_mw),
     )
 
 
