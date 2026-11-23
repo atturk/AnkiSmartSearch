@@ -468,7 +468,7 @@ class TestBrowserWindows(unittest.TestCase):
         extra_b = browser_windows._extra_browsers[0]
         self.assertIn("nid:901,902", extra_b.executed_searches)
 
-        # Case 2: No primary browser is open
+        # Case 2: No primary browser
         browser_windows._extra_browsers.clear()
         self.fake_dialogs._dialogs["Browser"][1] = None
 
@@ -480,6 +480,49 @@ class TestBrowserWindows(unittest.TestCase):
         primary_b = self.fake_dialogs._dialogs["Browser"][1]
         self.assertIsNotNone(primary_b)
         self.assertIn("nid:903", primary_b.executed_searches)
+
+    def test_find_similar_same_window_vs_new_window_and_mode(self):
+        from ankihub_searcher.config_manager import ConfigManager
+
+        starting_browser = MockBrowserWindow(self.fake_mw)
+        starting_browser.search_query = "deck:Bioimmagini"
+        starting_browser._selected_notes = [101]
+
+        cfg = ConfigManager(
+            embed_model="test-embed-model",
+            embed_provider="test",
+            similar_scope="all",
+            similar_min_score=0.65,
+            similar_max_notes=10,
+        )
+        cfg.get_active_model_id = lambda: "test-mid"
+
+        tooltips = []
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([(201, 0.92), (202, 0.88)], [])) as mock_find, \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))):
+
+            # Same window mode: reuses starting_browser, opens 0 extra windows
+            browser_menu.on_find_similar_cards_clicked(starting_browser, new_window=False, mode="structure")
+
+        self.assertEqual(len(browser_windows._extra_browsers), 0)
+        self.assertIn("nid:201,202", starting_browser.executed_searches)
+        self.assertEqual(tooltips[0][0], starting_browser)
+        self.assertIn("[Struttura]", tooltips[0][1])
+        self.assertEqual(mock_find.call_args.kwargs.get("mode"), "structure")
+
+        # Now new_window=True: opens a new window without altering starting_browser again
+        starting_browser.executed_searches.clear()
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.find_similar_notes", return_value=([(301, 0.85)], [])) as mock_find2, \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip"):
+
+            browser_menu.on_find_similar_cards_clicked(starting_browser, new_window=True, mode="tags")
+
+        self.assertEqual(len(browser_windows._extra_browsers), 1)
+        self.assertEqual(starting_browser.executed_searches, [])
+        self.assertIn("nid:301", browser_windows._extra_browsers[0].executed_searches)
+        self.assertEqual(mock_find2.call_args.kwargs.get("mode"), "tags")
 
 
 if __name__ == "__main__":

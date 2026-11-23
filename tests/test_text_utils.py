@@ -7,8 +7,11 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 from ankihub_searcher.text_utils import (
+    build_structural_representation,
     clean_html_and_cloze,
     clean_tags,
+    compute_structural_similarity,
+    extract_primary_field_raw,
     normalize_inline_latex,
     parse_markdown_units,
     parse_keyword_lines,
@@ -223,6 +226,51 @@ apob48
         self.assertEqual(units[1].deck_name, "Farmacologia - 1.3 Farmaci")
         self.assertEqual(units[1].breadcrumb, "Capitolo 1 - Metabolismo > 1.3 Farmaci")
         self.assertEqual(units[1].keywords, ["α-litici", "β-bloccanti"])
+
+    def test_extract_primary_field_raw(self):
+        # Skips Extra field and hidden UUID / image-occlusion fields
+        flds = "Un esempio di {{c1::proiezione}} è la RX\x1fQuesto campo Extra è lungo e non va usato"
+        self.assertEqual(extract_primary_field_raw(flds), "Un esempio di {{c1::proiezione}} è la RX")
+
+        io_flds = "a1b2c3d4e5f6\x1f{{c1::image-occlusion:rect:left=.1:top=.2}}\x1fTitolo Schema"
+        self.assertEqual(extract_primary_field_raw(io_flds), "Titolo Schema")
+
+        self.assertEqual(
+            extract_primary_field_raw("", fallback_clean_text="Prima riga\nSeconda riga"),
+            "Prima riga",
+        )
+
+    def test_structural_similarity_templates_and_non_matches(self):
+        # 1. Exact Italian clinical template with different content slots
+        s_cardio = "Nello shock cardiogeno, il meccanismo centrale è l’insufficienza meccanica del cuore"
+        s_ipovol = "Nello shock ipovolemico, il meccanismo centrale è la perdita significativa di volume"
+        s_unrel = "La formula di Shannon per l'informazione associata a un evento si misura in bit"
+
+        rep_c = build_structural_representation(s_cardio)
+        rep_i = build_structural_representation(s_ipovol)
+        rep_u = build_structural_representation(s_unrel)
+
+        sim_template = compute_structural_similarity(rep_c, rep_i)
+        sim_unrelated = compute_structural_similarity(rep_c, rep_u)
+        self.assertGreaterEqual(sim_template, 0.65)
+        self.assertLess(sim_unrelated, 0.35)
+
+        # 2. Bioimmagini / Patologia Generale cloze & math templates
+        b1 = "Un esempio di tecnologia di imaging che sfrutta la <b>proiezione</b> è {{c1::la radiografia}}"
+        b2 = "Un esempio di tecnologia di imaging che sfrutta la <b>tomografia</b> è {{c1::TAC, RM, PET e SPECT::4}}"
+        sim_bio = compute_structural_similarity(
+            build_structural_representation(b1),
+            build_structural_representation(b2),
+        )
+        self.assertGreaterEqual(sim_bio, 0.85)
+
+        abg1 = r"Un pz mi arriva con<br>\(\ce{pH}\) → 7.24<br>\(\ce{PaCO2}\) → 60 mmHg<br>In questo caso è acidosi respiratoria {{c1::ACUTA::cronica/acuta}}"
+        abg2 = r"Un pz mi arriva con<br>\(\ce{pH}\) → 7.34<br>\(\ce{PaCO2}\) → 60 mmHg<br>In questo caso è acidosi respiratoria {{c1::CRONICA::cronica/acuta}}"
+        sim_abg = compute_structural_similarity(
+            build_structural_representation(abg1),
+            build_structural_representation(abg2),
+        )
+        self.assertGreaterEqual(sim_abg, 0.90)
 
 
 if __name__ == "__main__":

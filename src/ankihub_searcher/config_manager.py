@@ -42,6 +42,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "similar_custom_query": "",
     "similar_min_score": 0.65,
     "similar_max_notes": 20,
+    "similar_default_window": "same",
+    "similar_use_embeddings": True,
+    "similar_use_tags": True,
+    "similar_use_structure": True,
+    "similar_weight_embedding": 0.55,
+    "similar_weight_tags": 0.25,
+    "similar_weight_structure": 0.20,
+    "similar_tag_max_df": 250,
     "menu_location": "tools",
     "fts_use_italian_keywords": False,
     "enable_llm_verification": False,
@@ -103,6 +111,14 @@ class ConfigManager:
     similar_custom_query: str = str(DEFAULT_CONFIG["similar_custom_query"])
     similar_min_score: float = float(DEFAULT_CONFIG["similar_min_score"])
     similar_max_notes: int = int(DEFAULT_CONFIG["similar_max_notes"])
+    similar_default_window: str = str(DEFAULT_CONFIG["similar_default_window"])
+    similar_use_embeddings: bool = bool(DEFAULT_CONFIG["similar_use_embeddings"])
+    similar_use_tags: bool = bool(DEFAULT_CONFIG["similar_use_tags"])
+    similar_use_structure: bool = bool(DEFAULT_CONFIG["similar_use_structure"])
+    similar_weight_embedding: float = float(DEFAULT_CONFIG["similar_weight_embedding"])
+    similar_weight_tags: float = float(DEFAULT_CONFIG["similar_weight_tags"])
+    similar_weight_structure: float = float(DEFAULT_CONFIG["similar_weight_structure"])
+    similar_tag_max_df: int = int(DEFAULT_CONFIG["similar_tag_max_df"])
     menu_location: str = str(DEFAULT_CONFIG.get("menu_location", "tools"))
     fts_use_italian_keywords: bool = bool(DEFAULT_CONFIG.get("fts_use_italian_keywords", False))
     enable_llm_verification: bool = bool(DEFAULT_CONFIG["enable_llm_verification"])

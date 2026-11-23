@@ -2,12 +2,12 @@
 
 Registers the "Smart Search" menu inside Anki's Browser window:
 1. "Cerca con la query corrente…": opens SearchDialog pre-filled with the current browser search query.
-2. "Trova carte simili" (Ctrl+Alt+M): enabled only when at least 1 card is selected;
-   computes cosine similarity across indexed notes using the normalized mean vector of selected notes,
-   and displays matching note IDs in the browser search bar.
-3. Custom browser column "Smart Search: similarità" showing similarity scores of the last search.
-4. Non-modal panel "Carte simili" listing ranked notes with double-click selection in the browser.
-5. Context menu item in the browser table rows.
+2. "Trova carte simili (stessa finestra)" (Ctrl+Alt+M) and "Trova carte simili (nuova finestra)" (Ctrl+Shift+Alt+M):
+   enabled only when at least 1 card is selected; supports multi-criteria search across
+   semantic embeddings, hierarchical IDF-weighted tags, and syntactic/structural sentence similarity.
+3. Submenu "Trova carte simili per criterio" for dedicated Embedding / Tag / Structure searches.
+4. Custom browser column "Smart Search: similarità" showing similarity scores and active criterion breakdown.
+5. Context menu items in the browser table rows.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ from .storage import SearchDatabase
 
 # Global caches for the similarity column in Anki Browser
 _last_similar_scores: Dict[int, float] = {}
+_last_similar_details: Dict[int, Dict[str, float]] = {}
 _last_similar_query: str = ""
 _similar_custom_order_active: bool = False
 _cid_to_nid_cache: Dict[int, int] = {}
@@ -291,6 +292,7 @@ def show_scored_notes_in_browser(
     matched: Sequence[Tuple[int, float]],
     message: str = "",
     parent: Any = None,
+    details: Optional[Dict[int, Dict[str, float]]] = None,
 ) -> None:
     """Shows the given notes in the Browser, ordered by descending score.
 
@@ -303,6 +305,9 @@ def show_scored_notes_in_browser(
 
     _last_similar_scores.clear()
     _last_similar_scores.update({nid: score for nid, score in matched})
+    _last_similar_details.clear()
+    if details:
+        _last_similar_details.update(details)
 
     col = getattr(browser, "col", None) or getattr(parent, "col", None) or (mw.col if mw else None)
     if col:
@@ -340,6 +345,7 @@ def run_find_similar(
     selected_nids: Sequence[int],
     parent: Any,
     get_browser: Callable[[], Any],
+    mode: str = "combined",
 ) -> None:
     """Executes similarity retrieval for selected notes and applies results to a browser window."""
     if not selected_nids:
@@ -347,7 +353,8 @@ def run_find_similar(
 
     config = ConfigManager.load()
     active_mid = config.get_active_model_id()
-    if not active_mid:
+    eff_mode = (mode or "combined").strip().lower()
+    if not active_mid and eff_mode == "embedding":
         show_browser_info(
             parent,
             "Nessun modello di embedding configurato nelle Impostazioni di Smart Search.",
@@ -368,15 +375,26 @@ def run_find_similar(
             q = getattr(config, "similar_custom_query", "").strip()
             if q and c and hasattr(c, "find_notes"):
                 candidate_nids = set(c.find_notes(q))
-        # if scope == "all": candidate_nids remains None (all indexed notes for active model)
+        # if scope == "all": candidate_nids remains None (all collection / indexed notes)
 
+        details: Dict[int, Dict[str, float]] = {}
         matched, missing = find_similar_notes(
             storage=storage,
             selected_nids=list(selected_nids),
-            active_model_id=active_mid,
+            active_model_id=active_mid or "",
             candidate_nids=candidate_nids,
             min_score=getattr(config, "similar_min_score", 0.65),
             max_notes=getattr(config, "similar_max_notes", 20),
+            mode=eff_mode,
+            col=c,
+            use_embeddings=getattr(config, "similar_use_embeddings", True),
+            use_tags=getattr(config, "similar_use_tags", True),
+            use_structure=getattr(config, "similar_use_structure", True),
+            weight_embedding=getattr(config, "similar_weight_embedding", 0.55),
+            weight_tags=getattr(config, "similar_weight_tags", 0.25),
+            weight_structure=getattr(config, "similar_weight_structure", 0.20),
+            tag_max_df=getattr(config, "similar_tag_max_df", 250),
+            details_out=details,
         )
 
         if missing:
@@ -396,6 +414,8 @@ def run_find_similar(
 
         return {
             "matched": matched,
+            "details": details,
+            "mode": eff_mode,
             "min_score": getattr(config, "similar_min_score", 0.65),
             "note_previews": note_previews,
         }
@@ -406,11 +426,18 @@ def run_find_similar(
             return
 
         matched = res.get("matched", [])
+        details = res.get("details", {})
+        res_mode = res.get("mode", eff_mode)
         min_score = res.get("min_score", 0.65)
 
         if not matched:
+            mode_label = {
+                "embedding": " (Embedding)",
+                "tags": " (Tag)",
+                "structure": " (Struttura)",
+            }.get(res_mode, "")
             show_browser_tooltip(
-                parent, f"Nessuna carta simile trovata con similarità ≥ {min_score:.2f}"
+                parent, f"Nessuna carta simile trovata{mode_label} con similarità ≥ {min_score:.2f}"
             )
             return
 
@@ -418,8 +445,17 @@ def run_find_similar(
         if not browser:
             return
 
+        mode_tag = {
+            "embedding": " [Embedding]",
+            "tags": " [Tag]",
+            "structure": " [Struttura]",
+        }.get(res_mode, "")
         show_scored_notes_in_browser(
-            browser, matched, f"Trovate {len(matched)} note simili", parent=parent
+            browser,
+            matched,
+            f"Trovate {len(matched)} note simili{mode_tag}",
+            parent=parent,
+            details=details,
         )
 
     # In Anki: use QueryOp with background thread and progress spinner
@@ -436,8 +472,12 @@ def run_find_similar(
         _on_success(res)
 
 
-def on_find_similar_cards_clicked(browser: Any) -> None:
-    """Executes similarity retrieval for the selected cards in background via QueryOp."""
+def on_find_similar_cards_clicked(
+    browser: Any,
+    new_window: bool = True,
+    mode: str = "combined",
+) -> None:
+    """Executes similarity retrieval for selected cards, in same window or new Browser window."""
     selected_nids: List[int] = []
     if hasattr(browser, "selected_notes"):
         try:
@@ -448,17 +488,26 @@ def on_find_similar_cards_clicked(browser: Any) -> None:
     if not selected_nids:
         return
 
-    from .browser_windows import open_new_browser
+    if new_window:
+        from .browser_windows import open_new_browser
 
-    target_mw = getattr(browser, "mw", None) or mw
+        target_mw = getattr(browser, "mw", None) or mw
+        get_target_browser = lambda: open_new_browser(target_mw)
+    else:
+        get_target_browser = lambda: browser
+
     run_find_similar(
         selected_nids=selected_nids,
         parent=browser,
-        get_browser=lambda: open_new_browser(target_mw),
+        get_browser=get_target_browser,
+        mode=mode,
     )
 
 
-def on_find_similar_cards_review_clicked(parent_window: Any = None) -> None:
+def on_find_similar_cards_review_clicked(
+    parent_window: Any = None,
+    mode: str = "combined",
+) -> None:
     """Executes similarity retrieval for the currently reviewed card in Anki reviewer."""
     target_mw = parent_window or mw
     if not target_mw:
@@ -475,6 +524,7 @@ def on_find_similar_cards_review_clicked(parent_window: Any = None) -> None:
         selected_nids=[nid],
         parent=target_mw,
         get_browser=lambda: get_browser_for_results(target_mw),
+        mode=mode,
     )
 
 
@@ -533,18 +583,75 @@ def _open_search_from_browser(browser: Any) -> None:
 
 
 def _update_similar_action_state(browser: Any) -> None:
-    """Enables 'Trova carte simili' only when at least 1 card is selected in the browser."""
-    act = getattr(browser, "_smart_search_similar_action", None)
-    if act is not None:
+    """Enables 'Trova carte simili' actions only when at least 1 card is selected in the browser."""
+    try:
+        has_sel = (
+            bool(browser.selected_notes())
+            if hasattr(browser, "selected_notes")
+            else False
+        )
+    except Exception:
+        has_sel = False
+
+    acts: List[Any] = []
+    single_act = getattr(browser, "_smart_search_similar_action", None)
+    if single_act is not None:
+        acts.append(single_act)
+    extra_acts = getattr(browser, "_smart_search_similar_actions", None)
+    if isinstance(extra_acts, (list, tuple)):
+        for a in extra_acts:
+            if a is not None and a not in acts:
+                acts.append(a)
+
+    for act in acts:
         try:
-            has_sel = (
-                bool(browser.selected_notes())
-                if hasattr(browser, "selected_notes")
-                else False
-            )
             act.setEnabled(has_sel)
         except Exception:
             pass
+
+
+def _populate_mode_submenu(
+    sub_menu: Any,
+    browser: Any,
+    has_sel: bool,
+    tracked_actions: Optional[List[Any]] = None,
+) -> None:
+    """Populates a submenu with dedicated Embedding / Tag / Structure similarity actions."""
+    same_items = [
+        ("Solo Embedding (stessa finestra)", "embedding", False),
+        ("Solo Tag (stessa finestra)", "tags", False),
+        ("Solo Struttura della frase (stessa finestra)", "structure", False),
+    ]
+    new_items = [
+        ("Solo Embedding (nuova finestra)", "embedding", True),
+        ("Solo Tag (nuova finestra)", "tags", True),
+        ("Solo Struttura della frase (nuova finestra)", "structure", True),
+    ]
+
+    for label, mode_name, is_new in same_items:
+        act = sub_menu.addAction(label)
+        act.setEnabled(has_sel)
+        act.triggered.connect(
+            lambda _checked=False, m=mode_name, nw=is_new: on_find_similar_cards_clicked(
+                browser, new_window=nw, mode=m
+            )
+        )
+        if tracked_actions is not None:
+            tracked_actions.append(act)
+
+    if hasattr(sub_menu, "addSeparator"):
+        sub_menu.addSeparator()
+
+    for label, mode_name, is_new in new_items:
+        act = sub_menu.addAction(label)
+        act.setEnabled(has_sel)
+        act.triggered.connect(
+            lambda _checked=False, m=mode_name, nw=is_new: on_find_similar_cards_clicked(
+                browser, new_window=nw, mode=m
+            )
+        )
+        if tracked_actions is not None:
+            tracked_actions.append(act)
 
 
 def _update_mw_similar_action_state(
@@ -628,25 +735,55 @@ def populate_smart_search_menu(
     actions["search_current"] = act_current
 
     # 3. Trova carte simili
-    act_similar = menu.addAction("Trova carte simili")
-    if hasattr(act_similar, "setShortcut"):
-        # Scorciatoia Ctrl+Alt+M: verificato sul form del Browser di Anki che Ctrl+Shift+S
-        # è già occupata da "Riposiziona" e Ctrl+Alt+S è occupata da "Inverti selezione".
-        act_similar.setShortcut("Ctrl+Alt+M")
     if browser is not None:
         has_sel = (
             bool(browser.selected_notes())
             if hasattr(browser, "selected_notes")
             else False
         )
-        act_similar.setEnabled(has_sel)
-        act_similar.triggered.connect(
-            lambda _checked=False: on_find_similar_cards_clicked(browser)
+        tracked_acts: List[Any] = []
+
+        # Scorciatoia Ctrl+Alt+M: verificato sul form del Browser di Anki che Ctrl+Shift+S
+        # è già occupata da "Riposiziona" e Ctrl+Alt+S è occupata da "Inverti selezione".
+        act_similar_same = menu.addAction("Trova carte simili (stessa finestra)")
+        if hasattr(act_similar_same, "setShortcut"):
+            act_similar_same.setShortcut("Ctrl+Alt+M")
+        act_similar_same.setEnabled(has_sel)
+        act_similar_same.triggered.connect(
+            lambda _checked=False: on_find_similar_cards_clicked(
+                browser, new_window=False, mode="combined"
+            )
         )
-        setattr(browser, "_smart_search_similar_action", act_similar)
+        tracked_acts.append(act_similar_same)
+        actions["find_similar"] = act_similar_same
+        actions["find_similar_same"] = act_similar_same
+
+        act_similar_new = menu.addAction("Trova carte simili (nuova finestra)")
+        if hasattr(act_similar_new, "setShortcut"):
+            act_similar_new.setShortcut("Ctrl+Shift+Alt+M")
+        act_similar_new.setEnabled(has_sel)
+        act_similar_new.triggered.connect(
+            lambda _checked=False: on_find_similar_cards_clicked(
+                browser, new_window=True, mode="combined"
+            )
+        )
+        tracked_acts.append(act_similar_new)
+        actions["find_similar_new"] = act_similar_new
+
+        if hasattr(menu, "addMenu"):
+            sub_menu = menu.addMenu("Trova carte simili per criterio")
+            if sub_menu is not None:
+                _populate_mode_submenu(sub_menu, browser, has_sel, tracked_acts)
+                actions["find_similar_by_mode"] = sub_menu
+
+        setattr(browser, "_smart_search_similar_action", act_similar_same)
+        setattr(browser, "_smart_search_similar_actions", tracked_acts)
         if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):
             menu.aboutToShow.connect(lambda: _update_similar_action_state(browser))
     else:
+        act_similar = menu.addAction("Trova carte simili")
+        if hasattr(act_similar, "setShortcut"):
+            act_similar.setShortcut("Ctrl+Alt+M")
         target_mw = parent_window or mw
         act_similar.triggered.connect(
             lambda _checked=False: on_find_similar_cards_review_clicked(target_mw)
@@ -656,7 +793,7 @@ def populate_smart_search_menu(
         _update_mw_similar_action_state(target_mw, act_similar)
         if hasattr(menu, "aboutToShow") and hasattr(menu.aboutToShow, "connect"):
             menu.aboutToShow.connect(lambda: _update_mw_similar_action_state(target_mw, act_similar))
-    actions["find_similar"] = act_similar
+        actions["find_similar"] = act_similar
 
     menu.addSeparator()
 
@@ -715,14 +852,34 @@ def on_browser_did_change_row(browser: Any) -> None:
 
 
 def on_browser_will_show_context_menu(browser: Any, menu: Any) -> None:
-    """Adds 'Trova carte simili' to the Browser row context menu."""
+    """Adds 'Trova carte simili' (same/new window + by-criterion submenu) to the Browser row context menu."""
     try:
-        act = menu.addAction("Smart Search: Trova carte simili")
-        if hasattr(act, "setShortcut"):
-            act.setShortcut("Ctrl+Alt+M")
         has_sel = bool(browser.selected_notes()) if hasattr(browser, "selected_notes") else False
-        act.setEnabled(has_sel)
-        act.triggered.connect(lambda _checked=False: on_find_similar_cards_clicked(browser))
+
+        act_same = menu.addAction("Smart Search: Trova carte simili (stessa finestra)")
+        if hasattr(act_same, "setShortcut"):
+            act_same.setShortcut("Ctrl+Alt+M")
+        act_same.setEnabled(has_sel)
+        act_same.triggered.connect(
+            lambda _checked=False: on_find_similar_cards_clicked(
+                browser, new_window=False, mode="combined"
+            )
+        )
+
+        act_new = menu.addAction("Smart Search: Trova carte simili (nuova finestra)")
+        if hasattr(act_new, "setShortcut"):
+            act_new.setShortcut("Ctrl+Shift+Alt+M")
+        act_new.setEnabled(has_sel)
+        act_new.triggered.connect(
+            lambda _checked=False: on_find_similar_cards_clicked(
+                browser, new_window=True, mode="combined"
+            )
+        )
+
+        if hasattr(menu, "addMenu"):
+            sub_menu = menu.addMenu("Smart Search: Trova simili per criterio")
+            if sub_menu is not None:
+                _populate_mode_submenu(sub_menu, browser, has_sel)
     except Exception as e:
         print(f"[SmartSearch] Error in browser_will_show_context_menu: {e}")
 
@@ -752,12 +909,14 @@ def on_browser_did_fetch_row(
         return
 
     score: Optional[float] = None
+    target_nid: Optional[int] = None
     if is_notes_mode:
+        target_nid = item
         score = _last_similar_scores.get(item)
     else:
         if item in _cid_to_nid_cache:
-            nid = _cid_to_nid_cache[item]
-            score = _last_similar_scores.get(nid)
+            target_nid = _cid_to_nid_cache[item]
+            score = _last_similar_scores.get(target_nid)
         else:
             try:
                 from aqt import mw
@@ -766,11 +925,23 @@ def on_browser_did_fetch_row(
                     card = mw.col.get_card(item)
                     if card:
                         _cid_to_nid_cache[item] = card.nid
+                        target_nid = card.nid
                         score = _last_similar_scores.get(card.nid)
             except Exception:
                 pass
 
-    score_str = f"{score:.2f}" if score is not None else ""
+    if score is not None:
+        comp = _last_similar_details.get(target_nid) if target_nid is not None else None
+        if comp and len(comp) >= 2:
+            parts = [f"{k}:{comp[k]:.2f}" for k in ("E", "T", "S") if k in comp and comp[k] >= 0.05]
+            if parts:
+                score_str = f"{score:.2f} ({' '.join(parts)})"
+            else:
+                score_str = f"{score:.2f}"
+        else:
+            score_str = f"{score:.2f}"
+    else:
+        score_str = ""
     try:
         from aqt.browser import Cell
 

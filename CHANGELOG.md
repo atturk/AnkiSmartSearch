@@ -2,6 +2,29 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.6.0] - 2026-11-23
+
+### Novità
+- **QoL nel Browser — Ricerca nella stessa finestra vs Nuova finestra:**
+  - Nel menu `Smart Search` del Browser e nel menu tasto destro sulle righe della tabella sono ora disponibili direttamente entrambe le opzioni:
+    - **Trova carte simili (stessa finestra)** con scorciatoia `Ctrl+Alt+M` (`Cmd+Opt+M` su Mac) per sostituire la ricerca nella finestra Browser corrente senza moltiplicare le finestre.
+    - **Trova carte simili (nuova finestra)** con scorciatoia `Ctrl+Shift+Alt+M` (`Cmd+Shift+Opt+M` su Mac) per aprire una nuova finestra nativa del Browser preservando selezione e query di partenza.
+  - Nuovo sottomenu **Trova carte simili per criterio** (sia nel menu Browser che nel menu contestuale) per lanciare ricerche dedicate: *Solo Embedding*, *Solo Tag*, *Solo Struttura della frase* (ciascuna in stessa finestra o nuova finestra).
+- **Ricerca intelligente tramite Tag (`Solo Tag` e modalità Combinata):**
+  - Calcola la similarità sui tag gerarchici delle note con pesatura statistica **$\text{IDF}^2$** (match esatto su tag foglia + match attenuato sul nodo padre di livello superiore per recuperare carte "cugine" nella stessa sezione di risorsa/capitolo).
+  - **Filtro automatico e generico del rumore tramite Document Frequency ($\text{DF}$):** tag generici o di manutenzione troppo diffusi nella collezione vengono scartati statisticamente in base alla soglia `similar_tag_max_df` (default `250`, con scala dinamica anche su mazzi piccoli), senza alcuna regola o nome di tag hardcodato.
+- **Ricerca tramite similarità sintattica/strutturale della frase (`Solo Struttura` e modalità Combinata):**
+  - Confronta lo scheletro sintattico-lessicale del **campo primario della nota** (escludendo `Extra`, media e campi ID nascosti) tramite una metrica composita senza dipendenze esterne: Word/Skeleton **ROUGE-L (LCS)** su token e scheletri con `<CLOZE>`, `<MATH>` e `<NUM>` mascherati, allineamento su scheletro **POS closed-class (IT/EN)**, **n-grammi di template**, prefisso iniziale e hint dei cloze.
+  - Ideale per recuperare serie di carte con struttura parallela (es. *"Nello shock cardiogeno, il meccanismo centrale è..."* ↔ *"Nello shock ipovolemico, il meccanismo centrale è..."*, oppure domande parallele di Bioimmagini/Clinica) anche quando hanno argomenti o tag differenti.
+- **Fusione sinergica multi-criterio e supporto a carte non ancora indicizzate:**
+  - La modalità **Combinata** fonde Embedding semantici, Tag e Struttura della frase con formula sinergica (*Best-Criterion Anchor + Multi-Criterion Boost*).
+  - Le ricerche per **Tag**, **Struttura** e **Combinata** leggono direttamente le note dalla collezione Anki e funzionano subito anche su carte personali appena create che non possiedono ancora un vettore embedding in `smart_search.db`.
+- **Impostazioni e Colonna Browser:**
+  - Nuova sezione **Criteri di Similarità (Combinata)** in `Impostazioni → Carte simili` per attivare/disattivare i singoli criteri, regolarne i pesi (`0.55` Embedding / `0.25` Tag / `0.20` Struttura) e configurare `similar_tag_max_df`.
+  - La colonna `Smart Search: similarità` nel Browser mostra ora anche il breakdown dei criteri attivi (es. `0.84 (E:0.81 T:0.90)`).
+
+---
+
 ## [0.5.3] - 2026-11-12
 
 ### Novità

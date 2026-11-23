@@ -30,15 +30,20 @@ Paste your Italian lecture unit (or an entire Markdown document with multiple un
   - Caches embeddings in a local WAL SQLite database scoped by `provider::model`.
   - Instant commit after every 32-note batch — pause and resume anytime with 0% progress lost.
   - Includes a **Smart Tag Cleaner** (strips `#AK_Step1_v12`, `AnKing_Image`, `AMBOSS` hashes, etc.) and per-Note-Type field selection.
-- **🔍 Trova carte simili ovunque (`Ctrl+Alt+M`):**
-  - Nel Browser e durante la revisione delle carte (`review`), trova istantaneamente le carte simili alla nota corrente aprendo una nuova finestra del Browser con ordinamento per similarità decrescente, conservando la ricerca e la selezione della finestra di partenza.
+- **🔍 Trova carte simili multi-criterio (`Ctrl+Alt+M` / `Ctrl+Shift+Alt+M`):**
+  - **Stessa finestra vs Nuova finestra nel Browser:** Scegli istantaneamente dal menu tasto destro o da scorciatoia se cercare nella finestra corrente (`Ctrl+Alt+M`) oppure aprire una nuova finestra del Browser (`Ctrl+Shift+Alt+M`) preservando la ricerca di partenza. Disponibile anche durante la revisione (`review`).
+  - **Fusione intelligente Embedding + Tag + Struttura della frase:**
+    - **Embedding semantici** dai vettori indicizzati.
+    - **Tag gerarchici (IDF² + filtro DF generico):** trova carte correlate anche tramite tag condivisi o nodi padre di risorsa/argomento, filtrando automaticamente i tag di rumore troppo frequenti senza hardcoding.
+    - **Similarità sintattica/strutturale della frase:** individua carte con lo stesso schema espositivo/template (LCS su token e scheletro `<CLOZE>`/`<NUM>`/`<MATH>`, scheletro POS IT/EN, bigrammi e hint dei cloze) anche su note personali non ancora indicizzate con embedding.
+  - Sottomenu dedicato per cercare **Solo Embedding**, **Solo Tag** o **Solo Struttura**, colonna `Smart Search: similarità` con breakdown `0.84 (E:0.81 T:0.90)` e pesi personalizzabili in `Impostazioni → Carte simili`.
 
 ---
 
 ## 📦 Installation
 
 ### Option A: Install from Release `.ankiaddon`
-1. Download the latest **`AnkiHubSearcher.ankiaddon`** (or `dist/AnkiHubSearcher-v0.5.1.ankiaddon`) from the [Releases page](https://github.com/atturk/AnkiSmartSearch/releases).
+1. Download the latest **`AnkiHubSearcher.ankiaddon`** (or `dist/AnkiHubSearcher-v0.6.0.ankiaddon`) from the [Releases page](https://github.com/atturk/AnkiSmartSearch/releases).
 2. In Anki, go to **Tools → Add-ons → Install from file...** and select the `.ankiaddon` file.
 3. Restart Anki and open **Tools → AnkiHub Smart Searcher...** (`Ctrl+Shift+F` / `Cmd+Shift+F`).
 

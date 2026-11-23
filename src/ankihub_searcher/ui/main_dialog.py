@@ -225,7 +225,7 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.5.3"
+CURRENT_VERSION = "0.6.0"
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1819,7 +1819,7 @@ class SettingsDialog(QDialog):
         row_similar_scope.addWidget(QLabel("Ambito di ricerca:"))
         self.combo_similar_scope = QComboBox()
         self.combo_similar_scope.addItem("Query Smart Search salvata", "query")
-        self.combo_similar_scope.addItem("Tutte le note indicizzate", "all")
+        self.combo_similar_scope.addItem("Tutte le note (collezione / indicizzate)", "all")
         self.combo_similar_scope.addItem("Query personalizzata", "custom")
         self.combo_similar_scope.currentIndexChanged.connect(self._on_similar_scope_changed)
         row_similar_scope.addWidget(self.combo_similar_scope)
@@ -1850,6 +1850,63 @@ class SettingsDialog(QDialog):
         similar_layout.addLayout(row_similar_params)
 
         tab_similar_layout.addWidget(similar_group)
+
+        criteria_group = QGroupBox("Criteri di Similarità (Combinata)")
+        criteria_layout = QVBoxLayout(criteria_group)
+
+        row_crit_emb = QHBoxLayout()
+        self.chk_sim_use_emb = QCheckBox("Usa Embedding (similarità semantica)")
+        self.chk_sim_use_emb.setChecked(bool(getattr(self.config, "similar_use_embeddings", True)))
+        row_crit_emb.addWidget(self.chk_sim_use_emb)
+        row_crit_emb.addStretch()
+        row_crit_emb.addWidget(QLabel("Peso:"))
+        self.spin_sim_weight_emb = QDoubleSpinBox()
+        self.spin_sim_weight_emb.setRange(0.05, 1.00)
+        self.spin_sim_weight_emb.setSingleStep(0.05)
+        self.spin_sim_weight_emb.setDecimals(2)
+        self.spin_sim_weight_emb.setValue(float(getattr(self.config, "similar_weight_embedding", 0.55)))
+        row_crit_emb.addWidget(self.spin_sim_weight_emb)
+        criteria_layout.addLayout(row_crit_emb)
+
+        row_crit_tags = QHBoxLayout()
+        self.chk_sim_use_tags = QCheckBox("Usa Tag (gerarchia e IDF statistico)")
+        self.chk_sim_use_tags.setChecked(bool(getattr(self.config, "similar_use_tags", True)))
+        row_crit_tags.addWidget(self.chk_sim_use_tags)
+        row_crit_tags.addStretch()
+        row_crit_tags.addWidget(QLabel("Peso:"))
+        self.spin_sim_weight_tags = QDoubleSpinBox()
+        self.spin_sim_weight_tags.setRange(0.05, 1.00)
+        self.spin_sim_weight_tags.setSingleStep(0.05)
+        self.spin_sim_weight_tags.setDecimals(2)
+        self.spin_sim_weight_tags.setValue(float(getattr(self.config, "similar_weight_tags", 0.25)))
+        row_crit_tags.addWidget(self.spin_sim_weight_tags)
+        criteria_layout.addLayout(row_crit_tags)
+
+        row_crit_struct = QHBoxLayout()
+        self.chk_sim_use_struct = QCheckBox("Usa Struttura della frase (template sintattico/lessicale)")
+        self.chk_sim_use_struct.setChecked(bool(getattr(self.config, "similar_use_structure", True)))
+        row_crit_struct.addWidget(self.chk_sim_use_struct)
+        row_crit_struct.addStretch()
+        row_crit_struct.addWidget(QLabel("Peso:"))
+        self.spin_sim_weight_struct = QDoubleSpinBox()
+        self.spin_sim_weight_struct.setRange(0.05, 1.00)
+        self.spin_sim_weight_struct.setSingleStep(0.05)
+        self.spin_sim_weight_struct.setDecimals(2)
+        self.spin_sim_weight_struct.setValue(float(getattr(self.config, "similar_weight_structure", 0.20)))
+        row_crit_struct.addWidget(self.spin_sim_weight_struct)
+        criteria_layout.addLayout(row_crit_struct)
+
+        row_tag_df = QHBoxLayout()
+        row_tag_df.addWidget(QLabel("Max note per tag informativo (filtro rumore DF):"))
+        self.spin_sim_tag_max_df = QSpinBox()
+        self.spin_sim_tag_max_df.setRange(10, 2000)
+        self.spin_sim_tag_max_df.setSingleStep(10)
+        self.spin_sim_tag_max_df.setValue(int(getattr(self.config, "similar_tag_max_df", 250)))
+        row_tag_df.addWidget(self.spin_sim_tag_max_df)
+        row_tag_df.addStretch()
+        criteria_layout.addLayout(row_tag_df)
+
+        tab_similar_layout.addWidget(criteria_group)
         tab_similar_layout.addStretch()
 
         self.tab_widget.addTab(self._wrap_scroll(tab_similar), "Carte simili")
@@ -2087,6 +2144,14 @@ class SettingsDialog(QDialog):
         self.spin_similar_score.setValue(getattr(self.config, "similar_min_score", 0.70))
         self.spin_similar_max_notes.setValue(getattr(self.config, "similar_max_notes", 20))
 
+        self.chk_sim_use_emb.setChecked(bool(getattr(self.config, "similar_use_embeddings", True)))
+        self.chk_sim_use_tags.setChecked(bool(getattr(self.config, "similar_use_tags", True)))
+        self.chk_sim_use_struct.setChecked(bool(getattr(self.config, "similar_use_structure", True)))
+        self.spin_sim_weight_emb.setValue(float(getattr(self.config, "similar_weight_embedding", 0.55)))
+        self.spin_sim_weight_tags.setValue(float(getattr(self.config, "similar_weight_tags", 0.25)))
+        self.spin_sim_weight_struct.setValue(float(getattr(self.config, "similar_weight_structure", 0.20)))
+        self.spin_sim_tag_max_df.setValue(int(getattr(self.config, "similar_tag_max_df", 250)))
+
         idx_menu = self.combo_menu_location.findData(getattr(self.config, "menu_location", "tools"))
         if idx_menu != -1:
             self.combo_menu_location.setCurrentIndex(idx_menu)
@@ -2312,6 +2377,13 @@ class SettingsDialog(QDialog):
         self.config.similar_custom_query = self.txt_similar_custom.text().strip()
         self.config.similar_min_score = round(self.spin_similar_score.value(), 2)
         self.config.similar_max_notes = self.spin_similar_max_notes.value()
+        self.config.similar_use_embeddings = self.chk_sim_use_emb.isChecked()
+        self.config.similar_use_tags = self.chk_sim_use_tags.isChecked()
+        self.config.similar_use_structure = self.chk_sim_use_struct.isChecked()
+        self.config.similar_weight_embedding = round(self.spin_sim_weight_emb.value(), 2)
+        self.config.similar_weight_tags = round(self.spin_sim_weight_tags.value(), 2)
+        self.config.similar_weight_structure = round(self.spin_sim_weight_struct.value(), 2)
+        self.config.similar_tag_max_df = self.spin_sim_tag_max_df.value()
         self.config.menu_location = self.combo_menu_location.currentData() or "tools"
 
         # Save selected fields for active model

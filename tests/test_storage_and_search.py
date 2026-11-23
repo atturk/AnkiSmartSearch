@@ -2493,12 +2493,18 @@ I should decompose this into atomic concepts.
                 self.title = title
                 self.parent = parent
                 self.actions = []
+                self.submenus = []
                 self._about_to_show_cbs = []
 
             def addAction(self, text):
                 act = MockAction(text)
                 self.actions.append(act)
                 return act
+
+            def addMenu(self, title):
+                sub = MockMenu(title, parent=self)
+                self.submenus.append(sub)
+                return sub
 
             def addSeparator(self):
                 pass
@@ -2549,45 +2555,54 @@ I should decompose this into atomic concepts.
         self.assertEqual(len(browser.form.menubar.menus), 1)
         menu = browser.form.menubar.menus[0]
         self.assertEqual(menu.title, "Smart Search")
-        # 7 unified actions
-        self.assertEqual(len(menu.actions), 7)
+        # 8 top-level actions (Nuova ricerca, Cerca con query, Trova simili stessa finestra, Trova simili nuova finestra, Cronologia, Indicizzazione, Impostazioni, Aggiornamenti) + 1 submenu
+        self.assertEqual(len(menu.actions), 8)
+        self.assertEqual(len(menu.submenus), 1)
+        self.assertEqual(menu.submenus[0].title, "Trova carte simili per criterio")
+        self.assertEqual(len(menu.submenus[0].actions), 6)
 
         act_new = menu.actions[0]
         act_search = menu.actions[1]
-        act_similar = menu.actions[2]
-        act_history = menu.actions[3]
-        act_index = menu.actions[4]
-        act_settings = menu.actions[5]
-        act_updates = menu.actions[6]
+        act_similar_same = menu.actions[2]
+        act_similar_new = menu.actions[3]
+        act_history = menu.actions[4]
+        act_index = menu.actions[5]
+        act_settings = menu.actions[6]
+        act_updates = menu.actions[7]
 
         self.assertEqual(act_new.text, "Nuova ricerca…")
         self.assertEqual(act_new.shortcut, "Ctrl+Shift+F")
         self.assertEqual(act_search.text, "Cerca con la query corrente…")
         self.assertTrue(act_search.enabled)
 
-        self.assertEqual(act_similar.text, "Trova carte simili")
-        self.assertEqual(act_similar.shortcut, "Ctrl+Alt+M")
+        self.assertEqual(act_similar_same.text, "Trova carte simili (stessa finestra)")
+        self.assertEqual(act_similar_same.shortcut, "Ctrl+Alt+M")
+        self.assertEqual(act_similar_new.text, "Trova carte simili (nuova finestra)")
+        self.assertEqual(act_similar_new.shortcut, "Ctrl+Shift+Alt+M")
         self.assertEqual(act_history.text, "Cronologia")
         self.assertEqual(act_index.text, "Indicizzazione")
         self.assertEqual(act_settings.text, "Impostazioni")
         self.assertEqual(act_updates.text, "Verifica aggiornamenti")
 
-        # Initial selection is empty -> act_similar disabled
-        self.assertFalse(act_similar.enabled)
+        # Initial selection is empty -> similar actions disabled
+        self.assertFalse(act_similar_same.enabled)
+        self.assertFalse(act_similar_new.enabled)
 
         # 2. Test selection toggle
         browser._selected = [501]
         _update_similar_action_state(browser)
-        self.assertTrue(act_similar.enabled)
+        self.assertTrue(act_similar_same.enabled)
+        self.assertTrue(act_similar_new.enabled)
 
         browser._selected = []
         _update_similar_action_state(browser)
-        self.assertFalse(act_similar.enabled)
+        self.assertFalse(act_similar_same.enabled)
+        self.assertFalse(act_similar_new.enabled)
 
         # 3. Test get_browser_search_text
         self.assertEqual(get_browser_search_text(browser), '"deck:AnKing"')
 
-        # 4. Test "Trova carte simili" execution
+        # 4. Test "Trova carte simili (nuova finestra)" execution
         browser._selected = [501]
         new_browser = MockBrowser(col=col, selected_nids=[], current_search_str="")
         with patch.object(ConfigManager, "load") as mock_load:
@@ -2604,7 +2619,7 @@ I should decompose this into atomic concepts.
 
             with patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage), \
                  patch("ankihub_searcher.browser_windows.open_new_browser", return_value=new_browser):
-                act_similar.trigger()
+                act_similar_new.trigger()
 
         # Originating browser search is untouched
         self.assertEqual(browser.executed_searches, [])
@@ -2612,7 +2627,13 @@ I should decompose this into atomic concepts.
         # New browser window received the similarity search query
         self.assertIn("nid:502,503", new_browser.executed_searches)
 
-        # 5. Test context menu hook (Item 20d)
+        # 4b. Test "Trova carte simili (stessa finestra)" execution
+        with patch.object(ConfigManager, "load", return_value=cfg), \
+             patch("ankihub_searcher.browser_menu.SearchDatabase", return_value=self.storage):
+            act_similar_same.trigger()
+        self.assertIn("nid:502,503", browser.executed_searches)
+
+        # 5. Test context menu hook (Item 20d + v0.6.0 same/new window & submenu)
         from ankihub_searcher.browser_menu import (
             on_browser_will_show_context_menu,
             on_browser_did_fetch_columns,
@@ -2623,10 +2644,16 @@ I should decompose this into atomic concepts.
 
         ctx_menu = MockMenu("Context")
         on_browser_will_show_context_menu(browser, ctx_menu)
-        self.assertEqual(len(ctx_menu.actions), 1)
-        self.assertEqual(ctx_menu.actions[0].text, "Smart Search: Trova carte simili")
+        self.assertEqual(len(ctx_menu.actions), 2)
+        self.assertEqual(ctx_menu.actions[0].text, "Smart Search: Trova carte simili (stessa finestra)")
         self.assertEqual(ctx_menu.actions[0].shortcut, "Ctrl+Alt+M")
         self.assertTrue(ctx_menu.actions[0].enabled)
+        self.assertEqual(ctx_menu.actions[1].text, "Smart Search: Trova carte simili (nuova finestra)")
+        self.assertEqual(ctx_menu.actions[1].shortcut, "Ctrl+Shift+Alt+M")
+        self.assertTrue(ctx_menu.actions[1].enabled)
+        self.assertEqual(len(ctx_menu.submenus), 1)
+        self.assertEqual(ctx_menu.submenus[0].title, "Smart Search: Trova simili per criterio")
+        self.assertEqual(len(ctx_menu.submenus[0].actions), 6)
 
         # 6. Test custom column registration and row fetching (Item 20c)
         columns_dict = {}
@@ -3075,10 +3102,21 @@ print("__JSON_RESULT__" + json.dumps(output))
         b_menu = MockMenu("Smart Search")
         acts_b = populate_smart_search_menu(b_menu, parent_window=browser, browser=browser)
 
-        self.assertEqual([a.text for a in b_menu.actions], expected_labels)
+        expected_browser_labels = [
+            "Nuova ricerca…",
+            "Cerca con la query corrente…",
+            "Trova carte simili (stessa finestra)",
+            "Trova carte simili (nuova finestra)",
+            "Cronologia",
+            "Indicizzazione",
+            "Impostazioni",
+            "Verifica aggiornamenti",
+        ]
+        self.assertEqual([a.text for a in b_menu.actions], expected_browser_labels)
         self.assertTrue(acts_b["new_search"].enabled)
         self.assertTrue(acts_b["search_current"].enabled)
-        self.assertTrue(acts_b["find_similar"].enabled)
+        self.assertTrue(acts_b["find_similar_same"].enabled)
+        self.assertTrue(acts_b["find_similar_new"].enabled)
 
         # 3. Test init_addon with menu_location='tools' vs 'menubar'
         class FakeMenubar:
@@ -3894,12 +3932,18 @@ class TestFindSimilarReviewMode(unittest.TestCase):
                 self.title = title
                 self.parent = parent
                 self.actions = []
+                self.submenus = []
                 self._about_to_show_cbs = []
 
             def addAction(self, text):
                 act = MockAction(text)
                 self.actions.append(act)
                 return act
+
+            def addMenu(self, title):
+                sub = MockMenu(title, parent=self)
+                self.submenus.append(sub)
+                return sub
 
             def addSeparator(self):
                 pass
@@ -4156,4 +4200,200 @@ class TestSearchDialogCloseBeforeSummary(unittest.TestCase):
             )
             mock_new_dlg.exec.assert_called_once()
 
+        col.conn.close()
+
+
+class TestV060TagAndStructuralSimilarity(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp_dir.name, "test_v060.db")
+        self.storage = SearchDatabase(db_path=self.db_path)
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_tag_similarity_statistical_filtering_and_hierarchy(self):
+        from ankihub_searcher.search_pipeline import compute_tag_similarity_scores
+
+        # Build a 50-note synthetic dataset where a generic tag appears on 45 notes (> 20% = 10)
+        # without any hardcoded tag names!
+        notes_tags = {}
+        for nid in range(1, 51):
+            tags = ["Generic_Noise_Tag::Category_A"]
+            if nid in (1, 2, 3):
+                # QID shared specifically among notes 1, 2, 3
+                tags.append("ExamBank::QID::998877")
+            if nid in (1, 2):
+                tags.append("Book::Cardio::Shock::Cardiogenic")
+            elif nid == 3:
+                # Sister tag under Book::Cardio::Shock
+                tags.append("Book::Cardio::Shock::Hypovolemic")
+            elif nid == 4:
+                # Only shares the high-frequency noise tag
+                pass
+            else:
+                tags.append(f"Other::Topic_{nid // 5}")
+            notes_tags[nid] = tags
+
+        scores, has_tags = compute_tag_similarity_scores(
+            selected_nids=[1],
+            notes_tags=notes_tags,
+            max_tag_df=250,
+        )
+        self.assertTrue(has_tags)
+        # Note 2 shares both QID and exact leaf -> highest score
+        self.assertIn(2, scores)
+        self.assertGreater(scores[2], 0.80)
+        # Note 3 shares QID + parent Book::Cardio::Shock -> high score
+        self.assertIn(3, scores)
+        self.assertGreater(scores[3], 0.55)
+        self.assertGreater(scores[2], scores[3])
+        # Note 4 ONLY shared Generic_Noise_Tag (df=50 > eff_max_df=10) -> filtered out completely!
+        self.assertNotIn(4, scores)
+
+    def test_find_similar_notes_modes_combined_tags_structure_and_unindexed(self):
+        from ankihub_searcher.search_pipeline import find_similar_notes
+
+        mid = "test-v060-mid"
+        col = MockAnkiCol()
+        # Insert notes into MockAnkiCol (including note 10 which has NO embedding yet!)
+        notes_rows = [
+            (10, 1, 100, "Nello shock cardiogeno, il meccanismo centrale è l’insufficienza meccanica del cuore\x1fExtra info", "Cardio::Shock::Cardiogeno"),
+            (11, 1, 100, "Nello shock ipovolemico, il meccanismo centrale è la perdita significativa di volume\x1fExtra info", "Cardio::Shock::Ipovolemico"),
+            (12, 1, 100, "La pressione arteriosa media dipende da gittata cardiaca e resistenze periferiche\x1fExtra", "Cardio::Shock::Cardiogeno Cardio::Emodinamica"),
+            (13, 1, 100, "La glicolisi anaerobica produce due molecole di ATP e lattato nel citosol\x1fExtra", "Biochimica::Metabolismo"),
+            (14, 1, 100, "Il potenziale d'azione neuronale dipende dall'apertura dei canali del sodio\x1fExtra", "Neuro::Sinapsi"),
+            (15, 1, 100, "La compliance polmonare aumenta nell'enfisema per perdita di fibre elastiche\x1fExtra", "Pneumo::Meccanica"),
+        ]
+        for nid, m, mod, flds, tags in notes_rows:
+            col.conn.execute(
+                "INSERT INTO notes (id, mid, mod, flds, tags) VALUES (?, ?, ?, ?, ?)",
+                (nid, m, mod, flds, tags),
+            )
+            col.conn.execute(
+                "INSERT INTO cards (id, nid, did) VALUES (?, ?, 100)",
+                (nid * 10, nid),
+            )
+        col.conn.commit()
+
+        # Save embeddings ONLY for notes 12 and 13 (note 10 & 11 have NO embeddings!)
+        self.storage.save_embeddings_batch(
+            [
+                (12, mid, "h12", 2, [1.0, 0.0]),
+                (13, mid, "h13", 2, [0.0, 1.0]),
+            ]
+        )
+
+        # 1. Pure embedding mode on unindexed note 10 -> returns missing [10]
+        matched_e, missing_e = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[10],
+            active_model_id=mid,
+            mode="embedding",
+            col=col,
+        )
+        self.assertEqual(matched_e, [])
+        self.assertEqual(missing_e, [10])
+
+        # 2. Structure mode on unindexed note 10 -> finds note 11 without requiring embedding
+        details_s = {}
+        matched_s, missing_s = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[10],
+            active_model_id=mid,
+            min_score=0.60,
+            mode="structure",
+            col=col,
+            details_out=details_s,
+        )
+        self.assertEqual(missing_s, [])
+        self.assertEqual([n for n, _ in matched_s], [11])
+        self.assertIn("S", details_s[11])
+
+        # 3. Tags mode on unindexed note 10 -> finds note 12 (exact tag) & note 11 (sister tag under Cardio::Shock)
+        details_t = {}
+        matched_t, missing_t = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[10],
+            active_model_id=mid,
+            min_score=0.25,
+            mode="tags",
+            col=col,
+            details_out=details_t,
+        )
+        self.assertEqual(missing_t, [])
+        t_nids = [n for n, _ in matched_t]
+        self.assertIn(12, t_nids)
+        self.assertIn(11, t_nids)
+        self.assertNotIn(13, t_nids)
+
+        # 4. Combined mode on unindexed note 10 -> gracefully fuses available Tags + Structure without failing
+        details_c = {}
+        matched_c, missing_c = find_similar_notes(
+            storage=self.storage,
+            selected_nids=[10],
+            active_model_id=mid,
+            min_score=0.55,
+            mode="combined",
+            col=col,
+            details_out=details_c,
+        )
+        self.assertEqual(missing_c, [])
+        c_nids = [n for n, _ in matched_c]
+        self.assertIn(11, c_nids)
+        self.assertIn(12, c_nids)
+        self.assertNotIn(13, c_nids)
+        self.assertIn("S", details_c[11])
+        self.assertIn("T", details_c[11])
+
+        col.conn.close()
+
+    def test_similarity_column_breakdown_formatting(self):
+        from ankihub_searcher import browser_menu
+
+        browser_menu._last_similar_scores = {1001: 0.84, 1002: 0.91}
+        browser_menu._last_similar_details = {
+            1001: {"E": 0.81, "T": 0.90, "S": 0.02},
+            1002: {"E": 0.91},
+        }
+        row1 = type("Row", (), {"cells": [type("Cell", (), {"text": ""})()]})()
+        row2 = type("Row", (), {"cells": [type("Cell", (), {"text": ""})()]})()
+
+        browser_menu.on_browser_did_fetch_row(1001, True, row1, ["smart_search_similarity"])
+        browser_menu.on_browser_did_fetch_row(1002, True, row2, ["smart_search_similarity"])
+
+        self.assertEqual(row1.cells[0].text, "0.84 (E:0.81 T:0.90)")
+        self.assertEqual(row2.cells[0].text, "0.91")
+
+    def test_settings_dialog_similarity_criteria(self):
+        from ankihub_searcher.ui.main_dialog import SettingsDialog
+
+        col = MockAnkiCol()
+        cfg = ConfigManager()
+        cfg.similar_use_embeddings = False
+        cfg.similar_use_tags = True
+        cfg.similar_use_structure = True
+        cfg.similar_weight_embedding = 0.40
+        cfg.similar_weight_tags = 0.35
+        cfg.similar_weight_structure = 0.25
+        cfg.similar_tag_max_df = 300
+
+        dlg = SettingsDialog(col=col, config=cfg)
+        self.assertFalse(dlg.chk_sim_use_emb.isChecked())
+        self.assertTrue(dlg.chk_sim_use_tags.isChecked())
+        self.assertTrue(dlg.chk_sim_use_struct.isChecked())
+        self.assertAlmostEqual(dlg.spin_sim_weight_emb.value(), 0.40, places=2)
+        self.assertAlmostEqual(dlg.spin_sim_weight_tags.value(), 0.35, places=2)
+        self.assertAlmostEqual(dlg.spin_sim_weight_struct.value(), 0.25, places=2)
+        self.assertEqual(dlg.spin_sim_tag_max_df.value(), 300)
+
+        dlg.chk_sim_use_emb.setChecked(True)
+        dlg.spin_sim_weight_emb.setValue(0.60)
+        dlg.spin_sim_tag_max_df.setValue(180)
+        with patch.object(cfg, "save"):
+            dlg._save_settings()
+
+        self.assertTrue(cfg.similar_use_embeddings)
+        self.assertAlmostEqual(cfg.similar_weight_embedding, 0.60, places=2)
+        self.assertEqual(cfg.similar_tag_max_df, 180)
         col.conn.close()

@@ -10,10 +10,11 @@ Provides:
 from __future__ import annotations
 
 import html
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -567,3 +568,315 @@ def parse_keyword_units(
             unit.keywords = kws
             result.append(unit)
     return result
+
+
+# =====================================================================
+# Structural / Syntactic Similarity Utilities
+# =====================================================================
+
+_STRUCT_POS_MAP: Dict[str, str] = {}
+for _w in (
+    "il", "lo", "la", "i", "gli", "le", "l", "un", "uno", "una",
+    "the", "a", "an",
+):
+    _STRUCT_POS_MAP[_w] = "DET"
+for _w in (
+    "di", "del", "dello", "della", "dei", "degli", "delle",
+    "a", "ad", "al", "allo", "alla", "ai", "agli", "alle",
+    "da", "dal", "dallo", "dalla", "dai", "dagli", "dalle",
+    "in", "nel", "nello", "nella", "nei", "negli", "nelle",
+    "con", "su", "sul", "sullo", "sulla", "sui", "sugli", "sulle",
+    "per", "tra", "fra",
+    "of", "in", "to", "for", "with", "on", "at", "from", "by",
+    "into", "through", "during", "between", "among", "within",
+    "without", "under", "over",
+):
+    _STRUCT_POS_MAP[_w] = "ADP"
+for _w in (
+    "è", "e", "sono", "era", "erano", "sia", "siano", "essere",
+    "ha", "hanno", "aveva", "può", "possono", "deve", "devono",
+    "viene", "vengono", "consiste",
+    "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "can", "may", "must", "does", "do", "did",
+):
+    _STRUCT_POS_MAP[_w] = "AUX"
+for _w in (
+    "che", "cui", "quale", "quali", "chi", "cosa", "dove", "quando",
+    "come", "perché", "perche", "quanto", "quanta", "quanti", "quante",
+    "which", "what", "who", "whom", "where", "when", "how", "why", "that",
+):
+    _STRUCT_POS_MAP[_w] = "WH"
+for _w in (
+    "ed", "o", "od", "ma", "però", "pero", "mentre", "quindi",
+    "perciò", "percio", "poiché", "poiche", "perchè", "se", "anche",
+    "oppure", "ovvero",
+    "and", "or", "but", "while", "whereas", "if", "because", "since",
+    "although", "though", "therefore", "thus", "however",
+):
+    _STRUCT_POS_MAP[_w] = "CONJ"
+for _w in (
+    "non", "no", "né", "ne", "mai", "senza",
+    "not", "no", "never", "without", "neither", "nor",
+):
+    _STRUCT_POS_MAP[_w] = "NEG"
+for _w in (
+    "più", "piu", "meno", "maggiore", "minore", "alto", "alta",
+    "basso", "bassa", "aumenta", "diminuisce",
+    "more", "less", "greater", "lower", "higher", "increased",
+    "decreased", "increases", "decreases",
+):
+    _STRUCT_POS_MAP[_w] = "CMP"
+for _w in (
+    "questo", "questa", "questi", "queste", "quello", "quella", "si", "ci",
+    "this", "these", "that", "those", "it", "its", "they", "their",
+):
+    _STRUCT_POS_MAP[_w] = "PRON"
+
+_RE_STRUCT_MATH = re.compile(
+    r"\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$\$[\s\S]*?\$\$|\$[^$]+\$"
+)
+_RE_STRUCT_NUM = re.compile(r"^\d+(?:[.,:/-]\d+)*$")
+_RE_STRUCT_UUID = re.compile(r"^[a-f0-9-]{8,}$|^[A-Za-z0-9]{10,32}$")
+
+
+def extract_primary_field_raw(flds_str: Optional[str], fallback_clean_text: str = "") -> str:
+    """Extracts the primary question/prompt field from Anki's \\x1f-joined flds string.
+
+    Skips empty fields, pure media-only fields, Image Occlusion coordinate masks,
+    and hidden ID/UUID fields so structural comparison operates on the actual sentence.
+    """
+    if flds_str:
+        parts = flds_str.split("\x1f")
+        for raw in parts:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            if "image-occlusion:rect:" in stripped:
+                continue
+            # Check plain visible text without HTML/media
+            visible = _RE_MEDIA_SOUND.sub(" ", stripped)
+            visible = _RE_HTML_TAGS.sub(" ", visible)
+            visible = html.unescape(visible).strip()
+            if not visible:
+                continue
+            if _RE_STRUCT_UUID.match(visible) and " " not in visible and len(parts) > 1:
+                continue
+            return stripped
+
+    if fallback_clean_text:
+        for line in fallback_clean_text.splitlines():
+            s = line.strip()
+            if s:
+                return s
+    return ""
+
+
+def build_structural_representation(raw_text: Optional[str]) -> Dict[str, Any]:
+    """Builds a lightweight, language-agnostic structural representation of a flashcard field.
+
+    Captures:
+    - lexical_tokens: ordered word tokens after HTML/cloze unwrapping
+    - skeleton_tokens: ordered tokens with clozes (<CLOZE>), math (<MATH>), and numbers (<NUM>) masked
+    - pos_tokens: coarse IT/EN closed-class POS skeleton with collapsed content runs
+    - hints: normalized cloze hints
+    - shingles: set of lexical/skeleton 2-grams for fast inverted-index candidate pre-filtering
+    """
+    if not raw_text:
+        return {
+            "lexical_tokens": [],
+            "skeleton_tokens": [],
+            "pos_tokens": [],
+            "hints": set(),
+            "lex_2grams": set(),
+            "skel_2grams": set(),
+            "pos_2grams": set(),
+            "shingles": set(),
+        }
+
+    text = _RE_STYLE_SCRIPT.sub(" ", raw_text)
+    text = _RE_MEDIA_SOUND.sub(" ", text)
+    text = _RE_PROMO_LINKS.sub(" ", text)
+    text = _RE_STRUCT_MATH.sub(" __MATH__ ", text)
+
+    hints: Set[str] = set()
+
+    def _lex_cloze_repl(match: re.Match) -> str:
+        ans = match.group(1).strip()
+        hint = match.group(2)
+        if hint is not None:
+            h = hint.strip().lower()
+            if h and h not in {"...", "-", "?"}:
+                hints.add(h)
+        return ans
+
+    lex_t = text
+    skel_t = text
+    for _ in range(3):
+        if "{{" in lex_t:
+            lex_t = _RE_CLOZE.sub(_lex_cloze_repl, lex_t)
+        if "{{" in skel_t:
+            skel_t = _RE_CLOZE.sub(" __CLOZE__ ", skel_t)
+
+    def _tokenize_raw(s: str) -> List[str]:
+        s = re.sub(r"<(?:br\s*/?|/p|/div|/li|/tr|/td|/h[1-6])>", " , ", s, flags=re.IGNORECASE)
+        s = _RE_HTML_TAGS.sub(" ", s)
+        s = html.unescape(s)
+        s = s.replace("’", "'").replace("‘", "'").replace("→", " , ")
+        return re.findall(r"__cloze__|__math__|[a-zA-ZÀ-ÿ0-9]+|[?,;:]", s.lower())
+
+    lex_raw = _tokenize_raw(lex_t)
+    skel_raw = _tokenize_raw(skel_t)
+
+    lexical_tokens = [w for w in lex_raw if w not in {"?", ",", ";", ":"}][:80]
+    skeleton_tokens = [
+        ("<NUM>" if _RE_STRUCT_NUM.match(w) else ("<CLOZE>" if w == "__cloze__" else ("<MATH>" if w == "__math__" else w)))
+        for w in skel_raw
+        if w not in {"?", ",", ";", ":"}
+    ][:80]
+
+    pos_seq: List[str] = []
+    for w in lex_raw:
+        if w in {"?", ",", ";", ":"}:
+            pos_seq.append(w)
+        elif w == "__cloze__":
+            pos_seq.append("<CLOZE>")
+        elif w == "__math__":
+            pos_seq.append("<MATH>")
+        elif _RE_STRUCT_NUM.match(w):
+            pos_seq.append("<NUM>")
+        elif w in _STRUCT_POS_MAP:
+            pos_seq.append(_STRUCT_POS_MAP[w])
+        else:
+            pos_seq.append("W")
+
+    pos_tokens: List[str] = []
+    for p in pos_seq:
+        if p == "W" and pos_tokens and pos_tokens[-1] == "W":
+            continue
+        pos_tokens.append(p)
+    pos_tokens = pos_tokens[:60]
+
+    def _bigrams(seq: List[str]) -> Set[Tuple[str, str]]:
+        if len(seq) < 2:
+            return set()
+        return {(seq[i], seq[i + 1]) for i in range(len(seq) - 1)}
+
+    lex_2grams = _bigrams(lexical_tokens)
+    skel_2grams = _bigrams(skeleton_tokens)
+    pos_2grams = _bigrams(pos_tokens)
+
+    shingles: Set[str] = set()
+    for a, b in lex_2grams:
+        shingles.add(f"L:{a}|{b}")
+    for a, b in skel_2grams:
+        shingles.add(f"S:{a}|{b}")
+    for tok in lexical_tokens:
+        if len(tok) >= 4 and tok not in _STRUCT_POS_MAP and tok not in {"__math__", "__cloze__"}:
+            shingles.add(f"T:{tok}")
+
+    return {
+        "lexical_tokens": lexical_tokens,
+        "skeleton_tokens": skeleton_tokens,
+        "pos_tokens": pos_tokens,
+        "hints": hints,
+        "lex_2grams": lex_2grams,
+        "skel_2grams": skel_2grams,
+        "pos_2grams": pos_2grams,
+        "shingles": shingles,
+    }
+
+
+def _lcs_length(seq_a: List[str], seq_b: List[str]) -> int:
+    """Computes Longest Common Subsequence length in O(min(m, n)) space."""
+    if not seq_a or not seq_b:
+        return 0
+    if len(seq_a) < len(seq_b):
+        seq_a, seq_b = seq_b, seq_a
+    prev = [0] * (len(seq_b) + 1)
+    for tok_a in seq_a:
+        curr = [0] * (len(seq_b) + 1)
+        for j, tok_b in enumerate(seq_b, 1):
+            if tok_a == tok_b:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = prev[j] if prev[j] >= curr[j - 1] else curr[j - 1]
+        prev = curr
+    return prev[-1]
+
+
+def _lcs_f1(seq_a: List[str], seq_b: List[str]) -> float:
+    if not seq_a or not seq_b:
+        return 0.0
+    l = _lcs_length(seq_a, seq_b)
+    return (2.0 * l) / (len(seq_a) + len(seq_b))
+
+
+def _set_dice(set_a: Set[Any], set_b: Set[Any]) -> float:
+    if not set_a or not set_b:
+        return 0.0
+    return (2.0 * len(set_a & set_b)) / (len(set_a) + len(set_b))
+
+
+def compute_structural_similarity(rep_a: Dict[str, Any], rep_b: Dict[str, Any]) -> float:
+    """Computes normalized structural/template similarity in [0.0, 1.0] between two representations.
+
+    Combines:
+    1. Word-level & Skeleton-level ROUGE-L (LCS F1)
+    2. Coarse syntactic POS-skeleton alignment gated by template anchor overlap
+    3. Word/Skeleton bigram frame overlap
+    4. Opening prefix & cloze-hint similarity
+    """
+    lex_a = rep_a.get("lexical_tokens", [])
+    lex_b = rep_b.get("lexical_tokens", [])
+    skel_a = rep_a.get("skeleton_tokens", [])
+    skel_b = rep_b.get("skeleton_tokens", [])
+    if len(lex_a) < 2 or len(lex_b) < 2:
+        return 0.0
+
+    s_lex_lcs = _lcs_f1(lex_a, lex_b)
+    s_skel_lcs = _lcs_f1(skel_a, skel_b)
+    s_lcs = max(s_lex_lcs, s_skel_lcs)
+    if s_lcs <= 0.0:
+        return 0.0
+
+    pos_a = rep_a.get("pos_tokens", [])
+    pos_b = rep_b.get("pos_tokens", [])
+    s_pos_lcs = _lcs_f1(pos_a, pos_b)
+    s_pos_2g = _set_dice(rep_a.get("pos_2grams", set()), rep_b.get("pos_2grams", set()))
+    s_pos = 0.60 * s_pos_lcs + 0.40 * s_pos_2g
+
+    s_lex_2g = _set_dice(rep_a.get("lex_2grams", set()), rep_b.get("lex_2grams", set()))
+    s_skel_2g = _set_dice(rep_a.get("skel_2grams", set()), rep_b.get("skel_2grams", set()))
+    s_ngram = max(s_lex_2g, s_skel_2g)
+
+    pref_lex = 0
+    for x, y in zip(lex_a, lex_b):
+        if x == y:
+            pref_lex += 1
+        else:
+            break
+    pref_skel = 0
+    for x, y in zip(skel_a, skel_b):
+        if x == y:
+            pref_skel += 1
+        else:
+            break
+    pref = max(pref_lex, pref_skel)
+    s_pref = min(1.0, pref / max(1, min(5, len(lex_a), len(lex_b))))
+
+    pos_gated = s_pos * (0.40 + 0.60 * math.sqrt(s_lcs))
+    score = (
+        0.35 * math.sqrt(s_lcs)
+        + 0.25 * pos_gated
+        + 0.25 * math.sqrt(s_ngram)
+        + 0.15 * math.sqrt(s_pref)
+    )
+
+    hints_a = rep_a.get("hints", set())
+    hints_b = rep_b.get("hints", set())
+    if hints_a and hints_b:
+        s_hint = _set_dice(hints_a, hints_b)
+        if s_hint > 0.0:
+            score += 0.05 * s_hint
+
+    return round(min(1.0, max(0.0, score)), 4)

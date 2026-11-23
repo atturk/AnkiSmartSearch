@@ -7,6 +7,8 @@ Stage 3: Optional LLM Verification & Reranking
 
 from __future__ import annotations
 
+import collections
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -19,7 +21,13 @@ except ImportError:
 from .ai_client import AIClientError, OpenAICompatibleClient
 from .config_manager import ConfigManager
 from .storage import SearchDatabase, normalize_l2
-from .text_utils import LectureUnit, normalize_inline_latex
+from .text_utils import (
+    LectureUnit,
+    build_structural_representation,
+    compute_structural_similarity,
+    extract_primary_field_raw,
+    normalize_inline_latex,
+)
 
 
 class Stage1ExtractionError(AIClientError):
@@ -990,6 +998,330 @@ class SmartSearchPipeline:
         return candidates
 
 
+_STRUCT_REP_CACHE: Dict[int, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+_MAX_STRUCT_CACHE_SIZE = 80000
+
+
+def compute_tag_similarity_scores(
+    selected_nids: Sequence[int],
+    notes_tags: Dict[int, Sequence[str]],
+    max_tag_df: int = 250,
+    candidate_nids: Optional[Set[int]] = None,
+) -> Tuple[Dict[int, float], bool]:
+    """Computes deck-agnostic hierarchical IDF-weighted tag similarity scores in [0.0, 1.0].
+
+    Automatically filters out overly broad/boilerplate tags whose document frequency
+    exceeds dynamic eff_max_df without hardcoding any deck-specific tag names.
+
+    Returns:
+        (scores_by_nid, query_has_valid_tags)
+    """
+    sel_set = {int(n) for n in selected_nids}
+    if not sel_set or not notes_tags:
+        return {}, False
+
+    # Consider only notes that actually carry at least one tag for DF statistics
+    tagged_notes: Dict[int, List[str]] = {}
+    for nid, raw_tags in notes_tags.items():
+        cleaned = [str(t).strip() for t in raw_tags if str(t).strip()]
+        if cleaned:
+            tagged_notes[int(nid)] = cleaned
+
+    n_tagged = len(tagged_notes)
+    if n_tagged == 0:
+        return {}, False
+
+    if n_tagged <= 3:
+        eff_max_df = n_tagged
+    elif n_tagged < 200:
+        eff_max_df = min(max_tag_df, max(3, int(0.50 * n_tagged)))
+    else:
+        eff_max_df = min(max_tag_df, max(40, int(0.15 * n_tagged)))
+
+    exact_df: Dict[str, int] = collections.Counter()
+    prefix_df: Dict[str, int] = collections.Counter()
+    for ts in tagged_notes.values():
+        unique_lower = {t.lower() for t in ts}
+        for tl in unique_lower:
+            exact_df[tl] += 1
+        prefixes = {tl.rsplit("::", 1)[0] for tl in unique_lower if "::" in tl}
+        for p in prefixes:
+            prefix_df[p] += 1
+
+    def _extract_features(ts: Sequence[str]) -> Dict[Tuple[str, str], float]:
+        feats: Dict[Tuple[str, str], float] = {}
+        for t in ts:
+            tl = t.lower()
+            df = exact_df.get(tl, 0)
+            if 1 <= df <= eff_max_df:
+                idf = math.log(1.0 + n_tagged / df)
+                feats[("L", tl)] = idf * idf
+            if "::" in tl:
+                p = tl.rsplit("::", 1)[0]
+                pdf = prefix_df.get(p, 0)
+                if 1 <= pdf <= eff_max_df:
+                    pidf = math.log(1.0 + n_tagged / pdf)
+                    k = ("P", p)
+                    w = 0.35 * pidf * pidf
+                    if w > feats.get(k, 0.0):
+                        feats[k] = w
+        return feats
+
+    # Aggregate query features across selected notes
+    q_feat_weights: Dict[Tuple[str, str], float] = {}
+    q_feat_counts: Dict[Tuple[str, str], int] = collections.Counter()
+    sel_with_tags = [nid for nid in sel_set if nid in tagged_notes]
+    if not sel_with_tags:
+        return {}, False
+
+    for nid in sel_with_tags:
+        feats = _extract_features(tagged_notes[nid])
+        for k, w in feats.items():
+            q_feat_counts[k] += 1
+            if w > q_feat_weights.get(k, 0.0):
+                q_feat_weights[k] = w
+
+    if not q_feat_weights:
+        return {}, False
+
+    n_sel = len(sel_with_tags)
+    q_feats: Dict[Tuple[str, str], float] = {
+        k: w * (0.5 + 0.5 * (q_feat_counts[k] / n_sel))
+        for k, w in q_feat_weights.items()
+    }
+    q_sum = sum(q_feats.values())
+    if q_sum <= 1e-12:
+        return {}, False
+
+    q_leaf_keys = {val for kind, val in q_feats if kind == "L"}
+    q_parent_keys = {val for kind, val in q_feats if kind == "P"}
+
+    scores: Dict[int, float] = {}
+    for nid, ts in tagged_notes.items():
+        if nid in sel_set:
+            continue
+        if candidate_nids is not None and nid not in candidate_nids:
+            continue
+
+        # Fast rejection before computing feature dict
+        has_overlap = False
+        for t in ts:
+            tl = t.lower()
+            if tl in q_leaf_keys:
+                has_overlap = True
+                break
+            if "::" in tl and tl.rsplit("::", 1)[0] in q_parent_keys:
+                has_overlap = True
+                break
+        if not has_overlap:
+            continue
+
+        c_feats = _extract_features(ts)
+        if not c_feats:
+            continue
+
+        inter = 0.0
+        for k, qw in q_feats.items():
+            cw = c_feats.get(k)
+            if cw is not None:
+                inter += qw if qw <= cw else cw
+
+        if inter <= 0.0:
+            continue
+
+        c_sum = sum(c_feats.values())
+        cov = inter / q_sum
+        dice = (2.0 * inter) / (q_sum + c_sum)
+        raw = 0.65 * cov + 0.35 * dice
+        # Calibrate concave power curve (0.75) to align tag similarity with cosine scale
+        scores[nid] = round(min(1.0, max(0.0, raw ** 0.75)), 4)
+
+    return scores, True
+
+
+def _get_cached_struct_rep(nid: int, primary_raw: str) -> Dict[str, Any]:
+    """Returns cached structural representation for nid if primary_raw signature matches."""
+    sig = (len(primary_raw), hash(primary_raw))
+    cached = _STRUCT_REP_CACHE.get(nid)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    rep = build_structural_representation(primary_raw)
+    if len(_STRUCT_REP_CACHE) >= _MAX_STRUCT_CACHE_SIZE:
+        _STRUCT_REP_CACHE.clear()
+    _STRUCT_REP_CACHE[nid] = (sig, rep)
+    return rep
+
+
+def compute_structural_similarity_scores(
+    selected_nids: Sequence[int],
+    notes_primary_raw: Dict[int, str],
+    candidate_nids: Optional[Set[int]] = None,
+    shortlist_limit: int = 800,
+) -> Tuple[Dict[int, float], bool]:
+    """Computes syntactic/structural template similarity scores in [0.0, 1.0].
+
+    Uses a fast anchor-word pre-filter on collections > 1000 notes and computes exact
+    LCS + POS-skeleton + bigram template similarity on shortlisted candidates.
+
+    Returns:
+        (scores_by_nid, query_has_valid_structure)
+    """
+    sel_set = {int(n) for n in selected_nids}
+    if not sel_set or not notes_primary_raw:
+        return {}, False
+
+    sel_reps: List[Dict[str, Any]] = []
+    for nid in sel_set:
+        raw = notes_primary_raw.get(nid, "")
+        if not raw:
+            continue
+        rep = _get_cached_struct_rep(nid, raw)
+        if len(rep.get("lexical_tokens", [])) >= 2:
+            sel_reps.append(rep)
+
+    if not sel_reps:
+        return {}, False
+
+    # Collect distinctive query anchor words for fast pre-filtering on large collections
+    q_word_weights: Dict[str, int] = {}
+    q_min_len = min(len(r["lexical_tokens"]) for r in sel_reps)
+    for r in sel_reps:
+        for w in r["lexical_tokens"]:
+            if len(w) >= 4:
+                q_word_weights[w] = max(q_word_weights.get(w, 0), 2)
+            elif len(w) == 3:
+                q_word_weights[w] = max(q_word_weights.get(w, 0), 1)
+
+    pool_nids = [
+        nid
+        for nid in notes_primary_raw
+        if nid not in sel_set and (candidate_nids is None or nid in candidate_nids)
+    ]
+    if not pool_nids:
+        return {}, True
+
+    if len(pool_nids) > 1000 and q_word_weights:
+        distinct_anchors = list(q_word_weights.items())
+        min_weighted_hits = 3 if sum(w for _, w in distinct_anchors) >= 6 else 1
+        shortlist: List[Tuple[int, int]] = []
+        for nid in pool_nids:
+            raw = notes_primary_raw[nid]
+            if not raw:
+                continue
+            low = raw[:600].lower()
+            w_hits = 0
+            for w, weight in distinct_anchors:
+                if w in low:
+                    w_hits += weight
+            if w_hits >= min_weighted_hits:
+                shortlist.append((w_hits, nid))
+        shortlist.sort(key=lambda x: x[0], reverse=True)
+        target_nids = [nid for _, nid in shortlist[:shortlist_limit]]
+    else:
+        target_nids = pool_nids
+
+    scores: Dict[int, float] = {}
+    for nid in target_nids:
+        raw = notes_primary_raw.get(nid, "")
+        if not raw:
+            continue
+        c_rep = _get_cached_struct_rep(nid, raw)
+        if len(c_rep.get("lexical_tokens", [])) < 2:
+            continue
+        # If multiple notes selected, use best structural match across selected templates
+        best_s = max(compute_structural_similarity(q_rep, c_rep) for q_rep in sel_reps)
+        if best_s > 0.0:
+            scores[nid] = best_s
+
+    return scores, True
+
+
+def _load_notes_raw_meta(
+    storage: SearchDatabase,
+    selected_nids: Sequence[int],
+    candidate_nids: Optional[Union[Set[int], Sequence[int]]] = None,
+    col: Any = None,
+    notes_raw_meta: Optional[Dict[int, Tuple[str, List[str]]]] = None,
+) -> Tuple[Dict[int, str], Dict[int, List[str]]]:
+    """Loads primary field raw text and tag lists from notes_raw_meta, Anki col, or storage."""
+    primary_texts: Dict[int, str] = {}
+    notes_tags: Dict[int, List[str]] = {}
+
+    if notes_raw_meta is not None:
+        for nid, (txt, tags) in notes_raw_meta.items():
+            nid_i = int(nid)
+            if txt:
+                primary_texts[nid_i] = txt
+            notes_tags[nid_i] = list(tags)
+        return primary_texts, notes_tags
+
+    # Try reading directly from Anki collection DB (fast bulk SQL read)
+    db_obj = getattr(col, "db", None) if col is not None else None
+    if db_obj is not None and hasattr(db_obj, "execute"):
+        try:
+            cand_set = {int(n) for n in candidate_nids} if candidate_nids is not None else None
+            sel_set = {int(n) for n in selected_nids}
+            rows = []
+            if cand_set is not None:
+                needed = list(sel_set | cand_set)
+                if len(needed) <= 900:
+                    if needed:
+                        ph = ",".join(str(x) for x in needed)
+                        rows = list(db_obj.execute(f"SELECT id, flds, tags FROM notes WHERE id IN ({ph})"))
+                else:
+                    target = set(needed)
+                    rows = [r for r in db_obj.execute("SELECT id, flds, tags FROM notes") if int(r[0]) in target]
+            else:
+                rows = list(db_obj.execute("SELECT id, flds, tags FROM notes"))
+
+            for nid_val, flds_str, tags_str in rows:
+                nid_i = int(nid_val)
+                prim = extract_primary_field_raw(flds_str or "")
+                if prim:
+                    primary_texts[nid_i] = prim
+                notes_tags[nid_i] = [t for t in (tags_str or "").strip().split() if t]
+        except Exception:
+            pass
+
+    if primary_texts or any(notes_tags.values()):
+        return primary_texts, notes_tags
+
+    # Fallback to SmartSearch SQLite storage if available (e.g. standalone without col)
+    try:
+        fetch_nids: Optional[List[int]] = None
+        if candidate_nids is not None:
+            fetch_nids = list({int(n) for n in selected_nids} | {int(n) for n in candidate_nids})
+        else:
+            # Load only selected_nids first; if storage has notes_content, load all
+            sel_map = storage.get_notes_content([int(n) for n in selected_nids])
+            if sel_map:
+                with storage._get_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT nid, clean_text, clean_tags FROM notes_content")
+                    for r in cur.fetchall():
+                        nid_i = int(r["nid"])
+                        p = extract_primary_field_raw("", fallback_clean_text=r["clean_text"] or "")
+                        if p:
+                            primary_texts[nid_i] = p
+                        t_raw = (r["clean_tags"] or "").strip()
+                        if t_raw:
+                            notes_tags[nid_i] = [t.strip() for t in t_raw.split(",") if t.strip()]
+                return primary_texts, notes_tags
+        if fetch_nids:
+            c_map = storage.get_notes_content(fetch_nids)
+            for nid_i, info in c_map.items():
+                p = extract_primary_field_raw("", fallback_clean_text=info.get("clean_text", ""))
+                if p:
+                    primary_texts[int(nid_i)] = p
+                t_raw = (info.get("clean_tags") or "").strip()
+                if t_raw:
+                    notes_tags[int(nid_i)] = [t.strip() for t in t_raw.split(",") if t.strip()]
+    except Exception:
+        pass
+
+    return primary_texts, notes_tags
+
+
 def find_similar_notes(
     storage: SearchDatabase,
     selected_nids: Sequence[int],
@@ -997,71 +1329,225 @@ def find_similar_notes(
     candidate_nids: Optional[Union[Set[int], Sequence[int]]] = None,
     min_score: float = 0.70,
     max_notes: int = 20,
+    *,
+    mode: str = "combined",
+    col: Any = None,
+    notes_raw_meta: Optional[Dict[int, Tuple[str, List[str]]]] = None,
+    use_embeddings: bool = True,
+    use_tags: bool = True,
+    use_structure: bool = True,
+    weight_embedding: float = 0.55,
+    weight_tags: float = 0.25,
+    weight_structure: float = 0.20,
+    tag_max_df: int = 250,
+    details_out: Optional[Dict[int, Dict[str, float]]] = None,
 ) -> Tuple[List[Tuple[int, float]], List[int]]:
-    """Finds notes similar to the selected notes via vector cosine similarity.
+    """Finds notes similar to the selected notes using semantic embeddings, tags, and/or sentence structure.
 
-    1. Loads vectors for selected_nids from storage for active_model_id.
-    2. Identifies unindexed note IDs among selected_nids. If any exist, returns ([], missing_nids).
-    3. Computes the normalized mean vector across all selected notes.
-    4. Loads vectors for candidate notes (within candidate_nids if specified, or all indexed notes if None).
-    5. Excludes the selected notes themselves.
-    6. Filters candidate notes by score >= min_score, ordered descending, capped at max_notes.
+    Modes:
+    - "combined": fuses all enabled & available signals (Embedding, Tags, Structure) via synergistic fusion.
+                  Automatically falls back to Tags/Structure if selected notes lack embeddings.
+    - "embedding": pure vector cosine similarity (requires selected notes to be indexed).
+    - "tags": hierarchical IDF-weighted tag similarity (no embeddings required).
+    - "structure": syntactic/template sentence similarity (no embeddings required).
 
     Returns:
         (matched_notes, missing_nids)
-        where matched_notes is a list of (nid, similarity_score).
+        where matched_notes is a list of (nid, similarity_score) ordered descending.
     """
     if not selected_nids:
         return [], []
 
-    sel_nids_list, sel_vecs, dim = storage.load_embeddings_for_notes(
-        list(selected_nids), active_model_id
-    )
-    indexed_set = set(sel_nids_list)
-    missing = [nid for nid in selected_nids if nid not in indexed_set]
-    if missing:
-        return [], missing
-
-    if not sel_nids_list:
+    if candidate_nids is not None and len(candidate_nids) == 0:
         return [], []
 
-    # Compute normalized mean vector
-    if np is not None and isinstance(sel_vecs, getattr(np, "ndarray", ())):
-        mean_arr = np.mean(sel_vecs, axis=0)
-        norm_mean = normalize_l2(mean_arr.tolist())
-    else:
-        if len(sel_vecs) == 1:
-            norm_mean = normalize_l2(sel_vecs[0])
+    eff_mode = (mode or "combined").strip().lower()
+    if eff_mode not in {"combined", "embedding", "tags", "structure"}:
+        eff_mode = "combined"
+
+    want_emb = (eff_mode == "embedding") or (eff_mode == "combined" and use_embeddings)
+    want_tags = (eff_mode == "tags") or (eff_mode == "combined" and use_tags)
+    want_struct = (eff_mode == "structure") or (eff_mode == "combined" and use_structure)
+
+    sel_set = {int(n) for n in selected_nids}
+    cand_set: Optional[Set[int]] = {int(n) for n in candidate_nids} if candidate_nids is not None else None
+
+    # 1. Semantic Embedding Similarity
+    emb_scores: Dict[int, float] = {}
+    emb_active = False
+    missing_emb: List[int] = []
+
+    if want_emb:
+        sel_nids_list, sel_vecs, _dim = storage.load_embeddings_for_notes(
+            list(selected_nids), active_model_id
+        )
+        indexed_set = set(sel_nids_list)
+        missing_emb = [nid for nid in selected_nids if nid not in indexed_set]
+
+        if not missing_emb and sel_nids_list:
+            if np is not None and isinstance(sel_vecs, getattr(np, "ndarray", ())):
+                mean_arr = np.mean(sel_vecs, axis=0)
+                norm_mean = normalize_l2(mean_arr.tolist())
+            else:
+                if len(sel_vecs) == 1:
+                    norm_mean = normalize_l2(sel_vecs[0])
+                else:
+                    dim_len = len(sel_vecs[0])
+                    sum_vec = [0.0] * dim_len
+                    for v in sel_vecs:
+                        for d in range(dim_len):
+                            sum_vec[d] += v[d]
+                    norm_mean = normalize_l2(sum_vec)
+
+            cand_list: Optional[Sequence[int]] = list(cand_set) if cand_set is not None else None
+            cand_nids_list, cand_vecs, _ = storage.load_embeddings_for_notes(
+                cand_list, active_model_id
+            )
+            if cand_nids_list:
+                similarities = storage.compute_similarities_from_loaded(
+                    cand_nids_list, cand_vecs, norm_mean
+                )
+                emb_scores = {
+                    int(nid): round(float(score), 4)
+                    for nid, score in similarities
+                    if int(nid) not in sel_set and float(score) > 0.0
+                }
+            emb_active = True
+
+    if eff_mode == "embedding":
+        if missing_emb:
+            return [], missing_emb
+        matched = [
+            (nid, sc)
+            for nid, sc in sorted(emb_scores.items(), key=lambda x: x[1], reverse=True)
+            if sc >= min_score
+        ][:max_notes]
+        if details_out is not None:
+            details_out.clear()
+            for nid, sc in matched:
+                details_out[nid] = {"E": sc}
+        return matched, []
+
+    # 2. Load raw primary text & tags when needed for Tags / Structure
+    primary_texts: Dict[int, str] = {}
+    notes_tags: Dict[int, List[str]] = {}
+    if want_tags or want_struct:
+        primary_texts, notes_tags = _load_notes_raw_meta(
+            storage=storage,
+            selected_nids=selected_nids,
+            candidate_nids=cand_set,
+            col=col,
+            notes_raw_meta=notes_raw_meta,
+        )
+
+    # 3. Tag Similarity
+    tag_scores: Dict[int, float] = {}
+    tag_active = False
+    if want_tags and notes_tags:
+        tag_scores, tag_active = compute_tag_similarity_scores(
+            selected_nids=selected_nids,
+            notes_tags=notes_tags,
+            max_tag_df=tag_max_df,
+            candidate_nids=cand_set,
+        )
+
+    # 4. Structural / Syntactic Similarity
+    struct_scores: Dict[int, float] = {}
+    struct_active = False
+    if want_struct and primary_texts:
+        struct_scores, struct_active = compute_structural_similarity_scores(
+            selected_nids=selected_nids,
+            notes_primary_raw=primary_texts,
+            candidate_nids=cand_set,
+        )
+
+    # If combined mode had missing embeddings and neither tags nor structure is available,
+    # surface missing_emb so the user is prompted to index (preserving v0.5.x behavior).
+    if not emb_active and not tag_active and not struct_active:
+        if missing_emb:
+            return [], missing_emb
+        return [], []
+
+    # Standalone single-criterion modes
+    if eff_mode == "tags":
+        matched = [
+            (nid, sc)
+            for nid, sc in sorted(tag_scores.items(), key=lambda x: x[1], reverse=True)
+            if sc >= min_score
+        ][:max_notes]
+        if details_out is not None:
+            details_out.clear()
+            for nid, sc in matched:
+                details_out[nid] = {"T": sc}
+        return matched, []
+
+    if eff_mode == "structure":
+        matched = [
+            (nid, sc)
+            for nid, sc in sorted(struct_scores.items(), key=lambda x: x[1], reverse=True)
+            if sc >= min_score
+        ][:max_notes]
+        if details_out is not None:
+            details_out.clear()
+            for nid, sc in matched:
+                details_out[nid] = {"S": sc}
+        return matched, []
+
+    # 5. Combined Synergistic Fusion across active criteria
+    active_weights: Dict[str, float] = {}
+    if emb_active:
+        active_weights["E"] = max(0.01, float(weight_embedding))
+    if tag_active:
+        active_weights["T"] = max(0.01, float(weight_tags))
+    if struct_active:
+        active_weights["S"] = max(0.01, float(weight_structure))
+
+    if not active_weights:
+        return [], missing_emb if missing_emb else []
+
+    w_total = sum(active_weights.values())
+    all_cands: Set[int] = set()
+    if emb_active:
+        all_cands.update(emb_scores.keys())
+    if tag_active:
+        all_cands.update(tag_scores.keys())
+    if struct_active:
+        all_cands.update(struct_scores.keys())
+
+    scored: List[Tuple[int, float, Dict[str, float]]] = []
+    n_active = len(active_weights)
+
+    for nid in all_cands:
+        if nid in sel_set:
+            continue
+        comp: Dict[str, float] = {}
+        if emb_active:
+            comp["E"] = emb_scores.get(nid, 0.0)
+        if tag_active:
+            comp["T"] = tag_scores.get(nid, 0.0)
+        if struct_active:
+            comp["S"] = struct_scores.get(nid, 0.0)
+
+        if n_active == 1:
+            final_score = next(iter(comp.values()))
         else:
-            dim_len = len(sel_vecs[0])
-            sum_vec = [0.0] * dim_len
-            for v in sel_vecs:
-                for d in range(dim_len):
-                    sum_vec[d] += v[d]
-            norm_mean = normalize_l2(sum_vec)
+            s_weighted = sum(active_weights[k] * comp[k] for k in active_weights) / w_total
+            s_peak = max(comp.values())
+            base = max(s_weighted, 0.85 * s_peak + 0.15 * s_weighted)
+            strong_hits = sum(1 for v in comp.values() if v >= 0.45)
+            bonus = 0.04 * max(0, strong_hits - 1)
+            final_score = round(min(1.0, base + bonus), 4)
 
-    # Candidate notes
-    cand_list: Optional[Sequence[int]] = None
-    if candidate_nids is not None:
-        cand_list = list(candidate_nids)
-        if len(cand_list) == 0:
-            return [], []
+        if final_score >= min_score:
+            scored.append((nid, final_score, comp))
 
-    cand_nids_list, cand_vecs, _ = storage.load_embeddings_for_notes(
-        cand_list, active_model_id
-    )
-    if not cand_nids_list:
-        return [], []
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_scored = scored[:max_notes]
 
-    similarities = storage.compute_similarities_from_loaded(
-        cand_nids_list, cand_vecs, norm_mean
-    )
+    if details_out is not None:
+        details_out.clear()
+        for nid, _, comp in top_scored:
+            details_out[nid] = comp
 
-    sel_set = set(selected_nids)
-    matched = [
-        (nid, round(float(score), 4))
-        for nid, score in similarities
-        if nid not in sel_set and score >= min_score
-    ]
-    return matched[:max_notes], []
+    return [(nid, sc) for nid, sc, _ in top_scored], []
 
