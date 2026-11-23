@@ -18,8 +18,8 @@ def _is_alive(obj: Any) -> bool:
     """Checks whether a Qt widget / Python object is alive and not deleted."""
     if obj is None:
         return False
-    # Check explicit mock/test deletion flag if present
-    if getattr(obj, "_is_deleted", False):
+    # Check explicit mock/test deletion flag if present (avoid MagicMock truthiness)
+    if getattr(obj, "_is_deleted", False) is True:
         return False
 
     # Check PyQt/sip deletion

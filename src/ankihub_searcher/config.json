@@ -42,6 +42,7 @@
   "fts_use_italian_keywords": false,
   "enable_llm_verification": false,
   "include_active_cards_in_filtered_deck": false,
+  "run_search_in_background": true,
   "batch_deck_naming_style": "dash",
   "rollback_keep_reviewed_default": true,
   "indexed_fields_by_model": {

@@ -10,9 +10,12 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+from .debug_log import log_error, log_info, log_warning
 
 _RE_THINK_BLOCK = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 _RE_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
@@ -153,23 +156,41 @@ class OpenAICompatibleClient:
         )
 
         effective_timeout = timeout or self.default_timeout
+        payload_bytes_len = len(body_bytes) if body_bytes is not None else 0
+        t0 = time.monotonic()
 
         try:
             with urllib.request.urlopen(req, timeout=effective_timeout, context=self._ssl_ctx) as resp:
                 resp_text = resp.read().decode("utf-8")
+                elapsed = time.monotonic() - t0
+                log_info(
+                    "ai_client",
+                    f"{method} {url} -> HTTP 200 in {elapsed:.2f}s (req_bytes={payload_bytes_len}, resp_chars={len(resp_text)})",
+                )
                 return json.loads(resp_text)
         except urllib.error.HTTPError as e:
+            elapsed = time.monotonic() - t0
             err_body = ""
             try:
                 err_body = e.read().decode("utf-8")
             except Exception:
                 pass
+            log_warning(
+                "ai_client",
+                f"{method} {url} -> HTTP {e.code} ({e.reason}) after {elapsed:.2f}s: {err_body[:300]}",
+            )
             raise AIClientError(f"HTTP {e.code} ({e.reason}) at {url}: {err_body}", status_code=e.code) from e
         except urllib.error.URLError as e:
+            elapsed = time.monotonic() - t0
+            log_error("ai_client", f"{method} {url} -> connection failed after {elapsed:.2f}s: {e.reason}", e)
             raise AIClientError(f"Connection failed to {url}: {e.reason}") from e
         except TimeoutError as e:
+            elapsed = time.monotonic() - t0
+            log_error("ai_client", f"{method} {url} -> timeout after {elapsed:.2f}s (limit={effective_timeout}s)", e)
             raise AIClientError(f"Request timed out after {effective_timeout}s to {url}") from e
         except json.JSONDecodeError as e:
+            elapsed = time.monotonic() - t0
+            log_error("ai_client", f"{method} {url} -> invalid JSON after {elapsed:.2f}s", e)
             raise AIClientError(f"Invalid JSON returned from {url}: {e}") from e
 
     def list_models(self, base_url: str, api_key: str = "") -> List[str]:
@@ -306,12 +327,19 @@ class OpenAICompatibleClient:
                     },
                 }
 
+        t0 = time.monotonic()
+        log_info(
+            "ai_client",
+            f"chat_completion_json model={model} url={url} msgs={len(messages)} max_tokens={max_tokens} has_schema={json_schema is not None}",
+        )
+
         if "response_format" in payload:
             try:
                 res = self._make_request(url, method="POST", data=payload, api_key=api_key, timeout=timeout)
             except AIClientError as e:
                 # If server returns 400 for response_format, retry once without response_format
                 if getattr(e, "status_code", None) == 400 or "HTTP 400" in str(e):
+                    log_warning("ai_client", f"HTTP 400 with response_format for model={model}, retrying without schema")
                     payload_fallback = dict(payload)
                     payload_fallback.pop("response_format", None)
                     res = self._make_request(
@@ -324,6 +352,7 @@ class OpenAICompatibleClient:
 
         choices = res.get("choices", [])
         if not choices:
+            log_warning("ai_client", f"chat_completion_json returned no choices (model={model})")
             raise AIClientError("No choices returned in chat completion response.")
 
         first_choice = choices[0]
@@ -337,6 +366,10 @@ class OpenAICompatibleClient:
         try:
             parsed = self.extract_clean_json(raw_content)
         except Exception as e:
+            log_warning(
+                "ai_client",
+                f"JSON extraction failed (model={model}, finish_reason={finish_reason}): {e}",
+            )
             if finish_reason == "length":
                 raise AIClientError(
                     f"risposta troncata: aumentare chat_max_tokens (finish_reason: length, error: {e})"
@@ -344,8 +377,13 @@ class OpenAICompatibleClient:
             raise
 
         if finish_reason == "length":
+            log_warning("ai_client", f"chat_completion_json truncated (finish_reason=length, model={model})")
             raise AIClientError("risposta troncata: aumentare chat_max_tokens")
 
+        log_info(
+            "ai_client",
+            f"chat_completion_json completed model={model} finish_reason={finish_reason} in {time.monotonic() - t0:.2f}s",
+        )
         return parsed
 
     def get_embeddings(
@@ -363,6 +401,12 @@ class OpenAICompatibleClient:
 
         norm_url = self._normalize_base_url(base_url)
         url = f"{norm_url}/embeddings"
+
+        t0 = time.monotonic()
+        log_info(
+            "ai_client",
+            f"get_embeddings model={model} url={url} texts={len(texts)} batch_size={batch_size}",
+        )
 
         all_vectors: List[List[float]] = []
 
@@ -387,4 +431,8 @@ class OpenAICompatibleClient:
                     raise AIClientError("Empty embedding vector in response item.")
                 all_vectors.append(vec)
 
+        log_info(
+            "ai_client",
+            f"get_embeddings completed model={model} vectors={len(all_vectors)} in {time.monotonic() - t0:.2f}s",
+        )
         return all_vectors

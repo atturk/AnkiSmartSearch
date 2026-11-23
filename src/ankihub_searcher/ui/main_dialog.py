@@ -12,6 +12,7 @@ Alias AnkiHubSearcherDialog = SearchDialog is preserved for backwards compatibil
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -212,6 +213,14 @@ except ImportError:
 
 from ..ai_client import OpenAICompatibleClient
 from ..config_manager import ConfigManager
+from ..debug_log import (
+    clear_log_file,
+    get_log_file_path,
+    get_log_file_size_bytes,
+    log_error,
+    log_info,
+    read_log_text,
+)
 from ..deck_ops import (
     _get_op_changes,
     delete_filtered_deck_only,
@@ -225,7 +234,110 @@ from ..storage import SearchDatabase
 from ..text_utils import parse_markdown_units
 from .worker import IndexWorker, RollbackWorker, SearchBatchWorker
 
-CURRENT_VERSION = "0.6.0"
+CURRENT_VERSION = "0.6.1"
+
+# Strong references to active background SearchBatchWorker instances so they are not
+# garbage-collected after SearchDialog closes.
+_active_background_searches: List[SearchBatchWorker] = []
+
+
+def _show_nonblocking_tooltip(msg: str, parent: Optional[Any] = None) -> None:
+    """Shows a non-blocking Anki tooltip when available, otherwise logs to debug log."""
+    try:
+        from aqt.utils import tooltip  # type: ignore
+
+        tooltip(msg, parent=parent or mw)
+        return
+    except Exception:
+        pass
+    log_info("ui", f"Tooltip: {msg}")
+
+
+def handle_browse_only_results(res: Dict[str, Any], parent: Optional[Any] = None) -> None:
+    """Handles completion of a search-only run (both background and modal paths)."""
+    matched = res.get("matched", []) or []
+    unit_errors = res.get("unit_errors", []) or []
+    warning = res.get("warning", "")
+    target_parent = parent if parent is not None else (mw if mw else None)
+
+    if not matched:
+        if unit_errors:
+            lines = "\n".join(f"• {e['unit_title']}: {e['error']}" for e in unit_errors)
+            QMessageBox.warning(target_parent, "Ricerca non riuscita", lines)
+        else:
+            QMessageBox.information(
+                target_parent,
+                "Smart Search — Nessuna carta trovata",
+                "Ricerca completata: sono state trovate 0 note.",
+            )
+        return
+
+    msg = f"Trovate {len(matched)} note"
+    if unit_errors:
+        msg += f" — {len(unit_errors)} unità con errori"
+    if warning:
+        msg += f" — {warning}"
+    QTimer.singleShot(0, lambda: open_browser_with_results(matched, msg))
+
+
+def launch_background_search(worker: SearchBatchWorker, context: Dict[str, Any]) -> None:
+    """Registers and starts a SearchBatchWorker detached from SearchDialog."""
+    _active_background_searches.append(worker)
+    log_info("ui", f"Launched background SearchBatchWorker (active={len(_active_background_searches)})")
+
+    def _cleanup_worker() -> None:
+        try:
+            if worker in _active_background_searches:
+                _active_background_searches.remove(worker)
+        except Exception:
+            pass
+        if hasattr(worker, "deleteLater"):
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+    def _on_bg_finished(res: Dict[str, Any]) -> None:
+        _cleanup_worker()
+        if mw is not None and getattr(mw, "col", None) is None:
+            log_info("ui", "Discarding background search result because collection is closed.")
+            return
+        status = res.get("status", "done")
+        if status == "cancelled":
+            log_info("ui", "Background search cancelled.")
+            return
+        if res.get("browse_only"):
+            QTimer.singleShot(0, lambda: handle_browse_only_results(res, parent=mw if mw else None))
+        else:
+            QTimer.singleShot(0, lambda: show_search_summary(res, context))
+
+    def _on_bg_error(err_msg: str) -> None:
+        _cleanup_worker()
+        log_error("ui", f"Background search error: {err_msg}")
+        if mw is not None and getattr(mw, "col", None) is None:
+            return
+        target_parent = mw if mw else None
+        QTimer.singleShot(
+            0,
+            lambda: QMessageBox.critical(
+                target_parent,
+                "Errore Ricerca",
+                f"Si è verificato un errore durante la ricerca:\n\n{err_msg}",
+            ),
+        )
+
+    worker.finished_sig.connect(_on_bg_finished)
+    worker.error_sig.connect(_on_bg_error)
+    worker.start()
+
+
+def cancel_all_background_searches(*_args: Any, **_kwargs: Any) -> None:
+    """Requests cancellation of any active background search workers on profile close."""
+    for worker in list(_active_background_searches):
+        try:
+            worker.cancel()
+        except Exception:
+            pass
 
 
 def compute_coverage_stats(coverage_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -644,14 +756,6 @@ class SearchDialog(QDialog):
         self.last_search_mode = active_mode
         self.last_search_text = raw_text
 
-        self.btn_search.setEnabled(False)
-        self.btn_cancel.setText("Interrompi")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.lbl_status.setVisible(True)
-        self.lbl_status.setText("Avvio elaborazione in corso...")
-
         # Pre-read collection notes and card mappings on the main thread before starting background thread
         presearch_data = collect_presearch_data(
             col=self.col,
@@ -660,6 +764,43 @@ class SearchDialog(QDialog):
             ai_client=self.ai_client,
             search_query=query,
         )
+
+        run_in_bg = bool(getattr(self.config, "run_search_in_background", True))
+
+        if run_in_bg:
+            worker = SearchBatchWorker(
+                col=self.col,
+                config=self.config,
+                storage=self.storage,
+                ai_client=self.ai_client,
+                raw_text=raw_text,
+                base_deck_name=self.txt_base_deck.text().strip(),
+                precomputed_data=presearch_data,
+                profile=self.profile,
+                input_mode=active_mode,
+                create_deck=self.chk_create_deck.isChecked(),
+                parent=None,
+            )
+            self.search_worker = worker
+            context = self._get_search_context()
+
+            accepted_code = getattr(
+                getattr(QDialog, "DialogCode", None),
+                "Accepted",
+                getattr(QDialog, "Accepted", 1),
+            )
+            self.done(accepted_code)
+            _show_nonblocking_tooltip("Smart Search: ricerca avviata in background…", parent=mw)
+            launch_background_search(worker, context)
+            return
+
+        self.btn_search.setEnabled(False)
+        self.btn_cancel.setText("Interrompi")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.lbl_status.setVisible(True)
+        self.lbl_status.setText("Avvio elaborazione in corso...")
 
         self.search_worker = SearchBatchWorker(
             col=self.col,
@@ -687,26 +828,13 @@ class SearchDialog(QDialog):
     def _on_browse_results(self, res: Dict[str, Any]) -> None:
         """Search-only run: close the panel and show matches in the Browser by relevance."""
         matched = res.get("matched", []) or []
-        unit_errors = res.get("unit_errors", []) or []
-        warning = res.get("warning", "")
-
         if not matched:
-            if unit_errors:
-                lines = "\n".join(f"• {e['unit_title']}: {e['error']}" for e in unit_errors)
-                QMessageBox.warning(self, "Ricerca non riuscita", lines)
-            else:
-                QMessageBox.information(self, "Nessuna carta trovata", "Nessuna carta trovata.")
+            handle_browse_only_results(res, parent=self)
             return
 
         accepted_code = getattr(getattr(QDialog, "DialogCode", None), "Accepted", getattr(QDialog, "Accepted", 1))
         self.done(accepted_code)
-
-        msg = f"Trovate {len(matched)} note"
-        if unit_errors:
-            msg += f" — {len(unit_errors)} unità con errori"
-        if warning:
-            msg += f" — {warning}"
-        QTimer.singleShot(0, lambda: open_browser_with_results(matched, msg))
+        handle_browse_only_results(res, parent=mw if mw else self)
 
     def _get_search_context(self) -> Dict[str, Any]:
         mode = self.last_search_mode or getattr(self.config, "search_input_mode", "keyword")
@@ -1662,8 +1790,77 @@ class IndexDialog(QDialog):
 
 
 # =====================================================================
-# 4. SETTINGS DIALOG (Impostazioni)
+# 4. SETTINGS DIALOG & LOG VIEWER
 # =====================================================================
+
+
+class LogViewerDialog(QDialog):
+    """Minimal read-only dialog displaying the Smart Search debug log file."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Smart Search — Log di debug")
+        self.resize(780, 500)
+        self._init_ui()
+        self._reload_log()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        path_lbl = QLabel(f"File: {get_log_file_path()}")
+        path_lbl.setWordWrap(True)
+        path_lbl.setStyleSheet("color: gray;")
+        layout.addWidget(path_lbl)
+
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setStyleSheet("font-family: Menlo, Consolas, monospace; font-size: 11px;")
+        layout.addWidget(self.txt_log)
+
+        btn_row = QHBoxLayout()
+        btn_refresh = QPushButton("Aggiorna")
+        btn_refresh.clicked.connect(self._reload_log)
+        btn_row.addWidget(btn_refresh)
+
+        btn_copy = QPushButton("Copia")
+        btn_copy.clicked.connect(self._copy_log)
+        btn_row.addWidget(btn_copy)
+
+        btn_clear = QPushButton("Svuota log")
+        btn_clear.clicked.connect(self._clear_log)
+        btn_row.addWidget(btn_clear)
+
+        btn_row.addStretch()
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setDefault(True)
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+
+        layout.addLayout(btn_row)
+
+    def _reload_log(self) -> None:
+        content = read_log_text()
+        self.txt_log.setPlainText(content if content else "(Il file di log è attualmente vuoto)")
+        try:
+            sb = self.txt_log.verticalScrollBar()
+            if sb:
+                sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+    def _copy_log(self) -> None:
+        try:
+            cb = QApplication.clipboard()
+            if cb:
+                cb.setText(self.txt_log.toPlainText())
+        except Exception as e:
+            QMessageBox.warning(self, "Errore", f"Impossibile copiare negli appunti:\n{e}")
+
+    def _clear_log(self) -> None:
+        clear_log_file()
+        self._reload_log()
+
 
 class SettingsDialog(QDialog):
     """Minimal dialog for configuring search sensitivity, AI endpoints, and note fields."""
@@ -1792,6 +1989,14 @@ class SettingsDialog(QDialog):
         self.chk_include_active = QCheckBox("Inserisci nel mazzo filtrato anche le carte già attive in studio")
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
         deck_opts_layout.addWidget(self.chk_include_active)
+
+        self.chk_background_search = QCheckBox("Esegui le ricerche in background (non blocca Anki)")
+        self.chk_background_search.setToolTip(
+            "Quando attivo, sia la ricerca da finestra (Keyword/Testo) sia 'Trova carte simili' "
+            "lavorano in background lasciando Anki utilizzabile fino al completamento."
+        )
+        self.chk_background_search.setChecked(bool(getattr(self.config, "run_search_in_background", True)))
+        deck_opts_layout.addWidget(self.chk_background_search)
 
         naming_row = QHBoxLayout()
         naming_row.addWidget(QLabel("Stile nomi mazzi multi-unità:"))
@@ -2065,7 +2270,34 @@ class SettingsDialog(QDialog):
         ui_layout.addWidget(lbl_menu_hint)
 
         tab_ui_layout.addWidget(ui_group)
+
+        log_group = QGroupBox("Log di debug")
+        log_layout = QVBoxLayout(log_group)
+
+        self.lbl_log_info = QLabel("")
+        self.lbl_log_info.setWordWrap(True)
+        self.lbl_log_info.setStyleSheet("color: gray;")
+        log_layout.addWidget(self.lbl_log_info)
+
+        log_btn_row = QHBoxLayout()
+        btn_view_log = QPushButton("Visualizza log…")
+        btn_view_log.clicked.connect(self._open_log_viewer)
+        log_btn_row.addWidget(btn_view_log)
+
+        btn_open_log_ext = QPushButton("Apri file di log")
+        btn_open_log_ext.clicked.connect(self._open_log_file_external)
+        log_btn_row.addWidget(btn_open_log_ext)
+
+        btn_clear_log = QPushButton("Svuota log")
+        btn_clear_log.clicked.connect(self._clear_debug_log)
+        log_btn_row.addWidget(btn_clear_log)
+        log_btn_row.addStretch()
+        log_layout.addLayout(log_btn_row)
+
+        tab_ui_layout.addWidget(log_group)
         tab_ui_layout.addStretch()
+
+        self._refresh_log_status_label()
 
         self.tab_widget.addTab(self._wrap_scroll(tab_ui), "Interfaccia")
 
@@ -2103,6 +2335,7 @@ class SettingsDialog(QDialog):
 
         self.chk_llm_verify.setChecked(self.config.enable_llm_verification)
         self.chk_include_active.setChecked(self.config.include_active_cards_in_filtered_deck)
+        self.chk_background_search.setChecked(bool(getattr(self.config, "run_search_in_background", True)))
 
         idx_naming = self.combo_naming.findData(self.config.batch_deck_naming_style)
         if idx_naming != -1:
@@ -2360,6 +2593,7 @@ class SettingsDialog(QDialog):
 
         self.config.enable_llm_verification = self.chk_llm_verify.isChecked()
         self.config.include_active_cards_in_filtered_deck = self.chk_include_active.isChecked()
+        self.config.run_search_in_background = self.chk_background_search.isChecked()
         self.config.batch_deck_naming_style = self.combo_naming.currentData() or "dash"
 
         self.config.chat_base_url = self.txt_chat_url.text().strip()
@@ -2399,3 +2633,45 @@ class SettingsDialog(QDialog):
 
         self.config.save()
         self.accept()
+
+    def _refresh_log_status_label(self) -> None:
+        path = get_log_file_path()
+        size_kb = round(get_log_file_size_bytes() / 1024.0, 1)
+        self.lbl_log_info.setText(f"Percorso: {path} ({size_kb} KB)")
+
+    def _open_log_viewer(self) -> None:
+        dlg = LogViewerDialog(parent=self)
+        dlg.exec()
+        self._refresh_log_status_label()
+
+    def _open_log_file_external(self) -> None:
+        path = get_log_file_path()
+        if not os.path.exists(path):
+            with open(path, "a", encoding="utf-8"):
+                pass
+        try:
+            try:
+                from aqt.qt import QDesktopServices, QUrl  # type: ignore
+            except ImportError:
+                from PyQt6.QtCore import QUrl  # type: ignore
+                from PyQt6.QtGui import QDesktopServices  # type: ignore
+
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                return
+        except Exception:
+            pass
+
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif os.name == "nt":
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(self, "Errore", f"Impossibile aprire il file di log:\n{e}")
+
+    def _clear_debug_log(self) -> None:
+        clear_log_file()
+        self._refresh_log_status_label()
+        QMessageBox.information(self, "Log svuotato", "Il file di log di debug è stato svuotato.")

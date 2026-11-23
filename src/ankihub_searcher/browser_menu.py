@@ -13,6 +13,7 @@ Registers the "Smart Search" menu inside Anki's Browser window:
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
@@ -49,6 +50,7 @@ except ImportError:
     tooltip = None
 
 from .config_manager import ConfigManager
+from .debug_log import log_error, log_info, log_warning
 from .search_pipeline import find_similar_notes
 from .storage import SearchDatabase
 
@@ -354,6 +356,8 @@ def run_find_similar(
     config = ConfigManager.load()
     active_mid = config.get_active_model_id()
     eff_mode = (mode or "combined").strip().lower()
+    run_in_bg = bool(getattr(config, "run_search_in_background", True))
+
     if not active_mid and eff_mode == "embedding":
         show_browser_info(
             parent,
@@ -361,7 +365,20 @@ def run_find_similar(
         )
         return
 
+    log_info(
+        "browser_menu",
+        f"run_find_similar start selected={list(selected_nids)} mode={eff_mode} background={run_in_bg} scope={getattr(config, 'similar_scope', 'all')}",
+    )
+
+    def _safe_parent() -> Any:
+        from .browser_windows import _is_alive
+
+        if _is_alive(parent):
+            return parent
+        return mw
+
     def _background_op(col: Any) -> Dict[str, Any]:
+        t0 = time.monotonic()
         c = col or getattr(parent, "col", None) or (mw.col if mw else None)
         storage = SearchDatabase()
         scope = getattr(config, "similar_scope", "all")
@@ -403,6 +420,7 @@ def run_find_similar(
                 msg = f"Nota non indicizzata: indicizza il mazzo '{deck_name}'."
             else:
                 msg = "Nota non indicizzata: indicizza prima le note nel database di Smart Search."
+            log_warning("browser_menu", f"run_find_similar missing embeddings: {missing} ({time.monotonic() - t0:.2f}s)")
             return {"error": msg}
 
         # Fetch preview text for matched notes
@@ -412,6 +430,10 @@ def run_find_similar(
             for n, _ in matched:
                 note_previews[n] = content_map.get(n, {}).get("clean_text", "")
 
+        log_info(
+            "browser_menu",
+            f"run_find_similar finished mode={eff_mode} matched={len(matched)} in {time.monotonic() - t0:.2f}s",
+        )
         return {
             "matched": matched,
             "details": details,
@@ -421,8 +443,9 @@ def run_find_similar(
         }
 
     def _on_success(res: Dict[str, Any]) -> None:
+        safe_p = _safe_parent()
         if "error" in res:
-            show_browser_info(parent, res["error"])
+            show_browser_info(safe_p, res["error"])
             return
 
         matched = res.get("matched", [])
@@ -437,12 +460,23 @@ def run_find_similar(
                 "structure": " (Struttura)",
             }.get(res_mode, "")
             show_browser_tooltip(
-                parent, f"Nessuna carta simile trovata{mode_label} con similarità ≥ {min_score:.2f}"
+                safe_p, f"Nessuna carta simile trovata{mode_label} con similarità ≥ {min_score:.2f}"
             )
+            if run_in_bg:
+                show_browser_info(
+                    safe_p,
+                    f"Ricerca carte simili completata: sono state trovate 0 note{mode_label} (soglia ≥ {min_score:.2f}).",
+                )
             return
 
+        from .browser_windows import _is_alive, get_browser_for_results
+
         browser = get_browser()
-        if not browser:
+        if not browser or not _is_alive(browser):
+            target_mw = mw or safe_p
+            if target_mw:
+                browser = get_browser_for_results(target_mw)
+        if not browser or not _is_alive(browser):
             return
 
         mode_tag = {
@@ -454,22 +488,36 @@ def run_find_similar(
             browser,
             matched,
             f"Trovate {len(matched)} note simili{mode_tag}",
-            parent=parent,
+            parent=safe_p,
             details=details,
         )
 
-    # In Anki: use QueryOp with background thread and progress spinner
+    def _on_failure(exc: Exception) -> None:
+        log_error("browser_menu", f"run_find_similar background exception (mode={eff_mode})", exc)
+        show_browser_info(_safe_parent(), f"Errore durante la ricerca di carte simili:\n{exc}")
+
+    # In Anki: use QueryOp on background thread
     if QueryOp is not None:
-        QueryOp(
+        op = QueryOp(
             parent=parent,
             op=_background_op,
             success=_on_success,
-        ).with_progress(label="Ricerca carte simili...").run_in_background()
+        )
+        if hasattr(op, "failure"):
+            op = op.failure(_on_failure)
+        if run_in_bg:
+            show_browser_tooltip(parent, "Smart Search: ricerca carte simili in background…")
+            op.run_in_background()
+        else:
+            op.with_progress(label="Ricerca carte simili...").run_in_background()
     else:
         # Standalone / test fallback
-        col = getattr(parent, "col", None) or (mw.col if mw else None)
-        res = _background_op(col)
-        _on_success(res)
+        try:
+            col = getattr(parent, "col", None) or (mw.col if mw else None)
+            res = _background_op(col)
+            _on_success(res)
+        except Exception as exc:
+            _on_failure(exc)
 
 
 def on_find_similar_cards_clicked(

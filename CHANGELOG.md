@@ -2,6 +2,16 @@
 
 All notable changes to **Smart Search (AnkiSmartSearch)** are documented in this file.
 
+## [0.6.1] - 2026-11-23
+
+### Novità
+- **Ricerche non bloccanti in background (attiva di default):** sia la ricerca principale per query/keywords (`SearchDialog`) sia `Trova carte simili` (dal Browser e dalla revisione) girano ora in background senza bloccare l'interfaccia di Anki, permettendo di continuare a studiare o navigare mentre l'add-on esegue chiamate LLM, embedding e calcoli di similarità. Al termine viene aperto automaticamente il Browser con i risultati oppure mostrato un popup riepilogativo esplicito se vengono trovate `0` note (o il dialog di riepilogo in modalità mazzo filtrato).
+- **Opzione in Impostazioni (`Ricerca`):** aggiunta la spunta *"Esegui le ricerche in background (non bloccante)"* (`run_search_in_background`, attiva di default) per poter disattivare il funzionamento in background e tornare alla barra di avanzamento bloccante se preferito.
+- **File di log di debug dedicato (`smart_search.log`):** aggiunto un logger rotante thread-safe in `user_files/smart_search.log` (max 2 MB × 3 file) accessibile dalla tab `Interfaccia` delle Impostazioni con **Visualizza log…** (dialog integrato con *Aggiorna*, *Copia*, *Svuota log*), **Apri file di log** e **Svuota log**. Registra richieste/risposte HTTP API, embedding, indicizzazione, ricerche e timing senza mai salvare `api_key` o header `Authorization`.
+
+### Fix
+- Migliorata la gestione di finestre Browser chiuse o ricreate durante l'attesa di una ricerca in background (`browser_windows._is_alive` e guardie su `parent` eliminato).
+
 ## [0.6.0] - 2026-11-23
 
 ### Novità

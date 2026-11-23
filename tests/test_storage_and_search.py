@@ -4397,3 +4397,208 @@ class TestV060TagAndStructuralSimilarity(unittest.TestCase):
         self.assertAlmostEqual(cfg.similar_weight_embedding, 0.60, places=2)
         self.assertEqual(cfg.similar_tag_max_df, 180)
         col.conn.close()
+
+
+class TestV061BackgroundAndDebugLog(unittest.TestCase):
+    def setUp(self):
+        from ankihub_searcher.debug_log import configure_log_file
+
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.log_path = os.path.join(self.tmp_dir.name, "test_smart_search.log")
+        configure_log_file(self.log_path)
+
+    def tearDown(self):
+        from ankihub_searcher.debug_log import configure_log_file
+        from ankihub_searcher.ui.main_dialog import _active_background_searches
+
+        _active_background_searches.clear()
+        configure_log_file(None)
+        self.tmp_dir.cleanup()
+
+    def test_debug_log_write_read_clear_and_no_api_key_leak(self):
+        import io
+        import json
+        from ankihub_searcher.debug_log import (
+            clear_log_file,
+            get_log_file_path,
+            get_log_file_size_bytes,
+            log_error,
+            log_info,
+            log_warning,
+            read_log_text,
+        )
+
+        self.assertEqual(get_log_file_path(), os.path.abspath(self.log_path))
+        log_info("unit_test", "Search started in background")
+        log_warning("unit_test", "Minor warning occurred")
+        try:
+            raise ValueError("boom_test_error")
+        except ValueError as exc:
+            log_error("unit_test", "Captured failure", exc)
+
+        # Verify OpenAICompatibleClient logs request without leaking api_key
+        secret_key = "sk-secret-do-not-log-12345"
+        client = OpenAICompatibleClient()
+        mock_resp = io.BytesIO(
+            json.dumps(
+                {"choices": [{"finish_reason": "stop", "message": {"content": '{"ok": true}'}}]}
+            ).encode("utf-8")
+        )
+        mock_cm = MagicMock()
+        mock_cm.__enter__.return_value = mock_resp
+        with patch("urllib.request.urlopen", return_value=mock_cm):
+            res = client.chat_completion_json(
+                messages=[{"role": "user", "content": "hi"}],
+                model="gpt-test",
+                base_url="http://127.0.0.1:1234/v1",
+                api_key=secret_key,
+            )
+        self.assertEqual(res, {"ok": True})
+
+        content = read_log_text()
+        self.assertIn("[INFO] [ankihub_searcher.debug.unit_test] Search started in background", content)
+        self.assertIn("[WARNING] [ankihub_searcher.debug.unit_test] Minor warning occurred", content)
+        self.assertIn("ValueError: boom_test_error", content)
+        self.assertIn("http://127.0.0.1:1234/v1/chat/completions", content)
+        self.assertNotIn(secret_key, content)
+        self.assertGreater(get_log_file_size_bytes(), 0)
+
+        clear_log_file()
+        self.assertEqual(read_log_text(), "")
+        self.assertEqual(get_log_file_size_bytes(), 0)
+
+    def test_search_dialog_background_mode_and_empty_popup(self):
+        from ankihub_searcher.ui.main_dialog import (
+            QMessageBox,
+            SearchDialog,
+            _active_background_searches,
+            handle_browse_only_results,
+            launch_background_search,
+        )
+
+        col = MockAnkiCol()
+        col.conn.execute(
+            "INSERT INTO notes (id, mid, mod, flds, tags) VALUES (1, 1, 100, 'ApoB48\x1fExtra', '')"
+        )
+        col.conn.execute("INSERT INTO cards (id, nid, did) VALUES (10, 1, 100)")
+        col.conn.commit()
+        col.find_notes = lambda q: [1]
+        col.find_cards = lambda q: [10]
+
+        # 1. With run_search_in_background=True (default): closes dialog immediately and launches detached worker
+        cfg_bg = ConfigManager(run_search_in_background=True, search_query="deck:AnKing")
+        with patch.object(ConfigManager, "load", return_value=cfg_bg):
+            dlg = SearchDialog(col=col)
+        dlg.combo_query.setCurrentText("deck:AnKing")
+        dlg.input_tabs.setCurrentIndex(0)
+        dlg.txt_keywords.setPlainText("ApoB48")
+
+        done_codes = []
+        orig_done = dlg.done
+        dlg.done = lambda code: (done_codes.append(code), orig_done(code))
+
+        with patch("ankihub_searcher.ui.main_dialog.launch_background_search") as mock_launch, \
+             patch("ankihub_searcher.ui.main_dialog._show_nonblocking_tooltip") as mock_tip, \
+             patch.object(cfg_bg, "save"):
+            dlg._start_search()
+
+        self.assertEqual(len(done_codes), 1)
+        mock_launch.assert_called_once()
+        launched_worker = mock_launch.call_args[0][0]
+        self.assertIsNone(getattr(launched_worker, "parent", lambda: None)() if callable(getattr(launched_worker, "parent", None)) else None)
+        mock_tip.assert_called_once()
+
+        # 2. Test launch_background_search lifecycle with fake worker emitting finished_sig
+        class FakeSig:
+            def __init__(self):
+                self._slots = []
+            def connect(self, fn):
+                self._slots.append(fn)
+            def emit(self, *args):
+                for s in list(self._slots):
+                    s(*args)
+
+        class FakeWorker:
+            def __init__(self):
+                self.finished_sig = FakeSig()
+                self.error_sig = FakeSig()
+                self.started = False
+                self.cancelled = False
+            def start(self):
+                self.started = True
+            def cancel(self):
+                self.cancelled = True
+
+        # 2a. Empty browse_only results -> shows summary popup ("trovate 0 note")
+        fw_empty = FakeWorker()
+        launch_background_search(fw_empty, {"mode": "keyword"})
+        self.assertIn(fw_empty, _active_background_searches)
+        self.assertTrue(fw_empty.started)
+
+        info_msgs = []
+        with patch.object(QMessageBox, "information", side_effect=lambda p, t, m: info_msgs.append((t, m))):
+            fw_empty.finished_sig.emit({"status": "done", "browse_only": True, "matched": [], "unit_errors": [], "warning": ""})
+        self.assertNotIn(fw_empty, _active_background_searches)
+        self.assertTrue(any("0 note" in m for _, m in info_msgs))
+
+        # 2b. Non-empty browse_only results -> calls open_browser_with_results
+        fw_ok = FakeWorker()
+        launch_background_search(fw_ok, {"mode": "keyword"})
+        with patch("ankihub_searcher.ui.main_dialog.open_browser_with_results") as mock_open_br:
+            fw_ok.finished_sig.emit({"status": "done", "browse_only": True, "matched": [(101, 0.91)], "unit_errors": [], "warning": ""})
+        mock_open_br.assert_called_once_with([(101, 0.91)], "Trovate 1 note")
+        self.assertNotIn(fw_ok, _active_background_searches)
+
+        # 2c. Worker error -> removes from registry and shows critical QMessageBox
+        fw_err = FakeWorker()
+        launch_background_search(fw_err, {"mode": "keyword"})
+        crit_msgs = []
+        with patch.object(QMessageBox, "critical", side_effect=lambda p, t, m: crit_msgs.append((t, m))):
+            fw_err.error_sig.emit("Network failure")
+        self.assertNotIn(fw_err, _active_background_searches)
+        self.assertTrue(any("Network failure" in m for _, m in crit_msgs))
+
+        # 3. With run_search_in_background=False -> keeps dialog open (blocking mode)
+        cfg_blocking = ConfigManager(run_search_in_background=False, search_query="deck:AnKing")
+        with patch.object(ConfigManager, "load", return_value=cfg_blocking):
+            dlg_block = SearchDialog(col=col)
+        dlg_block.combo_query.setCurrentText("deck:AnKing")
+        dlg_block.input_tabs.setCurrentIndex(0)
+        dlg_block.txt_keywords.setPlainText("ApoB48")
+
+        block_done = []
+        dlg_block.done = lambda code: block_done.append(code)
+        with patch("ankihub_searcher.ui.worker.SearchBatchWorker.start") as mock_start, \
+             patch.object(cfg_blocking, "save"):
+            dlg_block._start_search()
+        self.assertEqual(block_done, [])
+        mock_start.assert_called_once()
+
+        # Also check handle_browse_only_results directly
+        info_msgs.clear()
+        with patch.object(QMessageBox, "information", side_effect=lambda p, t, m: info_msgs.append((t, m))):
+            handle_browse_only_results({"matched": [], "unit_errors": [], "warning": ""})
+        self.assertTrue(any("0 note" in m for _, m in info_msgs))
+
+        col.conn.close()
+
+    def test_settings_dialog_background_toggle_and_log_viewer(self):
+        from ankihub_searcher.debug_log import log_info, read_log_text
+        from ankihub_searcher.ui.main_dialog import LogViewerDialog, SettingsDialog
+
+        col = MockAnkiCol()
+        cfg = ConfigManager(run_search_in_background=False)
+        dlg = SettingsDialog(col=col, config=cfg)
+        self.assertFalse(dlg.chk_background_search.isChecked())
+
+        dlg.chk_background_search.setChecked(True)
+        with patch.object(cfg, "save"):
+            dlg._save_settings()
+        self.assertTrue(cfg.run_search_in_background)
+
+        log_info("settings_test", "Sample debug log line")
+        viewer = LogViewerDialog()
+        self.assertIn("Sample debug log line", viewer.txt_log.toPlainText())
+        viewer._clear_log()
+        self.assertEqual(read_log_text(), "")
+        col.conn.close()

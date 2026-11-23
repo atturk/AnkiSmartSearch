@@ -10,6 +10,7 @@ from __future__ import annotations
 import collections
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -20,6 +21,7 @@ except ImportError:
 
 from .ai_client import AIClientError, OpenAICompatibleClient
 from .config_manager import ConfigManager
+from .debug_log import log_error, log_info, log_warning
 from .storage import SearchDatabase, normalize_l2
 from .text_utils import (
     LectureUnit,
@@ -451,6 +453,11 @@ class SmartSearchPipeline:
         last_err: Optional[Exception] = None
         max_tokens = getattr(self.config, "chat_max_tokens", 16384)
         use_schema = bool(getattr(self.config, "chat_use_json_schema", False))
+        t0 = time.monotonic()
+        log_info(
+            "search_pipeline",
+            f"extract_concepts start unit='{unit.unit_title}' chars={len(clean_body)} model={self.config.chat_model}",
+        )
 
         for attempt in range(2):
             try:
@@ -467,11 +474,19 @@ class SmartSearchPipeline:
 
                 concepts = _parse_concepts(res)
                 if concepts:
+                    log_info(
+                        "search_pipeline",
+                        f"extract_concepts unit='{unit.unit_title}' -> {len(concepts)} concepts in {time.monotonic() - t0:.2f}s",
+                    )
                     return concepts
 
                 # If parsed response contains 0 concepts and response_format was active,
                 # retry once without response_format before counting the attempt as failed.
                 if schema_to_use is not None:
+                    log_warning(
+                        "search_pipeline",
+                        f"extract_concepts 0 concepts with response_format on attempt {attempt + 1}, retrying without schema",
+                    )
                     print(
                         f"[SmartSearch] Notice: 0 concepts with response_format active in attempt {attempt + 1}, retrying once without response_format..."
                     )
@@ -486,15 +501,28 @@ class SmartSearchPipeline:
                     )
                     concepts_no_schema = _parse_concepts(res_no_schema)
                     if concepts_no_schema:
+                        log_info(
+                            "search_pipeline",
+                            f"extract_concepts unit='{unit.unit_title}' (no-schema fallback) -> {len(concepts_no_schema)} concepts in {time.monotonic() - t0:.2f}s",
+                        )
                         return concepts_no_schema
 
                 raise Stage1ExtractionError("LLM response did not contain any valid medical concepts.")
 
             except Exception as e:
                 last_err = e
+                log_warning(
+                    "search_pipeline",
+                    f"extract_concepts attempt {attempt + 1} failed for unit='{unit.unit_title}': {e}",
+                )
                 print(f"[SmartSearch] Notice: Stage 1 extraction attempt {attempt + 1} failed: {e}")
 
         # Both attempts failed: do NOT fall back to arbitrary ASCII words
+        log_error(
+            "search_pipeline",
+            f"extract_concepts failed after 2 attempts for unit='{unit.unit_title}'",
+            last_err,
+        )
         raise Stage1ExtractionError(
             f"Stage 1 extraction failed after 2 attempts: {last_err}"
         )
@@ -597,6 +625,8 @@ class SmartSearchPipeline:
         last_err: Optional[Exception] = None
         max_tokens = getattr(self.config, "chat_max_tokens", 16384)
         use_schema = bool(getattr(self.config, "chat_use_json_schema", False))
+        t0 = time.monotonic()
+        log_info("search_pipeline", f"translate_keywords start count={len(all_keywords)} model={self.config.chat_model}")
 
         for attempt in range(2):
             try:
@@ -613,9 +643,17 @@ class SmartSearchPipeline:
 
                 translations = _align_to_keywords(res, _parse_translations(res))
                 if translations:
+                    log_info(
+                        "search_pipeline",
+                        f"translate_keywords -> {len(translations)}/{len(all_keywords)} translated in {time.monotonic() - t0:.2f}s",
+                    )
                     return translations
 
                 if schema_to_use is not None:
+                    log_warning(
+                        "search_pipeline",
+                        f"translate_keywords 0 translations with response_format on attempt {attempt + 1}, retrying without schema",
+                    )
                     print(
                         f"[SmartSearch] Notice: 0 translations with response_format active in attempt {attempt + 1}, retrying once without response_format..."
                     )
@@ -630,14 +668,20 @@ class SmartSearchPipeline:
                     )
                     translations_no_schema = _align_to_keywords(res_no_schema, _parse_translations(res_no_schema))
                     if translations_no_schema:
+                        log_info(
+                            "search_pipeline",
+                            f"translate_keywords (no-schema fallback) -> {len(translations_no_schema)}/{len(all_keywords)} in {time.monotonic() - t0:.2f}s",
+                        )
                         return translations_no_schema
 
                 raise RuntimeError("LLM response did not contain any valid keyword translations.")
 
             except Exception as e:
                 last_err = e
+                log_warning("search_pipeline", f"translate_keywords attempt {attempt + 1} failed: {e}")
                 print(f"[SmartSearch] Notice: Keyword translation attempt {attempt + 1} failed: {e}")
 
+        log_error("search_pipeline", "translate_keywords failed after 2 attempts", last_err)
         raise RuntimeError(f"Keyword translation failed after 2 attempts: {last_err}")
 
     # ---------------- Stage 2: Hybrid Retrieval ----------------
@@ -668,6 +712,8 @@ class SmartSearchPipeline:
 
         if not active_model_id:
             active_model_id = self.config.get_active_model_id()
+
+        t_retrieve_start = time.monotonic()
 
         # 1. Build query texts for embedding based on language strategy
         query_texts: List[str] = []
@@ -853,8 +899,17 @@ class SmartSearchPipeline:
             act_notes = [sn for sn in scored_notes if sn.nid not in suspended_nids][: max_cards_unit]
             combined_final = susp_notes + act_notes
             combined_final.sort(key=lambda x: x.score, reverse=True)
+            log_info(
+                "search_pipeline",
+                f"retrieve_for_concepts concepts={len(concepts)} candidates={len(loaded_nids)} threshold={eff_threshold:.2f} alpha={alpha:.2f} matched={len(combined_final)} in {time.monotonic() - t_retrieve_start:.2f}s",
+            )
             return combined_final
-        return scored_notes[: max_cards_unit]
+        final_res = scored_notes[: max_cards_unit]
+        log_info(
+            "search_pipeline",
+            f"retrieve_for_concepts concepts={len(concepts)} candidates={len(loaded_nids)} threshold={eff_threshold:.2f} alpha={alpha:.2f} matched={len(final_res)} in {time.monotonic() - t_retrieve_start:.2f}s",
+        )
+        return final_res
 
     # ---------------- Stage 3: Optional LLM Verification ----------------
 
@@ -944,16 +999,26 @@ class SmartSearchPipeline:
                         except (ValueError, TypeError):
                             pass
                 else:
+                    log_warning(
+                        "search_pipeline",
+                        f"verify_candidates invalid schema for batch starting at {i}, keeping batch",
+                    )
                     print(f"[SmartSearch] Notice: Stage 3 verification invalid response schema ({res}), keeping batch.")
                     for c in chunk:
                         verified_nids.add(c.nid)
             except Exception as e:
                 # If verification call fails, retain chunk rather than losing results
+                log_warning("search_pipeline", f"verify_candidates call error ({e}), keeping batch")
                 print(f"[SmartSearch] Notice: Stage 3 verification call error ({e}), keeping batch.")
                 for c in chunk:
                     verified_nids.add(c.nid)
 
-        return [c for c in candidates if c.nid in verified_nids]
+        verified_list = [c for c in candidates if c.nid in verified_nids]
+        log_info(
+            "search_pipeline",
+            f"verify_candidates input={len(candidates)} kept={len(verified_list)}",
+        )
+        return verified_list
 
     # ---------------- End-to-End Search Pipeline ----------------
 
@@ -1365,6 +1430,7 @@ def find_similar_notes(
     if eff_mode not in {"combined", "embedding", "tags", "structure"}:
         eff_mode = "combined"
 
+    t_sim_start = time.monotonic()
     want_emb = (eff_mode == "embedding") or (eff_mode == "combined" and use_embeddings)
     want_tags = (eff_mode == "tags") or (eff_mode == "combined" and use_tags)
     want_struct = (eff_mode == "structure") or (eff_mode == "combined" and use_structure)
@@ -1416,6 +1482,10 @@ def find_similar_notes(
 
     if eff_mode == "embedding":
         if missing_emb:
+            log_warning(
+                "search_pipeline",
+                f"find_similar_notes mode=embedding missing_emb={missing_emb} in {time.monotonic() - t_sim_start:.3f}s",
+            )
             return [], missing_emb
         matched = [
             (nid, sc)
@@ -1426,6 +1496,10 @@ def find_similar_notes(
             details_out.clear()
             for nid, sc in matched:
                 details_out[nid] = {"E": sc}
+        log_info(
+            "search_pipeline",
+            f"find_similar_notes mode=embedding selected={list(selected_nids)} matched={len(matched)} min_score={min_score:.2f} in {time.monotonic() - t_sim_start:.3f}s",
+        )
         return matched, []
 
     # 2. Load raw primary text & tags when needed for Tags / Structure
@@ -1465,7 +1539,15 @@ def find_similar_notes(
     # surface missing_emb so the user is prompted to index (preserving v0.5.x behavior).
     if not emb_active and not tag_active and not struct_active:
         if missing_emb:
+            log_warning(
+                "search_pipeline",
+                f"find_similar_notes mode={eff_mode} no active criteria and missing_emb={missing_emb} in {time.monotonic() - t_sim_start:.3f}s",
+            )
             return [], missing_emb
+        log_info(
+            "search_pipeline",
+            f"find_similar_notes mode={eff_mode} no active criteria -> 0 results in {time.monotonic() - t_sim_start:.3f}s",
+        )
         return [], []
 
     # Standalone single-criterion modes
@@ -1479,6 +1561,10 @@ def find_similar_notes(
             details_out.clear()
             for nid, sc in matched:
                 details_out[nid] = {"T": sc}
+        log_info(
+            "search_pipeline",
+            f"find_similar_notes mode=tags selected={list(selected_nids)} matched={len(matched)} min_score={min_score:.2f} in {time.monotonic() - t_sim_start:.3f}s",
+        )
         return matched, []
 
     if eff_mode == "structure":
@@ -1491,6 +1577,10 @@ def find_similar_notes(
             details_out.clear()
             for nid, sc in matched:
                 details_out[nid] = {"S": sc}
+        log_info(
+            "search_pipeline",
+            f"find_similar_notes mode=structure selected={list(selected_nids)} matched={len(matched)} min_score={min_score:.2f} in {time.monotonic() - t_sim_start:.3f}s",
+        )
         return matched, []
 
     # 5. Combined Synergistic Fusion across active criteria
@@ -1549,5 +1639,9 @@ def find_similar_notes(
         for nid, _, comp in top_scored:
             details_out[nid] = comp
 
+    log_info(
+        "search_pipeline",
+        f"find_similar_notes mode={eff_mode} selected={list(selected_nids)} active={list(active_weights.keys())} matched={len(top_scored)} min_score={min_score:.2f} in {time.monotonic() - t_sim_start:.3f}s",
+    )
     return [(nid, sc) for nid, sc, _ in top_scored], []
 

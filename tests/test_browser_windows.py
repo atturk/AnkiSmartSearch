@@ -524,6 +524,90 @@ class TestBrowserWindows(unittest.TestCase):
         self.assertIn("nid:301", browser_windows._extra_browsers[0].executed_searches)
         self.assertEqual(mock_find2.call_args.kwargs.get("mode"), "tags")
 
+    def test_run_find_similar_nonblocking_queryop_vs_blocking_and_deleted_parent(self):
+        from ankihub_searcher.config_manager import ConfigManager
+
+        class FakeQueryOp:
+            instances = []
+
+            def __init__(self, *, parent, op, success):
+                self.parent = parent
+                self.op = op
+                self.success = success
+                self.failure_cb = None
+                self.progress_labels = []
+                self.ran = False
+                FakeQueryOp.instances.append(self)
+
+            def failure(self, cb):
+                self.failure_cb = cb
+                return self
+
+            def with_progress(self, label=None):
+                self.progress_labels.append(label)
+                return self
+
+            def run_in_background(self):
+                self.ran = True
+
+        starting_browser = MockBrowserWindow(self.fake_mw)
+        starting_browser.col = MagicMock()
+        starting_browser._selected_notes = [101]
+
+        # 1. run_search_in_background=True -> QueryOp does NOT call with_progress (non-blocking)
+        FakeQueryOp.instances.clear()
+        cfg_bg = ConfigManager(
+            embed_model="m",
+            embed_provider="p",
+            run_search_in_background=True,
+        )
+        cfg_bg.get_active_model_id = lambda: "test-mid"
+        tooltips = []
+        infos = []
+
+        with patch("ankihub_searcher.browser_menu.QueryOp", FakeQueryOp), \
+             patch.object(ConfigManager, "load", return_value=cfg_bg), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))):
+            browser_menu.on_find_similar_cards_clicked(starting_browser, new_window=False)
+
+        self.assertEqual(len(FakeQueryOp.instances), 1)
+        op_bg = FakeQueryOp.instances[0]
+        self.assertTrue(op_bg.ran)
+        self.assertEqual(op_bg.progress_labels, [])
+        self.assertTrue(any("in background" in t[1] for t in tooltips))
+
+        # Simulate background completion with 0 matches while parent was deleted
+        starting_browser._is_deleted = True
+        with patch("ankihub_searcher.browser_menu.mw", self.fake_mw), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip", side_effect=lambda w, txt: tooltips.append((w, txt))), \
+             patch("ankihub_searcher.browser_menu.show_browser_info", side_effect=lambda w, txt: infos.append((w, txt))):
+            op_bg.success({"matched": [], "details": {}, "mode": "combined", "min_score": 0.65})
+
+        self.assertTrue(any("0 note" in msg for _, msg in infos))
+        # Info parent fell back to fake_mw because starting_browser was deleted
+        self.assertEqual(infos[-1][0], self.fake_mw)
+
+        # 2. run_search_in_background=False -> QueryOp DOES call with_progress (blocking)
+        FakeQueryOp.instances.clear()
+        starting_browser._is_deleted = False
+        cfg_block = ConfigManager(
+            embed_model="m",
+            embed_provider="p",
+            run_search_in_background=False,
+        )
+        cfg_block.get_active_model_id = lambda: "test-mid"
+
+        with patch("ankihub_searcher.browser_menu.QueryOp", FakeQueryOp), \
+             patch.object(ConfigManager, "load", return_value=cfg_block), \
+             patch("ankihub_searcher.browser_menu.show_browser_tooltip"):
+            browser_menu.on_find_similar_cards_clicked(starting_browser, new_window=False)
+
+        self.assertEqual(len(FakeQueryOp.instances), 1)
+        op_block = FakeQueryOp.instances[0]
+        self.assertTrue(op_block.ran)
+        self.assertEqual(op_block.progress_labels, ["Ricerca carte simili..."])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "fts_use_italian_keywords": False,
     "enable_llm_verification": False,
     "include_active_cards_in_filtered_deck": False,
+    "run_search_in_background": True,
     "batch_deck_naming_style": "dash",
     "rollback_keep_reviewed_default": True,
     "indexed_fields_by_model": {
@@ -123,6 +124,7 @@ class ConfigManager:
     fts_use_italian_keywords: bool = bool(DEFAULT_CONFIG.get("fts_use_italian_keywords", False))
     enable_llm_verification: bool = bool(DEFAULT_CONFIG["enable_llm_verification"])
     include_active_cards_in_filtered_deck: bool = bool(DEFAULT_CONFIG["include_active_cards_in_filtered_deck"])
+    run_search_in_background: bool = bool(DEFAULT_CONFIG["run_search_in_background"])
     batch_deck_naming_style: str = DEFAULT_CONFIG["batch_deck_naming_style"]
     rollback_keep_reviewed_default: bool = bool(DEFAULT_CONFIG["rollback_keep_reviewed_default"])
 

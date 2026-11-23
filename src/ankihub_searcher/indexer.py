@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .ai_client import OpenAICompatibleClient
 from .config_manager import ConfigManager
+from .debug_log import log_info, log_warning
 from .storage import SearchDatabase
 from .text_utils import clean_html_and_cloze, clean_tags
 
@@ -338,7 +339,12 @@ class DeckIndexer:
                 return {"total": len(nids), "text_indexed": 0, "embeddings_indexed": 0, "cancelled": True}
 
         active_model_id = self.config.get_active_model_id()
+        t0 = time.monotonic()
         needs_text_nids, needs_embed_nids = self.storage.get_notes_needing_indexing(notes_meta, active_model_id)
+        log_info(
+            "indexer",
+            f"index_selected_decks total={len(nids)} needs_text={len(needs_text_nids)} needs_embed={len(needs_embed_nids)} model={active_model_id}",
+        )
 
         # Step 2: Batch update text and FTS
         if needs_text_nids:
@@ -369,6 +375,10 @@ class DeckIndexer:
 
             for i in range(0, total_to_embed, batch_size):
                 if cancel_check and cancel_check():
+                    log_warning(
+                        "indexer",
+                        f"Indexing cancelled at {embedded_count}/{total_to_embed} embeddings ({time.monotonic() - t0:.2f}s)",
+                    )
                     return {
                         "total": len(nids),
                         "text_indexed": len(needs_text_nids),
@@ -421,6 +431,10 @@ class DeckIndexer:
                         f"Indicizzazione vettori: {embedded_count}/{total_to_embed} ({pct}%)",
                     )
 
+        log_info(
+            "indexer",
+            f"index_selected_decks finished total={len(nids)} text_indexed={len(needs_text_nids)} embeddings_indexed={embedded_count} in {time.monotonic() - t0:.2f}s",
+        )
         return {
             "total": len(nids),
             "text_indexed": len(needs_text_nids),

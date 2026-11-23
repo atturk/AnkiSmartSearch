@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 from .ai_client import OpenAICompatibleClient
 from .config_manager import ConfigManager
@@ -131,6 +131,16 @@ def init_addon() -> None:
             install_browser_windows()
         except Exception as e:
             print(f"[SmartSearch] Error installing browser window management: {e}")
+
+        try:
+            import aqt  # type: ignore
+            from .ui.main_dialog import cancel_all_background_searches
+
+            hooks = getattr(aqt, "gui_hooks", None)
+            if hooks is not None and hasattr(hooks, "profile_will_close"):
+                hooks.profile_will_close.append(cancel_all_background_searches)
+        except Exception as e:
+            print(f"[SmartSearch] Error registering profile_will_close hook: {e}")
 
     except ImportError:
         # Running in standalone test environment outside Anki

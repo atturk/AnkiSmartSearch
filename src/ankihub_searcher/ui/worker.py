@@ -61,6 +61,7 @@ except ImportError:
 
 from ..ai_client import OpenAICompatibleClient
 from ..config_manager import ConfigManager
+from ..debug_log import log_error, log_info, log_warning
 from ..deck_ops import (
     RollbackResult,
     RunResult,
@@ -241,7 +242,12 @@ class SearchBatchWorker(QThread):
         self._is_cancelled = True
 
     def run(self) -> None:
+        t_worker_start = time.monotonic()
         try:
+            log_info(
+                "worker",
+                f"SearchBatchWorker start mode={self.input_mode} create_deck={self.create_deck} query='{self.config.get_effective_search_query()}' text_chars={len(self.raw_text)}",
+            )
             # 1. Parse markdown units
             if self.input_mode == "keyword":
                 units = parse_keyword_units(
@@ -250,6 +256,7 @@ class SearchBatchWorker(QThread):
                     naming_style=self.config.batch_deck_naming_style,
                 )
                 if not units:
+                    log_warning("worker", "SearchBatchWorker aborted: no keywords found")
                     self.error_sig.emit("Nessuna keyword trovata.")
                     return
             else:
@@ -259,6 +266,7 @@ class SearchBatchWorker(QThread):
                     naming_style=self.config.batch_deck_naming_style,
                 )
                 if not units:
+                    log_warning("worker", "SearchBatchWorker aborted: no valid units in text")
                     self.error_sig.emit("Nessun testo o unità valida trovata nel testo inserito.")
                     return
 
@@ -363,6 +371,7 @@ class SearchBatchWorker(QThread):
                         except Exception as e:
                             translations = {}
                             keyword_warning = "Traduzione non riuscita: keyword usate senza traduzione."
+                            log_warning("worker", f"Keyword translation fallback: {e}")
                         finally:
                             stop_heartbeat.set()
                             hb_thread.join(timeout=1.0)
@@ -492,11 +501,17 @@ class SearchBatchWorker(QThread):
                 )
 
             if self._is_cancelled:
+                log_warning("worker", f"SearchBatchWorker cancelled after {time.monotonic() - t_worker_start:.2f}s")
                 self.finished_sig.emit({"status": "cancelled", "units_processed": 0, "results": []})
                 return
 
             if not self.create_deck:
-                self.finished_sig.emit(build_browse_result(units_search_data, self.last_warning))
+                res = build_browse_result(units_search_data, self.last_warning)
+                log_info(
+                    "worker",
+                    f"SearchBatchWorker browse_only completed matched={len(res.get('matched', []))} units={total_units} errors={len(res.get('unit_errors', []))} in {time.monotonic() - t_worker_start:.2f}s",
+                )
+                self.finished_sig.emit(res)
                 return
 
             # Disambiguate notes across units: assign each note exclusively to the unit where it scored highest
@@ -504,6 +519,10 @@ class SearchBatchWorker(QThread):
 
             # Sotto-passo 4: Creazione mazzo filtrato (10%)
             emit_prog(total_units * 95, "Creazione mazzo filtrato…")
+            log_info(
+                "worker",
+                f"SearchBatchWorker delegating filtered deck creation for {total_units} units after {time.monotonic() - t_worker_start:.2f}s",
+            )
 
             # Delegate collection writes to the main thread with undo entry
             self._delegate_deck_creations(
@@ -516,6 +535,7 @@ class SearchBatchWorker(QThread):
             )
 
         except Exception as e:
+            log_error("worker", f"SearchBatchWorker failed after {time.monotonic() - t_worker_start:.2f}s", e)
             self.error_sig.emit(str(e))
 
     def _delegate_deck_creations(
